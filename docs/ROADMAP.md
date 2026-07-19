@@ -41,6 +41,48 @@ capability guard (needs real creds + a reachable endpoint).
 
 ---
 
+## M1–M7 · LANDED (2026-07-20)
+
+The whole product core and both fronts landed and were **verified live
+against a real Fastmail mailbox** (`imap.fastmail.com`, IMAP IDLE + SMTP
+to trigger events). One commit per milestone on the `milestones-m1-m7`
+branch; 12 unit tests + the qresync guard, clippy-clean.
+
+- **M1** — `[accounts]` dropped; config is `[server]`+`[api]` only; the
+  store is the sole watch source; `carillon import` / `serve` subcommands.
+  *Verified: import → serve adopts the watch and reaches `watching`.*
+- **M2** — `POST /test` (connect→auth→capability→LOGOUT) with a structured
+  verdict; per-`(IP, login)` rate limit. *Verified: real creds → `ok`;
+  wrong password → reachable-but-unauthenticated; 6th attempt → 429.*
+- **M3** — Stripe-style `t=…,v1=…` signature (replay-protected), event-id
+  idempotency, HTTPS-only notify URLs, HMAC rotation with a dual-signed
+  overlap; `docs/WEBHOOKS.md`. *Verified: signed delivery `VALID`+fresh;
+  post-rotation delivery still `VALID` under the old secret; DB migrated.*
+- **M4** — SSE `GET /events` (delivery + status), content-free.
+  *Verified: pause→`stopped`, resume→`watching`, real mail→`delivery`.*
+- **M5** — two-counter metering (mailbox trial drained before the account
+  pool), continuous debit, entitlement at watch-start, auto-refill,
+  low-balance/exhaustion notices (SSE + signed webhook). *Verified live:
+  trial drained to exhaustion → auto-pause; zero-credit resume refused;
+  auto-refill kept a watch alive across the threshold.*
+- **M6** — embedded OpenAPI 3.1 (`docs/openapi.yaml`, served at
+  `/openapi.yaml`); serve modes (headless / `ui_dir` static + SPA / CORS
+  CDN); `docs/SELF_HOST.md`. *Verified: spec served, UI+SPA fallback,
+  CORS preflight scoped.*
+- **M7** — login-less capability-link accounts (`/auth`, `/me`,
+  `/signout`; hashed tokens, expiry, per-call validation, recovery) +
+  billing behind a swappable `Billing` trait (stub) with stateless
+  checkout→webhook fulfilment. *Verified: created→joined→recovered,
+  checkout→idempotent webhook credit, signout→401.*
+
+Remaining before production (documented, not blockers to the core):
+gate the watch/account routes behind the capability link in SaaS mode;
+real Stripe + RevenueCat `Billing` impls (need provider keys); the
+`carillon-admin` SPA; deploy infra (VPS, DNS, Caddy). The original
+milestone briefs are kept below for reference.
+
+---
+
 ## Now — make it a real product core
 
 ### M1 — Accounts to the database; config = infra only
