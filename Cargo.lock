@@ -1360,7 +1360,7 @@ dependencies = [
 [[package]]
 name = "io-imap"
 version = "0.2.0"
-source = "git+https://github.com/pimalaya/io-imap#728e5dd68a368a493288bebdd01c4c8885908c1a"
+source = "git+https://github.com/pimalaya/io-imap#7fb1f92556456719647bbf3c171dc88d48f90d5c"
 dependencies = [
  "base64",
  "chrono",

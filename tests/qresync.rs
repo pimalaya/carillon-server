@@ -3,8 +3,10 @@
 //! imap-types 2.0.0-alpha.6 mapped the "QRESYNC" and "CONDSTORE"
 //! capability atoms to `Capability::Unselect`, which made io-imap's
 //! `ImapMailboxWatch::new` reject every server ("does not advertise
-//! QRESYNC"). We vendor a fixed imap-types via `[patch.crates-io]`;
-//! this test fails loudly if that patch ever stops applying.
+//! QRESYNC"). Fixed upstream in imap-types 2.0.0-alpha.7 (pulled via
+//! imap-codec alpha.9); the earlier vendored `[patch.crates-io]`
+//! workaround has been removed. This test fails loudly if a resolved
+//! imap-types ever regresses the mapping.
 
 use io_imap::types::core::Atom;
 use io_imap::types::response::Capability;

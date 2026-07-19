@@ -7,12 +7,22 @@ box and, the instant a mailbox changes, POSTs a small, HMAC-signed,
 > **Carillon signals; it never syncs.** It emits *that* something changed and
 > *which* UID — never the sender, subject or body. The consumer (which holds the
 > credentials) enriches the notification itself; the signal Carillon emits stays
-> pure. See `../CARILLON_PLAN.md`.
+> pure.
 
 This is the P0–P5 prototype: the async IMAP-IDLE → signed-webhook beast, a
 supervisor, at-rest credential encryption, sqlite persistence, and a control
 API. Billing, the dashboard, and non-IMAP source protocols are out of scope
-here (see the plan's roadmap).
+here (see the roadmap).
+
+## Docs
+
+- [`docs/CARILLON_PLAN.md`](docs/CARILLON_PLAN.md) — the original north-star vision
+  (what Carillon is, scope, cost model, business shape).
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — product & design decisions refined
+  since the plan (onboarding, credits, webhook security, self-host vs SaaS,
+  transport/architecture).
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — the action plan from this prototype to
+  the shippable product.
 
 ## Architecture
 
@@ -94,11 +104,13 @@ Headers: `X-Carillon-Event` (`new` | `flags_added` | `flags_removed` |
 
 - Watched servers must advertise **QRESYNC** (Gmail, Fastmail, Dovecot do); a
   server without it disables that one watch with a logged error.
-- **Vendored patch:** `imap-types` 2.0.0-alpha.6 has a copy-paste bug mapping the
-  `QRESYNC`/`CONDSTORE` capability atoms to `Capability::Unselect`, which makes
-  io-imap's watcher reject *every* server. `vendor/imap-types` carries the
-  two-line fix, applied via `[patch.crates-io]`. Remove it once fixed upstream.
-  Guarded by `tests/qresync.rs`.
+- **Read-only:** io-imap's watcher opens the mailbox with `EXAMINE`, never
+  `SELECT` — Carillon issues no write commands (see `docs/DECISIONS.md` §7).
 - Idle refresh is done by a periodic reconnect (15 min) plus TCP keepalive,
   rather than in-place DONE/re-IDLE — simpler and robust for the prototype.
 - Single box = SPOF; no redundancy on the IDLE side yet.
+
+(Historical: `imap-types` 2.0.0-alpha.6 had a bug parsing the `QRESYNC`/`CONDSTORE`
+capability atoms to `Capability::Unselect`; fixed upstream in alpha.7 (via
+imap-codec alpha.9). The interim vendored patch has been removed;
+`tests/qresync.rs` guards against a regression.)
