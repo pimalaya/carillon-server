@@ -6,9 +6,10 @@
 //! connections. This is the prototype's stand-in for the eventual
 //! dashboard and billing gate.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -16,9 +17,12 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
-use tracing::info;
+use tokio_rustls::TlsConnector;
+use tracing::{info, warn};
 
 use crate::crypto::Crypto;
+use crate::imap::session::{self, ImapAccount};
+use crate::ratelimit::RateLimiter;
 use crate::store::{Store, Watch};
 use crate::supervisor::SupervisorCmd;
 
@@ -31,12 +35,17 @@ pub struct AppState {
     pub crypto: Arc<Crypto>,
     /// Channel to ask the supervisor to reconcile after a mutation.
     pub commands: mpsc::Sender<SupervisorCmd>,
+    /// Shared TLS connector for the read-only `/test` probe.
+    pub connector: TlsConnector,
+    /// Per-`(IP, login)` limiter guarding the `/test` oracle surface.
+    pub test_limiter: Arc<RateLimiter>,
 }
 
 /// Builds the control API router.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/test", post(test_connect))
         .route("/watches", get(list_watches).post(create_watch))
         .route("/watches/{id}", delete(delete_watch))
         .route("/watches/{id}/pause", post(pause_watch))
@@ -47,6 +56,88 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Body of `POST /test`: credentials to probe, read-only.
+#[derive(Deserialize)]
+struct TestRequest {
+    imap_host: String,
+    #[serde(default = "default_port")]
+    imap_port: u16,
+    login: String,
+    password: String,
+    #[serde(default = "default_mailbox")]
+    mailbox: String,
+}
+
+/// Structured verdict returned by `POST /test`. `ok` is the plan's
+/// green light: reachable + authenticated + IDLE + QRESYNC — never just
+/// auth, because a server can authenticate fine and still fail the watch.
+#[derive(Serialize)]
+struct TestVerdict {
+    ok: bool,
+    reachable: bool,
+    authenticated: bool,
+    idle: bool,
+    qresync: bool,
+    condstore: bool,
+    missing: Vec<&'static str>,
+    error: Option<String>,
+}
+
+/// Probes credentials without spending a credit: connect → auth →
+/// capability check → LOGOUT. Rate-limited per `(IP, login)` so it
+/// cannot be used as a credential-testing oracle. Always returns `200`
+/// with the structured verdict (a failed probe is a valid answer);
+/// `429` only when the caller is rate-limited.
+async fn test_connect(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(request): Json<TestRequest>,
+) -> Response {
+    let key = format!("{}|{}", peer.ip(), request.login);
+    if let Err(retry_after) = state.test_limiter.check(&key) {
+        warn!(login = %request.login, peer = %peer.ip(), "test rate-limited");
+        let seconds = retry_after.as_secs().max(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", seconds.to_string())],
+            Json(json!({ "error": "too many attempts", "retry_after": seconds })),
+        )
+            .into_response();
+    }
+
+    let account = ImapAccount {
+        host: request.imap_host,
+        port: request.imap_port,
+        login: request.login,
+        password: request.password,
+        mailbox: request.mailbox,
+    };
+
+    let probe = session::probe(&state.connector, &account).await;
+    let verdict = TestVerdict {
+        ok: probe.watchable(),
+        reachable: probe.reachable,
+        authenticated: probe.authenticated,
+        idle: probe.idle,
+        qresync: probe.qresync,
+        condstore: probe.condstore,
+        missing: if probe.authenticated {
+            probe.missing()
+        } else {
+            Vec::new()
+        },
+        error: probe.error,
+    };
+
+    info!(
+        host = %account.host,
+        login = %account.login,
+        ok = verdict.ok,
+        "test probe",
+    );
+    Json(verdict).into_response()
 }
 
 /// Public view of a watch: never the password or HMAC secret.

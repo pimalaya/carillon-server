@@ -24,9 +24,11 @@ mod crypto;
 mod delivery;
 mod event;
 mod imap;
+mod ratelimit;
 mod store;
 mod supervisor;
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +45,7 @@ use tracing_subscriber::EnvFilter;
 use crate::api::AppState;
 use crate::config::{Config, ImportFile};
 use crate::crypto::Crypto;
+use crate::ratelimit::RateLimiter;
 use crate::store::{Store, Watch};
 use crate::supervisor::{Supervisor, SupervisorCmd};
 
@@ -50,6 +53,10 @@ use crate::supervisor::{Supervisor, SupervisorCmd};
 const EVENT_CHANNEL: usize = 4096;
 /// Channel depth for supervisor commands.
 const COMMAND_CHANNEL: usize = 64;
+/// `/test` limit: attempts per `(IP, login)` per window.
+const TEST_MAX_ATTEMPTS: u32 = 5;
+/// `/test` limit: the window over which attempts are counted.
+const TEST_WINDOW: Duration = Duration::from_secs(300);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -106,7 +113,7 @@ async fn serve(config: Config) -> Result<()> {
         Arc::new(Crypto::load_or_create(&config.server.age_key_path()).context("Cannot load key")?);
 
     // Shared TLS config: one verifier and one session cache for every
-    // held IMAP connection.
+    // held IMAP connection, and for the read-only `/test` probe.
     let tls = Arc::new(ClientConfig::with_platform_verifier().context("Cannot build TLS config")?);
     let connector = TlsConnector::from(tls);
 
@@ -122,11 +129,11 @@ async fn serve(config: Config) -> Result<()> {
     // Delivery worker.
     tokio::spawn(delivery::run(event_rx, store.clone(), http));
 
-    // Supervisor.
+    // Supervisor. Keep a clone of the connector for the `/test` probe.
     let supervisor = Supervisor::new(
         store.clone(),
         crypto.clone(),
-        connector,
+        connector.clone(),
         event_tx,
         config.server.max_concurrent_handshakes,
     );
@@ -138,6 +145,8 @@ async fn serve(config: Config) -> Result<()> {
         store: store.clone(),
         crypto: crypto.clone(),
         commands: command_tx.clone(),
+        connector,
+        test_limiter: Arc::new(RateLimiter::new(TEST_MAX_ATTEMPTS, TEST_WINDOW)),
     };
     let listener = TcpListener::bind(&config.api.listen)
         .await
@@ -145,7 +154,8 @@ async fn serve(config: Config) -> Result<()> {
     info!(listen = %config.api.listen, "control API listening");
 
     let shutdown_commands = command_tx.clone();
-    axum::serve(listener, api::router(state))
+    let service = api::router(state).into_make_service_with_connect_info::<SocketAddr>();
+    axum::serve(listener, service)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
             info!("shutdown signal received");
