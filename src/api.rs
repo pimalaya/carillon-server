@@ -8,11 +8,12 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -24,6 +25,8 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
 use crate::crypto::Crypto;
@@ -39,6 +42,10 @@ use crate::util::now_secs;
 /// Default rotation overlap: how long the previous HMAC secret keeps
 /// being signed with so a receiver has time to update.
 const DEFAULT_ROTATE_OVERLAP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// This server's OpenAPI contract, embedded so it is always served in
+/// sync with the binary.
+const OPENAPI_YAML: &str = include_str!("../docs/openapi.yaml");
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -57,10 +64,14 @@ pub struct AppState {
     pub live: LiveBus,
 }
 
-/// Builds the control API router.
-pub fn router(state: AppState) -> Router {
-    Router::new()
+/// Builds the control API router. `ui_dir`, if set, is served as static
+/// files at the origin (self-host embedding a `carillon-admin` build);
+/// `cors_origin`, if set, enables cross-origin access for a CDN-served
+/// front.
+pub fn router(state: AppState, ui_dir: Option<PathBuf>, cors_origin: Option<String>) -> Router {
+    let mut app = Router::new()
         .route("/health", get(health))
+        .route("/openapi.yaml", get(openapi))
         .route("/test", post(test_connect))
         .route("/watches", get(list_watches).post(create_watch))
         .route("/watches/{id}", delete(delete_watch))
@@ -72,8 +83,61 @@ pub fn router(state: AppState) -> Router {
         .route("/accounts", get(list_accounts))
         .route("/accounts/{id}", get(get_account))
         .route("/accounts/{id}/credit", post(add_credit))
-        .route("/accounts/{id}/auto-refill", post(set_auto_refill))
-        .with_state(state)
+        .route("/accounts/{id}/auto-refill", post(set_auto_refill));
+
+    // With a UI, static files own `/` (and unknown paths fall back to the
+    // SPA entrypoint); without one, `/` returns service metadata.
+    app = match &ui_dir {
+        Some(_) => app,
+        None => app.route("/", get(service_info)),
+    };
+
+    let mut app = app.with_state(state);
+
+    if let Some(dir) = ui_dir {
+        let index = dir.join("index.html");
+        app = app.fallback_service(ServeDir::new(dir).not_found_service(ServeFile::new(index)));
+    }
+
+    if let Some(origin) = cors_origin {
+        app = app.layer(cors_layer(&origin));
+    }
+
+    app
+}
+
+/// Service metadata for the root path (self-host without a UI).
+async fn service_info() -> Json<serde_json::Value> {
+    Json(json!({
+        "name": "carillon-server",
+        "version": env!("CARGO_PKG_VERSION"),
+        "openapi": "/openapi.yaml",
+        "docs": "https://carillon.pimalaya.org",
+    }))
+}
+
+/// Serves the embedded OpenAPI spec.
+async fn openapi() -> Response {
+    ([(header::CONTENT_TYPE, "application/yaml")], OPENAPI_YAML).into_response()
+}
+
+/// A CORS layer allowing the configured origin (`*` for any) with the
+/// `Authorization` bearer header — pairs with the localStorage capability
+/// link, no cookies/CSRF.
+fn cors_layer(origin: &str) -> CorsLayer {
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+    match origin {
+        "*" => layer.allow_origin(Any),
+        origin => match origin.parse::<axum::http::HeaderValue>() {
+            Ok(value) => layer.allow_origin(value),
+            Err(_) => {
+                warn!(origin, "invalid CORS origin; disabling CORS");
+                layer
+            }
+        },
+    }
 }
 
 async fn health() -> &'static str {

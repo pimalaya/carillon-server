@@ -87,12 +87,24 @@ pub struct ApiConfig {
     /// Listen address of the HTTP control API.
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// Optional directory of static UI assets (a built `carillon-admin`
+    /// `dist/`) to serve at the API origin. Unset = API only (the SaaS
+    /// front serves the UI from a CDN instead).
+    #[serde(default)]
+    pub ui_dir: Option<PathBuf>,
+    /// Optional CORS allow-origin for a cross-origin (CDN) front. `*`
+    /// allows any origin; a URL allows exactly that one. Unset = no CORS
+    /// (same-origin self-host).
+    #[serde(default)]
+    pub cors_allow_origin: Option<String>,
 }
 
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             listen: default_listen(),
+            ui_dir: None,
+            cors_allow_origin: None,
         }
     }
 }

@@ -1,0 +1,391 @@
+openapi: 3.1.0
+info:
+  title: Carillon control API
+  version: "0.0.1"
+  summary: Manage watches, probe credentials, meter watch-time, and stream live events.
+  description: |
+    The REST + SSE control surface of the Carillon watch server. Carillon
+    signals, it never syncs: it holds IMAP IDLE and POSTs small, signed,
+    **content-free** change events to each watch's notify URL. This API is
+    the contract `carillon-admin` (and any third-party UI) builds against.
+
+    All bodies are JSON. Timestamps are unix seconds. Watch-time balances
+    are in seconds.
+  license:
+    name: MIT OR Apache-2.0
+servers:
+  - url: http://127.0.0.1:3000
+    description: Self-host (localhost)
+tags:
+  - name: health
+  - name: onboarding
+  - name: watches
+  - name: deliveries
+  - name: accounts
+  - name: stream
+
+paths:
+  /:
+    get:
+      tags: [health]
+      summary: Service metadata
+      responses:
+        "200":
+          description: Name, version and useful links.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServiceInfo" }
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      responses:
+        "200":
+          description: The literal string `ok`.
+          content:
+            text/plain:
+              schema: { type: string, example: ok }
+  /openapi.yaml:
+    get:
+      tags: [health]
+      summary: This document
+      responses:
+        "200":
+          description: The OpenAPI spec.
+          content:
+            application/yaml: {}
+
+  /test:
+    post:
+      tags: [onboarding]
+      summary: Probe credentials, read-only (no credit spent)
+      description: |
+        Connects, authenticates, inspects capabilities and logs out —
+        never selecting a mailbox or spending a credit. `ok` is the green
+        light for a watch: reachable **and** authenticated **and** IDLE
+        **and** QRESYNC — not merely authenticated. Rate-limited per
+        `(client IP, login)`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TestRequest" }
+      responses:
+        "200":
+          description: The structured verdict (a failed probe is still 200).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TestVerdict" }
+        "429":
+          description: Too many attempts for this `(IP, login)`.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /watches:
+    get:
+      tags: [watches]
+      summary: List watches
+      responses:
+        "200":
+          description: Every watch (never the password or HMAC secret).
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/WatchView" }
+    post:
+      tags: [watches]
+      summary: Create a watch
+      description: |
+        Notify URL must be `https://` (loopback `http://` is allowed for
+        local sinks). Creates the watch's billing account and grants its
+        mailbox a one-time trial.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateWatch" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+                  id: { type: string }
+        "400":
+          description: Invalid notify URL.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /watches/{id}:
+    delete:
+      tags: [watches]
+      summary: Delete a watch
+      parameters: [{ $ref: "#/components/parameters/WatchId" }]
+      responses:
+        "200": { description: Deleted. }
+        "404":
+          description: No such watch.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /watches/{id}/pause:
+    post:
+      tags: [watches]
+      summary: Pause a watch (stops watching and debiting)
+      parameters: [{ $ref: "#/components/parameters/WatchId" }]
+      responses:
+        "200": { description: Paused. }
+        "404": { description: No such watch. }
+  /watches/{id}/resume:
+    post:
+      tags: [watches]
+      summary: Resume a watch
+      description: Only starts if the account still has watch-time credit.
+      parameters: [{ $ref: "#/components/parameters/WatchId" }]
+      responses:
+        "200": { description: Resumed. }
+        "404": { description: No such watch. }
+  /watches/{id}/rotate-secret:
+    post:
+      tags: [watches]
+      summary: Rotate the HMAC secret (with an overlap window)
+      description: |
+        The previous secret keeps being signed with until it expires, so a
+        receiver can update without dropping events. Omit `new_secret` to
+        have one generated and returned.
+      parameters: [{ $ref: "#/components/parameters/WatchId" }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RotateRequest" }
+      responses:
+        "200":
+          description: Rotated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+                  secret: { type: string }
+                  prev_expires_at: { type: integer }
+        "404": { description: No such watch. }
+
+  /deliveries:
+    get:
+      tags: [deliveries]
+      summary: Recent delivery log
+      parameters:
+        - name: account
+          in: query
+          schema: { type: string }
+          description: Filter by watch id.
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: Newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DeliveryView" }
+
+  /accounts:
+    get:
+      tags: [accounts]
+      summary: List billing accounts with their two counters
+      responses:
+        "200":
+          description: Every account.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/AccountView" }
+  /accounts/{id}:
+    get:
+      tags: [accounts]
+      summary: One account's balance (trials + paid pool)
+      parameters: [{ $ref: "#/components/parameters/AccountId" }]
+      responses:
+        "200":
+          description: The account view.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountView" }
+        "404": { description: No such account. }
+  /accounts/{id}/credit:
+    post:
+      tags: [accounts]
+      summary: Top up the paid pool
+      description: The sole thing money touches; billing calls this after a payment.
+      parameters: [{ $ref: "#/components/parameters/AccountId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreditRequest" }
+      responses:
+        "200":
+          description: Updated account view.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountView" }
+        "400": { description: Non-positive amount. }
+  /accounts/{id}/auto-refill:
+    post:
+      tags: [accounts]
+      summary: Configure auto-refill
+      parameters: [{ $ref: "#/components/parameters/AccountId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AutoRefillRequest" }
+      responses:
+        "200": { description: Configured. }
+        "400": { description: Missing amount when enabling. }
+
+  /events:
+    get:
+      tags: [stream]
+      summary: Live event stream (Server-Sent Events)
+      description: |
+        A `text/event-stream` of delivery outcomes (`event: delivery`),
+        watch status changes (`event: status`) and metering notices
+        (`event: notice`). Content-free. Consume with `EventSource`.
+      responses:
+        "200":
+          description: The SSE stream.
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+components:
+  parameters:
+    WatchId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    AccountId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+  schemas:
+    ServiceInfo:
+      type: object
+      properties:
+        name: { type: string }
+        version: { type: string }
+        openapi: { type: string }
+        docs: { type: string }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+    TestRequest:
+      type: object
+      required: [imap_host, login, password]
+      properties:
+        imap_host: { type: string }
+        imap_port: { type: integer, default: 993 }
+        login: { type: string }
+        password: { type: string }
+        mailbox: { type: string, default: INBOX }
+    TestVerdict:
+      type: object
+      properties:
+        ok: { type: boolean, description: reachable && authenticated && idle && qresync }
+        reachable: { type: boolean }
+        authenticated: { type: boolean }
+        idle: { type: boolean }
+        qresync: { type: boolean }
+        condstore: { type: boolean }
+        missing:
+          type: array
+          items: { type: string }
+        error: { type: [string, "null"] }
+    CreateWatch:
+      type: object
+      required: [id, imap_host, login, password, notify_url, hmac_secret]
+      properties:
+        id: { type: string }
+        imap_host: { type: string }
+        imap_port: { type: integer, default: 993 }
+        login: { type: string }
+        password: { type: string }
+        mailbox: { type: string, default: INBOX }
+        notify_url: { type: string, format: uri }
+        hmac_secret: { type: string }
+        active: { type: boolean, default: true }
+    WatchView:
+      type: object
+      properties:
+        id: { type: string }
+        imap_host: { type: string }
+        imap_port: { type: integer }
+        login: { type: string }
+        mailbox: { type: string }
+        notify_url: { type: string }
+        active: { type: boolean }
+    RotateRequest:
+      type: object
+      properties:
+        new_secret: { type: [string, "null"] }
+        overlap_secs: { type: [integer, "null"] }
+    DeliveryView:
+      type: object
+      properties:
+        account: { type: string }
+        event: { type: string, enum: [new, flags_added, flags_removed, removed] }
+        uid: { type: integer }
+        ok: { type: boolean }
+        status: { type: [integer, "null"] }
+        error: { type: [string, "null"] }
+        attempts: { type: integer }
+        at: { type: integer }
+    AccountView:
+      type: object
+      properties:
+        id: { type: string }
+        paid_secs: { type: number }
+        paid_expires: { type: [integer, "null"] }
+        pool_expired: { type: boolean }
+        auto_refill: { type: boolean }
+        auto_refill_threshold: { type: number }
+        auto_refill_amount: { type: number }
+        total_available_secs: { type: number }
+        mailboxes:
+          type: array
+          items:
+            type: object
+            properties:
+              watch_id: { type: string }
+              mailbox_key: { type: string }
+              trial_secs: { type: number }
+    CreditRequest:
+      type: object
+      required: [secs]
+      properties:
+        secs: { type: number, description: Watch-seconds to add to the pool. }
+        ttl_secs: { type: [integer, "null"], description: Pool lifetime; default ~12 months. }
+    AutoRefillRequest:
+      type: object
+      required: [enabled]
+      properties:
+        enabled: { type: boolean }
+        threshold_secs: { type: number }
+        amount_secs: { type: number }

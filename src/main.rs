@@ -178,7 +178,12 @@ async fn serve(config: Config) -> Result<()> {
     info!(listen = %config.api.listen, "control API listening");
 
     let shutdown_commands = command_tx.clone();
-    let service = api::router(state).into_make_service_with_connect_info::<SocketAddr>();
+    let service = api::router(
+        state,
+        config.api.ui_dir.clone(),
+        config.api.cors_allow_origin.clone(),
+    )
+    .into_make_service_with_connect_info::<SocketAddr>();
     axum::serve(listener, service)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
