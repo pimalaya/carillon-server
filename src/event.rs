@@ -5,9 +5,19 @@
 //! and *which* UID — never the sender, subject or body. Enriching the
 //! notification is the consumer's job (it holds the credentials); the
 //! signal Carillon emits stays pure.
+//!
+//! Two fields exist purely for delivery hygiene, not content: a unique
+//! [`id`](ChangeEvent::id) so receivers can dedupe our retries
+//! (idempotency), and a creation [`ts`](ChangeEvent::ts) that is folded
+//! into the signed preimage for replay protection. Both are stamped
+//! once, at fold time, so every retry of the same event carries the
+//! same id, timestamp and signature.
 
 use io_imap::watch::ImapMailboxWatchEvent;
+use rand::RngExt;
 use serde::Serialize;
+
+use crate::util::now_secs;
 
 /// The kind of change observed on a mailbox.
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -38,6 +48,12 @@ impl ChangeKind {
 /// The signed payload POSTed to a watch's notify URL.
 #[derive(Clone, Debug, Serialize)]
 pub struct ChangeEvent {
+    /// Unique event id (128-bit random, hex). Stable across retries so
+    /// receivers can dedupe; never a content leak.
+    pub id: String,
+    /// Unix timestamp (seconds) the event was folded. Signed for replay
+    /// protection; stable across retries.
+    pub ts: i64,
     /// The watch (account) identifier this change belongs to.
     pub account: String,
     /// What changed.
@@ -48,7 +64,8 @@ pub struct ChangeEvent {
 
 impl ChangeEvent {
     /// Folds a native IMAP watch event into the canonical shape,
-    /// tagging it with the owning account.
+    /// tagging it with the owning account and stamping a fresh id and
+    /// timestamp.
     pub fn from_watch(account: impl Into<String>, event: &ImapMailboxWatchEvent) -> Self {
         let (kind, uid) = match event {
             ImapMailboxWatchEvent::EnvelopeAdded { uid, .. } => (ChangeKind::New, uid.get()),
@@ -60,9 +77,16 @@ impl ChangeEvent {
         };
 
         Self {
+            id: new_id(),
+            ts: now_secs(),
             account: account.into(),
             event: kind,
             uid,
         }
     }
+}
+
+/// A 128-bit random, hex-encoded event id.
+fn new_id() -> String {
+    format!("{:032x}", rand::rng().random::<u128>())
 }

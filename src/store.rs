@@ -7,14 +7,12 @@
 //! per delivery); the hot delivery path wraps them in
 //! `spawn_blocking`.
 
-use std::{
-    path::Path,
-    sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{path::Path, sync::Mutex, time::Duration};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row, params};
+
+use crate::util::now_secs;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS watch (
@@ -26,6 +24,8 @@ CREATE TABLE IF NOT EXISTS watch (
   mailbox      TEXT NOT NULL,
   notify_url   TEXT NOT NULL,
   hmac_secret  TEXT NOT NULL,
+  hmac_secret_prev         TEXT,
+  hmac_secret_prev_expires INTEGER,
   active       INTEGER NOT NULL DEFAULT 1
 );
 
@@ -64,6 +64,12 @@ pub struct Watch {
     pub notify_url: String,
     /// Shared secret used to HMAC-sign deliveries.
     pub hmac_secret: String,
+    /// The previous HMAC secret during a rotation overlap, still
+    /// accepted by receivers until it expires.
+    pub hmac_secret_prev: Option<String>,
+    /// Unix time (seconds) at which `hmac_secret_prev` stops being
+    /// signed with.
+    pub hmac_secret_prev_expires: Option<i64>,
     /// Whether the watch is enabled.
     pub active: bool,
 }
@@ -79,8 +85,24 @@ impl Watch {
             mailbox: row.get("mailbox")?,
             notify_url: row.get("notify_url")?,
             hmac_secret: row.get("hmac_secret")?,
+            hmac_secret_prev: row.get("hmac_secret_prev")?,
+            hmac_secret_prev_expires: row.get("hmac_secret_prev_expires")?,
             active: row.get::<_, i64>("active")? != 0,
         })
+    }
+
+    /// The secrets a delivery should be signed with right now: always
+    /// the current one, plus the previous one while its overlap window
+    /// is open. Returning both lets a receiver mid-rotation validate
+    /// against either.
+    pub fn signing_secrets(&self, now: i64) -> Vec<&str> {
+        let mut secrets = vec![self.hmac_secret.as_str()];
+        if let (Some(prev), Some(expires)) = (&self.hmac_secret_prev, self.hmac_secret_prev_expires)
+            && now < expires
+        {
+            secrets.push(prev.as_str());
+        }
+        secrets
     }
 }
 
@@ -157,6 +179,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")
             .context("Cannot enable WAL")?;
         conn.execute_batch(SCHEMA).context("Cannot create schema")?;
+        migrate(&conn).context("Cannot migrate schema")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -167,15 +190,19 @@ impl Store {
         self.conn.lock().expect("store mutex poisoned")
     }
 
-    /// Inserts or replaces a watch.
+    /// Inserts or replaces a watch. Rotation state is left to
+    /// [`Store::rotate_secret`]; an upsert resets it (a redefine of the
+    /// watch drops any in-flight overlap).
     pub fn upsert_watch(&self, watch: &Watch) -> Result<()> {
         self.lock().execute(
             "INSERT INTO watch
-               (id, imap_host, imap_port, login, enc_password, mailbox, notify_url, hmac_secret, active)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+               (id, imap_host, imap_port, login, enc_password, mailbox, notify_url,
+                hmac_secret, hmac_secret_prev, hmac_secret_prev_expires, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                imap_host=?2, imap_port=?3, login=?4, enc_password=?5,
-               mailbox=?6, notify_url=?7, hmac_secret=?8, active=?9",
+               mailbox=?6, notify_url=?7, hmac_secret=?8,
+               hmac_secret_prev=?9, hmac_secret_prev_expires=?10, active=?11",
             params![
                 watch.id,
                 watch.imap_host,
@@ -185,10 +212,35 @@ impl Store {
                 watch.mailbox,
                 watch.notify_url,
                 watch.hmac_secret,
+                watch.hmac_secret_prev,
+                watch.hmac_secret_prev_expires,
                 watch.active as i64,
             ],
         )?;
         Ok(())
+    }
+
+    /// Rotates a watch's HMAC secret, keeping the current one as the
+    /// previous secret for an `overlap` window so a receiver can update
+    /// without dropping events. Returns the expiry of the overlap, or
+    /// `None` if no watch matched.
+    pub fn rotate_secret(
+        &self,
+        id: &str,
+        new_secret: &str,
+        overlap: Duration,
+    ) -> Result<Option<i64>> {
+        let now = now_secs();
+        let expires = now + overlap.as_secs() as i64;
+        let n = self.lock().execute(
+            "UPDATE watch
+               SET hmac_secret_prev = hmac_secret,
+                   hmac_secret_prev_expires = ?2,
+                   hmac_secret = ?3
+             WHERE id = ?1",
+            params![id, expires, new_secret],
+        )?;
+        Ok((n > 0).then_some(expires))
     }
 
     /// Returns every active watch, ordered by id.
@@ -235,10 +287,7 @@ impl Store {
 
     /// Records the outcome of a delivery attempt.
     pub fn log_delivery(&self, outcome: &DeliveryOutcome) -> Result<()> {
-        let at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let at = now_secs();
         self.lock().execute(
             "INSERT INTO delivery (account, event, uid, ok, status, error, attempts, at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -277,4 +326,27 @@ impl Store {
         };
         Ok(rows)
     }
+}
+
+/// Adds columns introduced after the initial schema to a pre-existing
+/// database. `CREATE TABLE IF NOT EXISTS` never alters an existing
+/// table, so older stores need their new columns backfilled here.
+fn migrate(conn: &Connection) -> Result<()> {
+    for (column, decl) in [
+        ("hmac_secret_prev", "TEXT"),
+        ("hmac_secret_prev_expires", "INTEGER"),
+    ] {
+        if !column_exists(conn, "watch", column)? {
+            conn.execute(&format!("ALTER TABLE watch ADD COLUMN {column} {decl}"), [])?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `table` has a column named `column`. Both are internal
+/// constants, never user input.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    Ok(names.any(|name| matches!(name, Ok(name) if name == column)))
 }

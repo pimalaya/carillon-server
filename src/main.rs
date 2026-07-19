@@ -27,6 +27,7 @@ mod imap;
 mod ratelimit;
 mod store;
 mod supervisor;
+mod util;
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -45,6 +46,7 @@ use tracing_subscriber::EnvFilter;
 use crate::api::AppState;
 use crate::config::{Config, ImportFile};
 use crate::crypto::Crypto;
+use crate::delivery::validate_notify_url;
 use crate::ratelimit::RateLimiter;
 use crate::store::{Store, Watch};
 use crate::supervisor::{Supervisor, SupervisorCmd};
@@ -184,6 +186,9 @@ fn import(config: &Config, path: &Path) -> Result<()> {
             .with_context(|| format!("Cannot resolve password for account {id}"))?;
         let enc_password = crypto.encrypt(&password)?;
 
+        validate_notify_url(&account.notify_url)
+            .with_context(|| format!("Invalid notify_url for account {id}"))?;
+
         let watch = Watch {
             id: id.clone(),
             imap_host: account.imap_host.clone(),
@@ -193,6 +198,8 @@ fn import(config: &Config, path: &Path) -> Result<()> {
             mailbox: account.mailbox.clone(),
             notify_url: account.notify_url.clone(),
             hmac_secret: account.hmac_secret.clone(),
+            hmac_secret_prev: None,
+            hmac_secret_prev_expires: None,
             active: account.active,
         };
         store.upsert_watch(&watch)?;

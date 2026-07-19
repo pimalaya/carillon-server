@@ -8,12 +8,14 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -21,10 +23,15 @@ use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
 
 use crate::crypto::Crypto;
+use crate::delivery::validate_notify_url;
 use crate::imap::session::{self, ImapAccount};
 use crate::ratelimit::RateLimiter;
 use crate::store::{Store, Watch};
 use crate::supervisor::SupervisorCmd;
+
+/// Default rotation overlap: how long the previous HMAC secret keeps
+/// being signed with so a receiver has time to update.
+const DEFAULT_ROTATE_OVERLAP: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -50,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .route("/watches/{id}", delete(delete_watch))
         .route("/watches/{id}/pause", post(pause_watch))
         .route("/watches/{id}/resume", post(resume_watch))
+        .route("/watches/{id}/rotate-secret", post(rotate_secret))
         .route("/deliveries", get(list_deliveries))
         .with_state(state)
 }
@@ -194,6 +202,10 @@ async fn create_watch(
     State(state): State<AppState>,
     Json(request): Json<CreateWatch>,
 ) -> Result<Response, AppError> {
+    if let Err(err) = validate_notify_url(&request.notify_url) {
+        return Ok(bad_request(&err.to_string()));
+    }
+
     let enc_password = state.crypto.encrypt(&request.password)?;
     let watch = Watch {
         id: request.id,
@@ -204,6 +216,8 @@ async fn create_watch(
         mailbox: request.mailbox,
         notify_url: request.notify_url,
         hmac_secret: request.hmac_secret,
+        hmac_secret_prev: None,
+        hmac_secret_prev_expires: None,
         active: request.active,
     };
 
@@ -271,6 +285,65 @@ async fn set_active(state: AppState, id: String, active: bool) -> Result<Respons
     Ok(Json(json!({ "status": "ok", "active": active })).into_response())
 }
 
+/// Body of `POST /watches/{id}/rotate-secret`. All fields optional; an
+/// empty body rotates to a fresh random secret with the default overlap.
+#[derive(Default, Deserialize)]
+struct RotateRequest {
+    /// The new secret. If omitted, a random 256-bit one is generated
+    /// and returned.
+    #[serde(default)]
+    new_secret: Option<String>,
+    /// How long (seconds) the previous secret keeps being signed with.
+    #[serde(default)]
+    overlap_secs: Option<u64>,
+}
+
+/// Rotates a watch's HMAC secret, keeping the old one valid for an
+/// overlap window (both are signed with meanwhile). Returns the new
+/// secret and the overlap expiry. The secret does not affect the IMAP
+/// connection (the supervisor fingerprint excludes it), so no reconnect.
+async fn rotate_secret(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Response, AppError> {
+    let request: RotateRequest = if body.is_empty() {
+        RotateRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(err) => return Ok(bad_request(&format!("invalid body: {err}"))),
+        }
+    };
+
+    let secret = request.new_secret.unwrap_or_else(random_secret);
+    let overlap = request
+        .overlap_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_ROTATE_OVERLAP);
+
+    let store = state.store.clone();
+    let rotate_id = id.clone();
+    let rotate_secret = secret.clone();
+    let expires = tokio::task::spawn_blocking(move || {
+        store.rotate_secret(&rotate_id, &rotate_secret, overlap)
+    })
+    .await??;
+
+    match expires {
+        Some(prev_expires_at) => {
+            info!(watch = %id, prev_expires_at, "hmac secret rotated");
+            Ok(Json(json!({
+                "status": "ok",
+                "secret": secret,
+                "prev_expires_at": prev_expires_at,
+            }))
+            .into_response())
+        }
+        None => Ok(not_found(&id)),
+    }
+}
+
 #[derive(Deserialize)]
 struct DeliveryQuery {
     account: Option<String>,
@@ -323,6 +396,19 @@ fn not_found(id: &str) -> Response {
         Json(json!({ "error": "watch not found", "id": id })),
     )
         .into_response()
+}
+
+fn bad_request(message: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+}
+
+/// A random 256-bit hex secret, for a rotation with no supplied secret.
+fn random_secret() -> String {
+    format!(
+        "{:032x}{:032x}",
+        rand::rng().random::<u128>(),
+        rand::rng().random::<u128>()
+    )
 }
 
 /// anyhow-to-500 adapter for handlers.

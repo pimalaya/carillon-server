@@ -8,15 +8,18 @@
 
 use std::sync::Arc;
 
+use anyhow::{Result, bail};
 use hmac::{Hmac, KeyInit, Mac};
 use reqwest::Client;
 use sha2::Sha256;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
+use url::{Host, Url};
 
 use crate::event::ChangeEvent;
 use crate::store::{DeliveryOutcome, Store};
+use crate::util::now_secs;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -72,7 +75,10 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent) {
     };
 
     let body = serde_json::to_vec(&event).expect("ChangeEvent always serializes");
-    let signature = sign(&watch.hmac_secret, &body);
+    // Sign the timestamped preimage `t.body` with every currently-valid
+    // secret (current, plus the previous one during a rotation overlap),
+    // Stripe-style, so a mid-rotation receiver validates against either.
+    let signature = sign(&watch.signing_secrets(now_secs()), event.ts, &body);
 
     let mut attempts = 0;
     let mut last_status = None;
@@ -87,6 +93,7 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent) {
             .header("content-type", "application/json")
             .header("x-carillon-event", event.event.as_str())
             .header("x-carillon-account", &event.account)
+            .header("x-carillon-id", &event.id)
             .header("x-carillon-signature", &signature)
             .body(body.clone())
             .send()
@@ -152,11 +159,96 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent) {
     .ok();
 }
 
-/// GitHub-style HMAC-SHA256 signature: `sha256=<hex>`.
-fn sign(secret: &str, body: &[u8]) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
-    mac.update(body);
-    let digest = mac.finalize().into_bytes();
-    format!("sha256={}", hex::encode(digest))
+/// Validates a notify URL against the HTTPS-only policy. Plain `http://`
+/// is refused because a leaked-in-transit signal (and, worse, an
+/// attacker able to see the URL) defeats the point — with one exception:
+/// a loopback host, where `http://` is safe and needed for local sinks,
+/// self-host and tests. Any non-loopback `http://` (or a non-HTTP
+/// scheme) is rejected.
+pub fn validate_notify_url(url: &str) -> Result<()> {
+    let parsed = Url::parse(url).map_err(|err| anyhow::anyhow!("not a valid URL: {err}"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback(&parsed) => {
+            warn!(
+                url,
+                "notify URL is plain http on loopback (allowed for local use)"
+            );
+            Ok(())
+        }
+        "http" => bail!("notify URL must be https:// (plain http is only allowed to loopback)"),
+        other => bail!("notify URL scheme must be https, got {other}://"),
+    }
+}
+
+/// Whether a URL's host is a loopback address or `localhost`.
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+/// Stripe-style signature header over the timestamped preimage
+/// `"{ts}.{body}"`, HMAC-SHA256 with each valid secret:
+/// `t=<ts>,v1=<hex>[,v1=<hex>]`. The timestamp is inside the signed
+/// content (replay protection); multiple `v1` values cover a rotation
+/// overlap. A receiver reconstructs `"{t}.{raw body}"`, HMACs it with
+/// its configured secret, and accepts if any `v1` matches.
+fn sign(secrets: &[&str], ts: i64, body: &[u8]) -> String {
+    let mut preimage = Vec::with_capacity(body.len() + 16);
+    preimage.extend_from_slice(ts.to_string().as_bytes());
+    preimage.push(b'.');
+    preimage.extend_from_slice(body);
+
+    let mut header = format!("t={ts}");
+    for secret in secrets {
+        let mut mac =
+            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+        mac.update(&preimage);
+        header.push_str(",v1=");
+        header.push_str(&hex::encode(mac.finalize().into_bytes()));
+    }
+    header
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Independently recompute what a receiver would, to pin the wire
+    /// format of the signed preimage.
+    fn expected_v1(secret: &str, ts: i64, body: &[u8]) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(format!("{ts}.").as_bytes());
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    #[test]
+    fn single_secret_signature_shape() {
+        let header = sign(&["s3cr3t"], 1700000000, b"{\"uid\":1}");
+        let v1 = expected_v1("s3cr3t", 1700000000, b"{\"uid\":1}");
+        assert_eq!(header, format!("t=1700000000,v1={v1}"));
+    }
+
+    #[test]
+    fn rotation_overlap_emits_both_v1() {
+        let header = sign(&["new", "old"], 42, b"body");
+        let new_v1 = expected_v1("new", 42, b"body");
+        let old_v1 = expected_v1("old", 42, b"body");
+        assert_eq!(header, format!("t=42,v1={new_v1},v1={old_v1}"));
+    }
+
+    #[test]
+    fn notify_url_policy() {
+        assert!(validate_notify_url("https://example.org/hook").is_ok());
+        assert!(validate_notify_url("http://127.0.0.1:9099/").is_ok());
+        assert!(validate_notify_url("http://localhost:8080/x").is_ok());
+        assert!(validate_notify_url("http://example.org/hook").is_err());
+        assert!(validate_notify_url("ftp://example.org/hook").is_err());
+        assert!(validate_notify_url("not a url").is_err());
+    }
 }
