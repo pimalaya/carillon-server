@@ -11,6 +11,7 @@ use std::{path::Path, sync::Mutex, time::Duration};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use sha2::{Digest, Sha256};
 
 use crate::util::now_secs;
 
@@ -63,6 +64,38 @@ CREATE TABLE IF NOT EXISTS mailbox_trial (
   mailbox_key TEXT PRIMARY KEY,
   trial_secs  REAL NOT NULL,
   granted_at  INTEGER NOT NULL
+);
+
+-- Capability links: the login-less bearer credential for an account
+-- (M7). Only the SHA-256 hash is stored, so a DB leak hands out no valid
+-- links. Sign-out deletes the row; expiry ages links out.
+CREATE TABLE IF NOT EXISTS capability (
+  token_hash TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER
+);
+
+-- Mailbox membership of an account: the mailboxes a user has proven
+-- control of (by authenticating), grouped under one account.
+CREATE TABLE IF NOT EXISTS account_mailbox (
+  account_id  TEXT NOT NULL,
+  mailbox_key TEXT NOT NULL,
+  login       TEXT NOT NULL,
+  imap_host   TEXT NOT NULL,
+  added_at    INTEGER NOT NULL,
+  PRIMARY KEY (account_id, mailbox_key)
+);
+
+-- Pending checkout sessions: payment is stateless on our side — we keep
+-- only what to grant on fulfilment, never card/PII (the provider owns
+-- the customer + receipt).
+CREATE TABLE IF NOT EXISTS checkout_session (
+  session_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  secs       REAL NOT NULL,
+  fulfilled  INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
 );
 ";
 
@@ -260,6 +293,17 @@ impl Balance {
     pub fn available(&self) -> f64 {
         self.trial + self.pool
     }
+}
+
+/// A mailbox an account has proven control of.
+#[derive(Clone, Debug)]
+pub struct MembershipRow {
+    /// Normalised mailbox key.
+    pub mailbox_key: String,
+    /// Login used to prove control.
+    pub login: String,
+    /// IMAP host.
+    pub imap_host: String,
 }
 
 /// The sqlite-backed store, cheap to clone via `Arc`.
@@ -607,6 +651,142 @@ impl Store {
         )?;
         Ok(())
     }
+
+    // --- Capability links, membership & checkout (M7) ---
+
+    /// Stores a capability link (by hash) for an account.
+    pub fn issue_capability(
+        &self,
+        account_id: &str,
+        token: &str,
+        expires: Option<i64>,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT OR REPLACE INTO capability (token_hash, account_id, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![token_hash(token), account_id, now_secs(), expires],
+        )?;
+        Ok(())
+    }
+
+    /// Resolves a capability link to its account, honouring expiry.
+    pub fn resolve_capability(&self, token: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let row: Option<(String, Option<i64>)> = conn
+            .query_row(
+                "SELECT account_id, expires_at FROM capability WHERE token_hash = ?1",
+                [token_hash(token)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        Ok(match row {
+            Some((account_id, expires)) => match expires {
+                Some(expires) if now_secs() >= expires => None,
+                _ => Some(account_id),
+            },
+            None => None,
+        })
+    }
+
+    /// Revokes a capability link (sign-out). Returns whether one matched.
+    pub fn revoke_capability(&self, token: &str) -> Result<bool> {
+        let n = self.lock().execute(
+            "DELETE FROM capability WHERE token_hash = ?1",
+            [token_hash(token)],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Records that an account controls a mailbox (idempotent).
+    pub fn add_membership(
+        &self,
+        account_id: &str,
+        mailbox_key: &str,
+        login: &str,
+        imap_host: &str,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT OR IGNORE INTO account_mailbox
+               (account_id, mailbox_key, login, imap_host, added_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![account_id, mailbox_key, login, imap_host, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// The account a mailbox already belongs to, if any (for recovery: a
+    /// re-auth to a member mailbox re-mints that account's link).
+    pub fn account_of_mailbox(&self, mailbox_key: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let account = conn
+            .query_row(
+                "SELECT account_id FROM account_mailbox WHERE mailbox_key = ?1
+                 ORDER BY added_at LIMIT 1",
+                [mailbox_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(account)
+    }
+
+    /// The mailboxes an account controls.
+    pub fn memberships(&self, account_id: &str) -> Result<Vec<MembershipRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT mailbox_key, login, imap_host FROM account_mailbox
+             WHERE account_id = ?1 ORDER BY added_at",
+        )?;
+        let rows = stmt.query_map([account_id], |row| {
+            Ok(MembershipRow {
+                mailbox_key: row.get(0)?,
+                login: row.get(1)?,
+                imap_host: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Records a pending checkout session (what to grant on fulfilment).
+    pub fn create_session(&self, session_id: &str, account_id: &str, secs: f64) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO checkout_session (session_id, account_id, secs, fulfilled, created_at)
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            params![session_id, account_id, secs, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Fulfils a session exactly once, returning `(account_id, secs)` to
+    /// credit. `None` if the session is unknown or already fulfilled
+    /// (idempotency against retried payment webhooks).
+    pub fn fulfill_session(&self, session_id: &str) -> Result<Option<(String, f64)>> {
+        let conn = self.lock();
+        let row: Option<(String, f64)> = conn
+            .query_row(
+                "SELECT account_id, secs FROM checkout_session
+                 WHERE session_id = ?1 AND fulfilled = 0",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        if row.is_some() {
+            conn.execute(
+                "UPDATE checkout_session SET fulfilled = 1 WHERE session_id = ?1",
+                [session_id],
+            )?;
+        }
+        Ok(row)
+    }
+}
+
+/// SHA-256 hex of a capability token — what we persist, so a DB leak
+/// never yields a usable link.
+fn token_hash(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Adds columns introduced after the initial schema to a pre-existing

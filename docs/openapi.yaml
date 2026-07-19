@@ -19,9 +19,11 @@ servers:
 tags:
   - name: health
   - name: onboarding
+  - name: identity
   - name: watches
   - name: deliveries
   - name: accounts
+  - name: billing
   - name: stream
 
 paths:
@@ -84,6 +86,91 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+
+  /auth:
+    post:
+      tags: [identity]
+      summary: Prove control of a mailbox (login-less account)
+      description: |
+        Authenticating proves control. First auth creates an account and
+        mints its capability link; a re-auth to a member mailbox recovers
+        (re-mints) the link; an auth carrying a valid link (`Authorization:
+        Bearer`) adds the mailbox to that account. Rate-limited per
+        `(IP, login)`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AuthRequest" }
+      responses:
+        "200":
+          description: The account and its capability link.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResult" }
+        "401": { description: Authentication failed. }
+        "429": { description: Too many attempts. }
+  /me:
+    get:
+      tags: [identity]
+      summary: The account behind the capability link
+      security: [{ capabilityLink: [] }]
+      responses:
+        "200":
+          description: Members, watches and balance.
+          content:
+            application/json: {}
+        "401": { description: Invalid or missing link. }
+  /signout:
+    post:
+      tags: [identity]
+      summary: Revoke the presented capability link
+      security: [{ capabilityLink: [] }]
+      responses:
+        "200": { description: Revoked (or already gone). }
+
+  /billing/packs:
+    get:
+      tags: [billing]
+      summary: The credit-pack catalogue (watch-time; price is the provider's)
+      responses:
+        "200":
+          description: Packs.
+          content:
+            application/json: {}
+  /billing/checkout:
+    post:
+      tags: [billing]
+      summary: Start a purchase for the link's account
+      security: [{ capabilityLink: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pack]
+              properties: { pack: { type: string } }
+      responses:
+        "200":
+          description: A pending session and the provider checkout URL.
+          content:
+            application/json: {}
+        "400": { description: Unknown pack. }
+  /billing/webhook:
+    post:
+      tags: [billing]
+      summary: Provider payment-confirmed callback (fulfil once, credit pool)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id]
+              properties: { session_id: { type: string } }
+      responses:
+        "200": { description: Fulfilled or ignored (idempotent). }
 
   /watches:
     get:
@@ -273,6 +360,11 @@ paths:
               schema: { type: string }
 
 components:
+  securitySchemes:
+    capabilityLink:
+      type: http
+      scheme: bearer
+      description: The per-account capability link, sent as `Authorization: Bearer <link>`.
   parameters:
     WatchId:
       name: id
@@ -389,3 +481,21 @@ components:
         enabled: { type: boolean }
         threshold_secs: { type: number }
         amount_secs: { type: number }
+    AuthRequest:
+      type: object
+      required: [imap_host, login, password]
+      properties:
+        imap_host: { type: string }
+        imap_port: { type: integer, default: 993 }
+        login: { type: string }
+        password: { type: string }
+        mailbox: { type: string, default: INBOX }
+    AuthResult:
+      type: object
+      properties:
+        account_id: { type: string }
+        action: { type: string, enum: [created, recovered, joined] }
+        link: { type: string, description: The capability link (bearer). Store it. }
+        watchable: { type: boolean }
+        idle: { type: boolean }
+        qresync: { type: boolean }

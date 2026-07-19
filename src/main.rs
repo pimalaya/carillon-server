@@ -19,6 +19,7 @@
 //!   accounts no longer live in the config.
 
 mod api;
+mod billing;
 mod config;
 mod crypto;
 mod delivery;
@@ -170,7 +171,9 @@ async fn serve(config: Config) -> Result<()> {
         commands: command_tx.clone(),
         connector,
         test_limiter: Arc::new(RateLimiter::new(TEST_MAX_ATTEMPTS, TEST_WINDOW)),
+        auth_limiter: Arc::new(RateLimiter::new(TEST_MAX_ATTEMPTS, TEST_WINDOW)),
         live: live_tx,
+        billing: Arc::new(billing::StubBilling),
     };
     let listener = TcpListener::bind(&config.api.listen)
         .await
@@ -232,7 +235,7 @@ fn import(config: &Config, path: &Path) -> Result<()> {
             active: account.active,
         };
         store.upsert_watch(&watch)?;
-        store.ensure_account(&id)?;
+        store.ensure_account(id)?;
         store.grant_trial(
             &metering::mailbox_key(&account.login, &account.imap_host),
             metering::trial_secs(),
