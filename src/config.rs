@@ -1,10 +1,12 @@
 //! # Configuration
 //!
-//! TOML configuration of the watch server: server-wide settings (the
-//! sqlite database, the age key, tuning knobs), the control API listen
-//! address, and an optional list of accounts to seed into the store on
-//! boot. Once seeded, the store is the source of truth; the API can
-//! add, pause and remove watches at runtime.
+//! TOML configuration of the watch server: **infrastructure only** —
+//! server-wide settings (the sqlite database, the age key, tuning
+//! knobs) and the control API listen address. Watches (accounts) do
+//! **not** live here: the store is their sole source of truth, and they
+//! enter it through the control API or the one-shot `carillon import`
+//! command (see [`ImportFile`]). This collapses the old "config-path vs
+//! API-path for accounts" duplication onto one path.
 
 use std::{
     collections::BTreeMap,
@@ -16,7 +18,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-/// Root of the TOML configuration file.
+/// Root of the daemon's TOML configuration file: infrastructure only.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     /// Server-wide settings.
@@ -25,9 +27,6 @@ pub struct Config {
     /// Control API settings.
     #[serde(default)]
     pub api: ApiConfig,
-    /// Accounts to seed into the store on boot, keyed by watch id.
-    #[serde(default)]
-    pub accounts: BTreeMap<String, SeedAccount>,
 }
 
 impl Config {
@@ -98,9 +97,30 @@ impl Default for ApiConfig {
     }
 }
 
-/// One account to seed into the store on boot.
+/// A file of accounts to import into the store, consumed by the
+/// `carillon import` command. This is the headless self-host entrypoint
+/// for populating the DB out-of-band; the running daemon picks the new
+/// watches up on its next reconcile. Distinct from [`Config`] on
+/// purpose: the daemon config is infra, this is data.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ImportFile {
+    /// Accounts to import, keyed by watch id.
+    #[serde(default)]
+    pub accounts: BTreeMap<String, ImportAccount>,
+}
+
+impl ImportFile {
+    /// Reads and parses an import file at the given path.
+    pub fn load(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Cannot read import file at {}", path.display()))?;
+        toml::from_str(&content).context("Cannot parse import file")
+    }
+}
+
+/// One account (watch) to import into the store.
 #[derive(Clone, Debug, Deserialize)]
-pub struct SeedAccount {
+pub struct ImportAccount {
     /// IMAP server host.
     pub imap_host: String,
     /// IMAP server port.

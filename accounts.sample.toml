@@ -1,0 +1,28 @@
+# Carillon accounts import file — sample.
+#
+# Bulk-populate the store for headless self-host:
+#
+#   carillon import accounts.toml [config]
+#
+# Each account is upserted into the store (an existing id is updated in
+# place). A running daemon adopts the new watches on its next reconcile.
+# Prefer the control API for day-to-day changes; this is the one-shot
+# out-of-band entrypoint.
+
+# One section per watch. The key is the watch id (also the `account`
+# field of every emitted event).
+[accounts.me]
+imap_host = "imap.example.org"
+imap_port = 993
+login = "user@example.org"
+# Either an inline password (testing only)...
+password.raw = "app-password-here"
+# ...or a command printing it (keyring CLIs):
+# password.command = "secret-tool lookup service imap user user@example.org"
+mailbox = "INBOX"
+# Where to POST the signed, content-free change events. A developer's
+# own webhook, or an ntfy topic URL for zero-app phone push.
+notify_url = "https://ntfy.sh/my-carillon-topic"
+# Shared secret; deliveries carry `X-Carillon-Signature: sha256=<hmac>`.
+hmac_secret = "change-me"
+active = true

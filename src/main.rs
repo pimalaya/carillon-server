@@ -10,6 +10,13 @@
 //! the [`delivery`] worker, which signs and POSTs them and logs the
 //! outcome to the sqlite [`store`]. The [`api`] manages watches at
 //! runtime. Passwords are encrypted at rest via [`crypto`].
+//!
+//! Two subcommands:
+//!
+//! - `carillon serve [config]` (the default) runs the daemon.
+//! - `carillon import <accounts.toml> [config]` populates the store from
+//!   an [`config::ImportFile`] and exits — the headless entrypoint, since
+//!   accounts no longer live in the config.
 
 mod api;
 mod config;
@@ -20,10 +27,11 @@ mod imap;
 mod store;
 mod supervisor;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rustls::ClientConfig;
 use rustls_platform_verifier::ConfigVerifierExt;
 use tokio::net::TcpListener;
@@ -33,7 +41,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::api::AppState;
-use crate::config::Config;
+use crate::config::{Config, ImportFile};
 use crate::crypto::Crypto;
 use crate::store::{Store, Watch};
 use crate::supervisor::{Supervisor, SupervisorCmd};
@@ -58,19 +66,44 @@ async fn main() -> Result<()> {
         .install_default()
         .ok();
 
-    let config_path = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("import") => {
+            let accounts = args
+                .get(2)
+                .context("usage: carillon import <accounts.toml> [config]")?;
+            let config = load_config(args.get(3).map(String::as_str))?;
+            import(&config, accounts.as_ref())
+        }
+        Some("serve") => {
+            let config = load_config(args.get(2).map(String::as_str))?;
+            serve(config).await
+        }
+        // No subcommand, or a bare config path (kept for convenience):
+        // `carillon` / `carillon carillon.toml` both serve.
+        Some(flag) if flag.starts_with('-') => bail!("unknown flag: {flag}"),
+        other => {
+            let config = load_config(other)?;
+            serve(config).await
+        }
+    }
+}
+
+/// Resolves the config path (explicit arg → `CARILLON_CONFIG` →
+/// `carillon.toml`) and loads it.
+fn load_config(explicit: Option<&str>) -> Result<Config> {
+    let path = explicit
+        .map(String::from)
         .or_else(|| std::env::var("CARILLON_CONFIG").ok())
         .unwrap_or_else(|| String::from("carillon.toml"));
-    let config = Config::load(config_path.as_ref())
-        .with_context(|| format!("Cannot load config at {config_path}"))?;
+    Config::load(path.as_ref()).with_context(|| format!("Cannot load config at {path}"))
+}
 
+/// Runs the daemon: watchers, delivery worker and control API.
+async fn serve(config: Config) -> Result<()> {
     let store = Arc::new(Store::open(&config.server.db_path()).context("Cannot open store")?);
     let crypto =
         Arc::new(Crypto::load_or_create(&config.server.age_key_path()).context("Cannot load key")?);
-
-    let seeded = seed_accounts(&store, &crypto, &config)?;
-    info!(seeded, "configuration seeded");
 
     // Shared TLS config: one verifier and one session cache for every
     // held IMAP connection.
@@ -124,16 +157,17 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Inserts config-declared accounts that are not yet in the store,
-/// leaving runtime changes (pauses, edits made via the API) untouched.
-fn seed_accounts(store: &Store, crypto: &Crypto, config: &Config) -> Result<usize> {
-    let mut seeded = 0;
+/// Imports accounts from a TOML file into the store, then exits. Watches
+/// are upserted (an existing id is updated in place); the running daemon,
+/// if any, adopts them on its next reconcile.
+fn import(config: &Config, path: &Path) -> Result<()> {
+    let store = Store::open(&config.server.db_path()).context("Cannot open store")?;
+    let crypto =
+        Crypto::load_or_create(&config.server.age_key_path()).context("Cannot load key")?;
+    let file = ImportFile::load(path)?;
 
-    for (id, account) in &config.accounts {
-        if store.get_watch(id)?.is_some() {
-            continue;
-        }
-
+    let mut imported = 0;
+    for (id, account) in &file.accounts {
         let password = account
             .password
             .resolve()
@@ -152,9 +186,10 @@ fn seed_accounts(store: &Store, crypto: &Crypto, config: &Config) -> Result<usiz
             active: account.active,
         };
         store.upsert_watch(&watch)?;
-        seeded += 1;
-        info!(watch = %id, "seeded from config");
+        imported += 1;
+        info!(watch = %id, "imported");
     }
 
-    Ok(seeded)
+    info!(imported, "import complete");
+    Ok(())
 }
