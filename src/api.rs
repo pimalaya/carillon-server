@@ -30,9 +30,11 @@ use crate::crypto::Crypto;
 use crate::delivery::validate_notify_url;
 use crate::imap::session::{self, ImapAccount};
 use crate::live::LiveBus;
+use crate::metering::{self, POOL_TTL_SECS};
 use crate::ratelimit::RateLimiter;
 use crate::store::{Store, Watch};
 use crate::supervisor::SupervisorCmd;
+use crate::util::now_secs;
 
 /// Default rotation overlap: how long the previous HMAC secret keeps
 /// being signed with so a receiver has time to update.
@@ -67,6 +69,10 @@ pub fn router(state: AppState) -> Router {
         .route("/watches/{id}/rotate-secret", post(rotate_secret))
         .route("/deliveries", get(list_deliveries))
         .route("/events", get(events))
+        .route("/accounts", get(list_accounts))
+        .route("/accounts/{id}", get(get_account))
+        .route("/accounts/{id}/credit", post(add_credit))
+        .route("/accounts/{id}/auto-refill", post(set_auto_refill))
         .with_state(state)
 }
 
@@ -215,6 +221,10 @@ async fn create_watch(
     }
 
     let enc_password = state.crypto.encrypt(&request.password)?;
+    // One watch, one billing account until grouped under a shared
+    // account (M7); grant the mailbox its one-time trial.
+    let account_id = request.id.clone();
+    let mailbox_key = metering::mailbox_key(&request.login, &request.imap_host);
     let watch = Watch {
         id: request.id,
         imap_host: request.imap_host,
@@ -226,12 +236,19 @@ async fn create_watch(
         hmac_secret: request.hmac_secret,
         hmac_secret_prev: None,
         hmac_secret_prev_expires: None,
+        account_id: account_id.clone(),
         active: request.active,
     };
 
     let id = watch.id.clone();
     let store = state.store.clone();
-    tokio::task::spawn_blocking(move || store.upsert_watch(&watch)).await??;
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        store.upsert_watch(&watch)?;
+        store.ensure_account(&account_id)?;
+        store.grant_trial(&mailbox_key, metering::trial_secs())?;
+        Ok(())
+    })
+    .await??;
     info!(watch = %id, "watch created");
 
     state.commands.send(SupervisorCmd::Reconcile).await.ok();
@@ -419,6 +436,174 @@ async fn events(
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// A member mailbox's non-refillable trial, within an account view.
+#[derive(Serialize)]
+struct MailboxView {
+    watch_id: String,
+    mailbox_key: String,
+    trial_secs: f64,
+}
+
+/// Public view of a billing account: the two counters (per-mailbox trials
+/// and the shared paid pool) the dashboard renders.
+#[derive(Serialize)]
+struct AccountView {
+    id: String,
+    paid_secs: f64,
+    paid_expires: Option<i64>,
+    pool_expired: bool,
+    auto_refill: bool,
+    auto_refill_threshold: f64,
+    auto_refill_amount: f64,
+    mailboxes: Vec<MailboxView>,
+    total_available_secs: f64,
+}
+
+async fn list_accounts(State(state): State<AppState>) -> Result<Json<Vec<AccountView>>, AppError> {
+    let store = state.store.clone();
+    let views = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<AccountView>> {
+        let now = now_secs();
+        store
+            .all_accounts()?
+            .into_iter()
+            .map(|account| account_view(&store, &account.id, now))
+            .collect()
+    })
+    .await??;
+    Ok(Json(views))
+}
+
+async fn get_account(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let store = state.store.clone();
+    let account = tokio::task::spawn_blocking({
+        let id = id.clone();
+        move || store.get_account(&id)
+    })
+    .await??;
+
+    if account.is_none() {
+        return Ok(not_found(&id));
+    }
+
+    let store = state.store.clone();
+    let view = tokio::task::spawn_blocking(move || account_view(&store, &id, now_secs())).await??;
+    Ok(Json(view).into_response())
+}
+
+/// Builds an account view, reading the pool and each member mailbox's
+/// trial. Blocking; call inside `spawn_blocking`.
+fn account_view(store: &Store, id: &str, now: i64) -> anyhow::Result<AccountView> {
+    let account = store.get_account(id)?.unwrap_or(crate::store::AccountRow {
+        id: id.to_string(),
+        paid_secs: 0.0,
+        paid_expires: None,
+        auto_refill: false,
+        auto_refill_threshold: 0.0,
+        auto_refill_amount: 0.0,
+    });
+
+    let pool_expired = matches!(account.paid_expires, Some(expires) if now >= expires);
+    let pool = if pool_expired { 0.0 } else { account.paid_secs };
+
+    let mut mailboxes = Vec::new();
+    let mut trials_total = 0.0;
+    for watch in store.watches_by_account(id)? {
+        let key = metering::mailbox_key(&watch.login, &watch.imap_host);
+        let trial = store.balance(id, &key, now)?.trial;
+        trials_total += trial;
+        mailboxes.push(MailboxView {
+            watch_id: watch.id,
+            mailbox_key: key,
+            trial_secs: trial,
+        });
+    }
+
+    Ok(AccountView {
+        id: account.id,
+        paid_secs: account.paid_secs,
+        paid_expires: account.paid_expires,
+        pool_expired,
+        auto_refill: account.auto_refill,
+        auto_refill_threshold: account.auto_refill_threshold,
+        auto_refill_amount: account.auto_refill_amount,
+        mailboxes,
+        total_available_secs: pool + trials_total,
+    })
+}
+
+/// Body of `POST /accounts/{id}/credit`: top up the paid pool. This is
+/// the sole thing money touches; M7's billing calls it after a payment.
+#[derive(Deserialize)]
+struct CreditRequest {
+    secs: f64,
+    #[serde(default)]
+    ttl_secs: Option<i64>,
+}
+
+async fn add_credit(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<CreditRequest>,
+) -> Result<Response, AppError> {
+    if !(request.secs > 0.0) {
+        return Ok(bad_request("secs must be positive"));
+    }
+    let expires = now_secs() + request.ttl_secs.unwrap_or(POOL_TTL_SECS);
+
+    let store = state.store.clone();
+    let credit_id = id.clone();
+    tokio::task::spawn_blocking(move || store.add_credit(&credit_id, request.secs, expires))
+        .await??;
+    info!(account = %id, secs = request.secs, "credit added");
+
+    let store = state.store.clone();
+    let view = tokio::task::spawn_blocking(move || account_view(&store, &id, now_secs())).await??;
+    Ok(Json(view).into_response())
+}
+
+/// Body of `POST /accounts/{id}/auto-refill`.
+#[derive(Deserialize)]
+struct AutoRefillRequest {
+    enabled: bool,
+    #[serde(default)]
+    threshold_secs: f64,
+    #[serde(default)]
+    amount_secs: f64,
+}
+
+async fn set_auto_refill(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<AutoRefillRequest>,
+) -> Result<Response, AppError> {
+    if request.enabled && !(request.amount_secs > 0.0) {
+        return Ok(bad_request(
+            "amount_secs must be positive when enabling auto-refill",
+        ));
+    }
+
+    let store = state.store.clone();
+    let refill_id = id.clone();
+    let matched = tokio::task::spawn_blocking(move || {
+        store.set_auto_refill(
+            &refill_id,
+            request.enabled,
+            request.threshold_secs,
+            request.amount_secs,
+        )
+    })
+    .await??;
+
+    if !matched {
+        return Ok(not_found(&id));
+    }
+    info!(account = %id, enabled = request.enabled, "auto-refill configured");
+    Ok(Json(json!({ "status": "ok" })).into_response())
 }
 
 fn not_found(id: &str) -> Response {

@@ -42,6 +42,37 @@ pub enum LiveEvent {
         detail: Option<String>,
         at: i64,
     },
+    /// A metering / billing notice (low balance, exhausted, refilled).
+    Notice {
+        account: String,
+        kind: NoticeKind,
+        detail: Option<String>,
+        at: i64,
+    },
+}
+
+/// A metering / billing notice. Delivered on the SSE bus and, so a
+/// no-dashboard user is not silently cut off, also as a signed webhook.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    /// The account pool is running low.
+    LowBalance,
+    /// Credit ran out; the watch was paused.
+    CreditExhausted,
+    /// Auto-refill topped the pool back up.
+    AutoRefilled,
+}
+
+impl NoticeKind {
+    /// The wire string for the webhook `notice` field.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NoticeKind::LowBalance => "low_balance",
+            NoticeKind::CreditExhausted => "credit_exhausted",
+            NoticeKind::AutoRefilled => "auto_refilled",
+        }
+    }
 }
 
 /// The connection state of a single watch, as surfaced to the UI.
@@ -64,6 +95,7 @@ impl LiveEvent {
         match self {
             LiveEvent::Delivery { .. } => "delivery",
             LiveEvent::Status { .. } => "status",
+            LiveEvent::Notice { .. } => "notice",
         }
     }
 
@@ -92,6 +124,16 @@ impl LiveEvent {
         LiveEvent::Status {
             account: account.into(),
             state,
+            detail,
+            at: now_secs(),
+        }
+    }
+
+    /// A metering notice stamped now.
+    pub fn notice(account: impl Into<String>, kind: NoticeKind, detail: Option<String>) -> Self {
+        LiveEvent::Notice {
+            account: account.into(),
+            kind,
             detail,
             at: now_secs(),
         }

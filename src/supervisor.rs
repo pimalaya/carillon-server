@@ -28,6 +28,7 @@ use crate::event::ChangeEvent;
 use crate::imap::pump;
 use crate::imap::session::{self, ImapAccount};
 use crate::live::{LiveBus, LiveEvent, WatchState};
+use crate::metering;
 use crate::store::{Store, Watch};
 
 /// Bound on the whole TCP + TLS + greeting + login handshake.
@@ -169,6 +170,18 @@ impl Supervisor {
     }
 
     fn spawn_watcher(&self, watch: &Watch) -> anyhow::Result<WatcherHandle> {
+        // Entitlement at the server boundary: never hold a standing IDLE
+        // connection for an account with no watch-time left.
+        let mailbox_key = metering::mailbox_key(&watch.login, &watch.imap_host);
+        if !metering::has_credit(&self.store, &watch.account_id, &mailbox_key) {
+            let _ = self.live.send(LiveEvent::status(
+                &watch.id,
+                WatchState::Error,
+                Some("no credit".into()),
+            ));
+            anyhow::bail!("no watch-time credit for account {}", watch.account_id);
+        }
+
         let password = self.crypto.decrypt(&watch.enc_password)?;
         let account = ImapAccount {
             host: watch.imap_host.clone(),

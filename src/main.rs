@@ -25,6 +25,7 @@ mod delivery;
 mod event;
 mod imap;
 mod live;
+mod metering;
 mod ratelimit;
 mod store;
 mod supervisor;
@@ -137,8 +138,17 @@ async fn serve(config: Config) -> Result<()> {
     tokio::spawn(delivery::run(
         event_rx,
         store.clone(),
-        http,
+        http.clone(),
         live_tx.clone(),
+    ));
+
+    // Metering loop: continuous watch-time debit + entitlement.
+    tokio::spawn(metering::run(
+        store.clone(),
+        live_tx.clone(),
+        http,
+        command_tx.clone(),
+        metering::tick(),
     ));
 
     // Supervisor. Keep a clone of the connector for the `/test` probe.
@@ -212,9 +222,16 @@ fn import(config: &Config, path: &Path) -> Result<()> {
             hmac_secret: account.hmac_secret.clone(),
             hmac_secret_prev: None,
             hmac_secret_prev_expires: None,
+            // One watch, one billing account until grouped (M7).
+            account_id: id.clone(),
             active: account.active,
         };
         store.upsert_watch(&watch)?;
+        store.ensure_account(&id)?;
+        store.grant_trial(
+            &metering::mailbox_key(&account.login, &account.imap_host),
+            metering::trial_secs(),
+        )?;
         imported += 1;
         info!(watch = %id, "imported");
     }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use hmac::{Hmac, KeyInit, Mac};
 use reqwest::Client;
+use serde_json::json;
 use sha2::Sha256;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Duration, sleep};
@@ -19,7 +20,7 @@ use url::{Host, Url};
 
 use crate::event::ChangeEvent;
 use crate::live::{LiveBus, LiveEvent};
-use crate::store::{DeliveryOutcome, Store};
+use crate::store::{DeliveryOutcome, Store, Watch};
 use crate::util::now_secs;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -175,6 +176,41 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: Li
     })
     .await
     .ok();
+}
+
+/// Sends a one-shot, signed **notice** webhook (low balance, exhausted,
+/// auto-refilled) to a watch's notify URL. Best-effort and content-free,
+/// like a change delivery, but not retried — a notice is advisory and the
+/// same state recurs on the next tick. Reuses the change-delivery
+/// signature scheme so receivers verify it the same way.
+pub async fn deliver_notice(client: &Client, watch: &Watch, kind: &str) {
+    let ts = now_secs();
+    let body = serde_json::to_vec(&json!({
+        "type": "notice",
+        "notice": kind,
+        "account": watch.id,
+        "ts": ts,
+    }))
+    .expect("notice always serializes");
+    let signature = sign(&watch.signing_secrets(ts), ts, &body);
+
+    let result = client
+        .post(&watch.notify_url)
+        .header("content-type", "application/json")
+        .header("x-carillon-event", "notice")
+        .header("x-carillon-account", &watch.id)
+        .header("x-carillon-signature", &signature)
+        .body(body)
+        .send()
+        .await;
+
+    match result {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            warn!(account = %watch.id, kind, status = %response.status(), "notice not acked")
+        }
+        Err(err) => warn!(account = %watch.id, kind, error = %err, "notice delivery failed"),
+    }
 }
 
 /// Validates a notify URL against the HTTPS-only policy. Plain `http://`
