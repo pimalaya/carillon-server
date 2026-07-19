@@ -1,0 +1,9 @@
+/target
+/result
+/carillon.toml
+/*.db
+/*.db-*
+/age.key
+/.envrc
+/.direnv
+/vendor

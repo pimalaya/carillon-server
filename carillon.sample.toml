@@ -1,0 +1,40 @@
+# Carillon watch server — sample configuration.
+#
+# Copy to `carillon.toml` and edit. Everything under [server] and [api]
+# has defaults; [accounts.*] entries are seeded into the store on first
+# boot (existing watches are left untouched — manage them at runtime via
+# the control API).
+
+[server]
+# sqlite database (watches + delivery log). `~` is expanded.
+db = "~/.local/share/carillon/carillon.db"
+# age identity file, generated (mode 0600) if absent, used to encrypt
+# watch passwords at rest.
+age_key_file = "~/.local/share/carillon/age.key"
+# Ceiling on simultaneous TLS handshakes (reconnect-storm throttle).
+max_concurrent_handshakes = 50
+# Safety-net interval (seconds) at which the supervisor re-reads the
+# store, on top of API-triggered reconciles.
+reconcile_interval_secs = 60
+
+[api]
+# Listen address of the HTTP control API.
+listen = "127.0.0.1:3000"
+
+# One section per watch. The key is the watch id (also the `account`
+# field of every emitted event).
+[accounts.me]
+imap_host = "imap.example.org"
+imap_port = 993
+login = "user@example.org"
+# Either an inline password (testing only)...
+password.raw = "app-password-here"
+# ...or a command printing it (keyring CLIs):
+# password.command = "secret-tool lookup service imap user user@example.org"
+mailbox = "INBOX"
+# Where to POST the signed, content-free change events. A developer's
+# own webhook, or an ntfy topic URL for zero-app phone push.
+notify_url = "https://ntfy.sh/my-carillon-topic"
+# Shared secret; deliveries carry `X-Carillon-Signature: sha256=<hmac>`.
+hmac_secret = "change-me"
+active = true
