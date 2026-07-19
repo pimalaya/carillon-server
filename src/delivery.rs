@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use url::{Host, Url};
 
 use crate::event::ChangeEvent;
+use crate::live::{LiveBus, LiveEvent};
 use crate::store::{DeliveryOutcome, Store};
 use crate::util::now_secs;
 
@@ -31,7 +32,12 @@ const MAX_ATTEMPTS: u32 = 3;
 const CONCURRENCY: usize = 64;
 
 /// Runs the delivery loop until the event channel closes.
-pub async fn run(mut events: mpsc::Receiver<ChangeEvent>, store: Arc<Store>, client: Client) {
+pub async fn run(
+    mut events: mpsc::Receiver<ChangeEvent>,
+    store: Arc<Store>,
+    client: Client,
+    live: LiveBus,
+) {
     let sem = Arc::new(Semaphore::new(CONCURRENCY));
 
     while let Some(event) = events.recv().await {
@@ -42,15 +48,16 @@ pub async fn run(mut events: mpsc::Receiver<ChangeEvent>, store: Arc<Store>, cli
             .expect("delivery semaphore never closes");
         let store = store.clone();
         let client = client.clone();
+        let live = live.clone();
 
         tokio::spawn(async move {
-            deliver(store, client, event).await;
+            deliver(store, client, event, live).await;
             drop(permit);
         });
     }
 }
 
-async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent) {
+async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: LiveBus) {
     let account = event.account.clone();
 
     // The store is the source of truth for the endpoint and secret.
@@ -140,6 +147,17 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent) {
             "delivery failed",
         );
     }
+
+    // Publish the outcome to any live (SSE) subscribers. Ignore the
+    // error: no subscribers is the normal case.
+    let _ = live.send(LiveEvent::delivery(
+        event.account.clone(),
+        event.event.as_str(),
+        event.uid,
+        ok,
+        last_status,
+        attempts,
+    ));
 
     let event_kind = event.event.as_str().to_owned();
     let uid = event.uid;

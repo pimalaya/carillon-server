@@ -6,12 +6,14 @@
 //! connections. This is the prototype's stand-in for the eventual
 //! dashboard and billing gate.
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -20,11 +22,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::{Stream, StreamExt};
 use tracing::{info, warn};
 
 use crate::crypto::Crypto;
 use crate::delivery::validate_notify_url;
 use crate::imap::session::{self, ImapAccount};
+use crate::live::LiveBus;
 use crate::ratelimit::RateLimiter;
 use crate::store::{Store, Watch};
 use crate::supervisor::SupervisorCmd;
@@ -46,6 +51,8 @@ pub struct AppState {
     pub connector: TlsConnector,
     /// Per-`(IP, login)` limiter guarding the `/test` oracle surface.
     pub test_limiter: Arc<RateLimiter>,
+    /// Live bus the `/events` SSE stream subscribes to.
+    pub live: LiveBus,
 }
 
 /// Builds the control API router.
@@ -59,6 +66,7 @@ pub fn router(state: AppState) -> Router {
         .route("/watches/{id}/resume", post(resume_watch))
         .route("/watches/{id}/rotate-secret", post(rotate_secret))
         .route("/deliveries", get(list_deliveries))
+        .route("/events", get(events))
         .with_state(state)
 }
 
@@ -388,6 +396,29 @@ async fn list_deliveries(
         })
         .collect();
     Ok(Json(views))
+}
+
+/// `GET /events` — a Server-Sent Events stream of live delivery outcomes
+/// and watch connection-status changes, for the dashboard. One-way,
+/// browser-native (`EventSource`), proxy-friendly. Each subscriber gets
+/// its own broadcast receiver; a slow client that lags simply misses the
+/// oldest events (surfaced as a `lagged` SSE event) rather than stalling
+/// the bus. Purely observational and content-free.
+async fn events(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = BroadcastStream::new(state.live.subscribe()).map(|message| {
+        let event = match message {
+            Ok(live) => Event::default()
+                .event(live.name())
+                .data(serde_json::to_string(&live).unwrap_or_default()),
+            // The subscriber fell behind and lost `skipped` events.
+            Err(err) => Event::default().event("lagged").data(err.to_string()),
+        };
+        Ok(event)
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 fn not_found(id: &str) -> Response {

@@ -24,6 +24,7 @@ mod crypto;
 mod delivery;
 mod event;
 mod imap;
+mod live;
 mod ratelimit;
 mod store;
 mod supervisor;
@@ -38,7 +39,7 @@ use anyhow::{Context, Result, bail};
 use rustls::ClientConfig;
 use rustls_platform_verifier::ConfigVerifierExt;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_rustls::TlsConnector;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -127,9 +128,18 @@ async fn serve(config: Config) -> Result<()> {
 
     let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
+    // Live bus for the SSE stream. The extra receiver is dropped; the
+    // sender survives with zero subscribers, and each SSE client makes
+    // its own.
+    let (live_tx, _live_rx) = broadcast::channel(live::CAPACITY);
 
     // Delivery worker.
-    tokio::spawn(delivery::run(event_rx, store.clone(), http));
+    tokio::spawn(delivery::run(
+        event_rx,
+        store.clone(),
+        http,
+        live_tx.clone(),
+    ));
 
     // Supervisor. Keep a clone of the connector for the `/test` probe.
     let supervisor = Supervisor::new(
@@ -138,6 +148,7 @@ async fn serve(config: Config) -> Result<()> {
         connector.clone(),
         event_tx,
         config.server.max_concurrent_handshakes,
+        live_tx.clone(),
     );
     let reconcile_interval = Duration::from_secs(config.server.reconcile_interval_secs.max(5));
     tokio::spawn(supervisor.run(command_rx, reconcile_interval));
@@ -149,6 +160,7 @@ async fn serve(config: Config) -> Result<()> {
         commands: command_tx.clone(),
         connector,
         test_limiter: Arc::new(RateLimiter::new(TEST_MAX_ATTEMPTS, TEST_WINDOW)),
+        live: live_tx,
     };
     let listener = TcpListener::bind(&config.api.listen)
         .await

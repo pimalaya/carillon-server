@@ -27,6 +27,7 @@ use crate::crypto::Crypto;
 use crate::event::ChangeEvent;
 use crate::imap::pump;
 use crate::imap::session::{self, ImapAccount};
+use crate::live::{LiveBus, LiveEvent, WatchState};
 use crate::store::{Store, Watch};
 
 /// Bound on the whole TCP + TLS + greeting + login handshake.
@@ -62,6 +63,7 @@ pub struct Supervisor {
     events: mpsc::Sender<ChangeEvent>,
     handshake_sem: Arc<Semaphore>,
     handles: HashMap<String, WatcherHandle>,
+    live: LiveBus,
 }
 
 impl Supervisor {
@@ -73,6 +75,7 @@ impl Supervisor {
         connector: TlsConnector,
         events: mpsc::Sender<ChangeEvent>,
         max_handshakes: usize,
+        live: LiveBus,
     ) -> Self {
         Self {
             store,
@@ -81,6 +84,7 @@ impl Supervisor {
             events,
             handshake_sem: Arc::new(Semaphore::new(max_handshakes.max(1))),
             handles: HashMap::new(),
+            live,
         }
     }
 
@@ -142,6 +146,9 @@ impl Supervisor {
             if let Some(handle) = self.handles.remove(&id) {
                 debug!(watch = %id, "stopping watcher");
                 stop(handle);
+                let _ = self
+                    .live
+                    .send(LiveEvent::status(&id, WatchState::Stopped, None));
             }
         }
 
@@ -179,9 +186,19 @@ impl Supervisor {
         let events = self.events.clone();
         let handshake_sem = self.handshake_sem.clone();
         let shutdown_flag = shutdown.clone();
+        let live = self.live.clone();
 
         let task = tokio::spawn(async move {
-            watch_loop(id, account, connector, events, handshake_sem, shutdown_flag).await;
+            watch_loop(
+                id,
+                account,
+                connector,
+                events,
+                handshake_sem,
+                shutdown_flag,
+                live,
+            )
+            .await;
         });
 
         Ok(WatcherHandle {
@@ -192,8 +209,11 @@ impl Supervisor {
     }
 
     fn stop_all(&mut self) {
-        for (_, handle) in self.handles.drain() {
+        for (id, handle) in self.handles.drain() {
             stop(handle);
+            let _ = self
+                .live
+                .send(LiveEvent::status(&id, WatchState::Stopped, None));
         }
     }
 }
@@ -226,11 +246,17 @@ async fn watch_loop(
     events: mpsc::Sender<ChangeEvent>,
     handshake_sem: Arc<Semaphore>,
     shutdown: Arc<AtomicBool>,
+    live: LiveBus,
 ) {
     let mailbox: Mailbox<'static> = match Mailbox::try_from(account.mailbox.clone()) {
         Ok(mailbox) => mailbox,
         Err(_) => {
             error!(watch = %id, mailbox = %account.mailbox, "invalid mailbox name");
+            let _ = live.send(LiveEvent::status(
+                &id,
+                WatchState::Error,
+                Some("invalid mailbox name".into()),
+            ));
             return;
         }
     };
@@ -258,11 +284,17 @@ async fn watch_loop(
                     Ok(watcher) => watcher,
                     Err(err) => {
                         error!(watch = %id, error = %err, "watcher cannot start; giving up");
+                        let _ = live.send(LiveEvent::status(
+                            &id,
+                            WatchState::Error,
+                            Some(err.to_string()),
+                        ));
                         return;
                     }
                 };
 
                 info!(watch = %id, host = %account.host, mailbox = %account.mailbox, "watching");
+                let _ = live.send(LiveEvent::status(&id, WatchState::Watching, None));
 
                 let outcome = pump::run_watch(
                     &id,
@@ -278,8 +310,22 @@ async fn watch_loop(
                     Err(err) => warn!(watch = %id, error = %err, "session lost; reconnecting"),
                 }
             }
-            Ok(Err(err)) => warn!(watch = %id, error = %err, "connect failed"),
-            Err(_elapsed) => warn!(watch = %id, "connect timed out"),
+            Ok(Err(err)) => {
+                warn!(watch = %id, error = %err, "connect failed");
+                let _ = live.send(LiveEvent::status(
+                    &id,
+                    WatchState::Error,
+                    Some(format!("{err:#}")),
+                ));
+            }
+            Err(_elapsed) => {
+                warn!(watch = %id, "connect timed out");
+                let _ = live.send(LiveEvent::status(
+                    &id,
+                    WatchState::Error,
+                    Some("connect timed out".into()),
+                ));
+            }
         }
 
         if shutdown.load(Ordering::SeqCst) {
@@ -292,6 +338,7 @@ async fn watch_loop(
             backoff = INITIAL_BACKOFF;
         }
 
+        let _ = live.send(LiveEvent::status(&id, WatchState::Reconnecting, None));
         let wait = backoff + jitter(backoff);
         debug!(watch = %id, wait_ms = wait.as_millis() as u64, "backing off before reconnect");
         sleep(wait).await;
