@@ -52,3 +52,22 @@ listen = "127.0.0.1:3000"
 # client_secret = "…"        # omit for a public client
 # [oauth.microsoft]
 # client_id = "…"
+
+# Payment provider. Unset (default) = the keyless STUB provider (checkout
+# returns a placeholder URL and the webhook fulfils on trust) — fine for local
+# dev. Configure [billing.stripe] to take real money. Hosted Checkout needs
+# ONLY the secret key server-side — no publishable key. In production inject
+# the secrets via systemd LoadCredential, not this file (see
+# docs/DEPLOY_HARDENING.md). Create the three Prices in the Stripe dashboard;
+# the price lives THERE, not here.
+# [billing.stripe]
+# secret_key = "sk_test_…"          # sandbox key; sk_live_… in production
+# webhook_secret = "whsec_…"        # from `stripe listen` or the dashboard endpoint
+# success_url and cancel_url are OPTIONAL — default to `dashboard_url` (or
+# `public_url`) with a ?checkout=success/cancel marker. Set them to override:
+# success_url = "https://app.carillon.example.org/?checkout=success"
+# cancel_url  = "https://app.carillon.example.org/?checkout=cancel"
+# [billing.stripe.prices]           # pack id → Stripe Price id
+# week    = "price_…"
+# quarter = "price_…"
+# year    = "price_…"

@@ -199,6 +199,22 @@ async fn serve(config: Config) -> Result<()> {
         microsoft: config.oauth.microsoft.as_ref().map(to_client),
     };
 
+    // Payment provider: Stripe when configured, else the keyless stub.
+    let billing: Arc<billing::Billing> = match &config.billing.stripe {
+        Some(stripe) => {
+            info!("billing: stripe");
+            Arc::new(billing::Billing::Stripe(billing::StripeBilling::new(
+                http.clone(),
+                stripe,
+                &dashboard_url,
+            )))
+        }
+        None => {
+            info!("billing: stub (no [billing.stripe] configured)");
+            Arc::new(billing::Billing::Stub)
+        }
+    };
+
     // Control API.
     let state = AppState {
         store: store.clone(),
@@ -211,7 +227,7 @@ async fn serve(config: Config) -> Result<()> {
         discover_limiter: Arc::new(RateLimiter::new(DISCOVER_MAX_ATTEMPTS, DISCOVER_WINDOW)),
         live: live_tx,
         shutdown: shutdown_rx,
-        billing: Arc::new(billing::StubBilling),
+        billing,
         admin_token: config.api.admin_token.clone(),
         public_url,
         dashboard_origin,

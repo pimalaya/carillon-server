@@ -31,6 +31,9 @@ pub struct Config {
     /// Thunderbird public clients).
     #[serde(default)]
     pub oauth: OauthConfig,
+    /// Payment provider (Stripe). Unset = the keyless stub provider.
+    #[serde(default)]
+    pub billing: BillingConfig,
 }
 
 /// OAuth client overrides for the providers that need a pre-registered app
@@ -56,6 +59,40 @@ pub struct OauthClientConfig {
     /// PKCE clients have none).
     #[serde(default)]
     pub client_secret: Option<String>,
+}
+
+/// Payment provider configuration. Unset (`[billing]` absent) = the keyless
+/// stub provider used for local/dev.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct BillingConfig {
+    /// `[billing.stripe]` — the Stripe adapter. Absent = the stub.
+    #[serde(default)]
+    pub stripe: Option<StripeConfig>,
+}
+
+/// Stripe configuration. `secret_key` and `webhook_secret` are **secrets** —
+/// in production inject them via systemd `LoadCredential` / a secrets manager
+/// rather than a world-readable file (see `docs/DEPLOY_HARDENING.md`). The
+/// price *lives in Stripe*: `prices` maps each pack id to a Stripe Price id
+/// created in the dashboard. Only the **secret** key is needed — hosted
+/// Checkout needs no publishable key server-side.
+#[derive(Clone, Debug, Deserialize)]
+pub struct StripeConfig {
+    /// Secret API key (`sk_test_…` in the sandbox, `sk_live_…` in production).
+    pub secret_key: String,
+    /// Webhook signing secret (`whsec_…`) for verifying the event signature.
+    pub webhook_secret: String,
+    /// Where Stripe returns the buyer after a successful payment. Optional —
+    /// defaults to the dashboard URL with a `?checkout=success` marker.
+    #[serde(default)]
+    pub success_url: Option<String>,
+    /// Where Stripe returns the buyer after a cancelled payment. Optional —
+    /// defaults to the dashboard URL with a `?checkout=cancel` marker.
+    #[serde(default)]
+    pub cancel_url: Option<String>,
+    /// Pack id (`week`, `quarter`, `year`) → Stripe Price id (`price_…`).
+    #[serde(default)]
+    pub prices: BTreeMap<String, String>,
 }
 
 impl Config {

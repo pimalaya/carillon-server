@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method, StatusCode, header};
@@ -84,7 +85,7 @@ pub struct AppState {
     /// hyper waits for every in-flight connection).
     pub shutdown: watch::Receiver<bool>,
     /// Payment provider adapter (stubbed until keys are wired).
-    pub billing: Arc<dyn Billing>,
+    pub billing: Arc<Billing>,
     /// Optional master token granting unscoped access to every account
     /// (ops / headless self-host). `None` = no unscoped access exists;
     /// every data route is reachable only via a capability link.
@@ -1692,7 +1693,21 @@ async fn billing_checkout(
         return Ok(bad_request("unknown pack"));
     };
 
+    // Create the provider checkout first (it can fail / call out); only then
+    // record the pending session, so a failed checkout leaves no orphan row.
     let session_id = random_secret();
+    let url = match state
+        .billing
+        .create_checkout(&session_id, &account_id, &pack)
+        .await
+    {
+        Ok(url) => url,
+        Err(err) => {
+            warn!(account = %account_id, pack = pack.id, error = %err, "checkout failed");
+            return Ok(bad_request(&format!("could not start checkout: {err}")));
+        }
+    };
+
     let store = state.store.clone();
     let create_id = account_id.clone();
     let create_session = session_id.clone();
@@ -1701,7 +1716,6 @@ async fn billing_checkout(
     })
     .await??;
 
-    let url = state.billing.checkout_url(&session_id, &account_id, &pack);
     info!(account = %account_id, pack = pack.id, "checkout created");
     Ok(Json(json!({
         "provider": state.billing.provider(),
@@ -1713,24 +1727,34 @@ async fn billing_checkout(
     .into_response())
 }
 
-/// Body of `POST /billing/webhook`.
-#[derive(Deserialize)]
-struct WebhookRequest {
-    session_id: String,
-}
-
 /// `POST /billing/webhook` — the provider's payment-confirmed callback.
-/// Fulfils the session exactly once (idempotent against retries),
-/// crediting the account's pool. A real provider impl would verify the
-/// webhook signature over the raw body before trusting it.
+/// The **raw body** is verified against the provider signature (Stripe's
+/// `Stripe-Signature` HMAC) before it is trusted, then the referenced session
+/// is fulfilled exactly once (idempotent against Stripe's retries), crediting
+/// the account's pool.
 async fn billing_webhook(
     State(state): State<AppState>,
-    Json(request): Json<WebhookRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, AppError> {
+    let signature = headers
+        .get("stripe-signature")
+        .and_then(|v| v.to_str().ok());
+    let session_id = match state.billing.verify_webhook(signature, &body) {
+        Ok(billing::WebhookOutcome::Fulfil(id)) => id,
+        Ok(billing::WebhookOutcome::Ignore) => {
+            return Ok(Json(json!({ "status": "ignored" })).into_response());
+        }
+        Err(err) => {
+            warn!(error = %err, "billing webhook rejected");
+            return Ok(bad_request(&format!("webhook rejected: {err}")));
+        }
+    };
+
     let store = state.store.clone();
     let fulfilled =
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<(String, f64)>> {
-            let Some((account_id, secs)) = store.fulfill_session(&request.session_id)? else {
+            let Some((account_id, secs)) = store.fulfill_session(&session_id)? else {
                 return Ok(None);
             };
             store.add_credit(&account_id, secs, now_secs() + POOL_TTL_SECS)?;

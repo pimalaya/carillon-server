@@ -323,25 +323,31 @@ paths:
               properties: { pack: { type: string } }
       responses:
         "200":
-          description: A pending session and the provider checkout URL.
+          description: >
+            A pending session and the provider checkout URL (Stripe hosted
+            Checkout). Send the buyer to `checkout_url`.
           content:
             application/json: {}
-        "400": { description: Unknown pack. }
+        "400": { description: Unknown pack, or the provider rejected checkout. }
   /billing/webhook:
     post:
       tags: [billing]
-      summary: Provider payment-confirmed callback (fulfil once, credit pool)
+      summary: Provider payment-confirmed callback (verify signature, fulfil once)
       security: []
+      description: |
+        The provider's raw event. For Stripe, the `Stripe-Signature` header
+        HMAC is verified over the **raw body** (within a 5-minute skew) before
+        anything is trusted; a paid `checkout.session.completed` fulfils the
+        referenced session exactly once (idempotent against Stripe's retries)
+        and credits the pool. The stub provider trusts a `{session_id}` body.
       requestBody:
         required: true
+        description: The provider's raw event body (do not re-serialize).
         content:
-          application/json:
-            schema:
-              type: object
-              required: [session_id]
-              properties: { session_id: { type: string } }
+          application/json: {}
       responses:
         "200": { description: Fulfilled or ignored (idempotent). }
+        "400": { description: Signature verification failed. }
 
   /watches:
     get:
