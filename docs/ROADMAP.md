@@ -45,8 +45,8 @@ capability guard (needs real creds + a reachable endpoint).
 
 The whole product core and both fronts landed and were **verified live
 against a real Fastmail mailbox** (`imap.fastmail.com`, IMAP IDLE + SMTP
-to trigger events). One commit per milestone on the `milestones-m1-m7`
-branch; 12 unit tests + the qresync guard, clippy-clean.
+to trigger events). Merged to `master` (2026-07-20); 12 unit tests + the
+qresync guard, clippy-clean.
 
 - **M1** — `[accounts]` dropped; config is `[server]`+`[api]` only; the
   store is the sole watch source; `carillon import` / `serve` subcommands.
