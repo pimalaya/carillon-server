@@ -14,12 +14,36 @@ use crate::util::now_secs;
 
 /// The sender half of the live bus, cloned to every publisher and to
 /// the API state. Subscribers call [`broadcast::Sender::subscribe`].
-pub type LiveBus = broadcast::Sender<LiveEvent>;
+pub type LiveBus = broadcast::Sender<Routed>;
 
 /// Channel depth: how many live events buffer before a slow SSE
 /// subscriber starts lagging (dropping the oldest). Deliveries and
 /// status changes are small and infrequent per box, so this is ample.
 pub const CAPACITY: usize = 1024;
+
+/// A live event tagged with the billing **account** it belongs to, so the
+/// `/events` SSE stream can scope each subscriber to its own account
+/// (§ DECISIONS 5). The routing tag is server-side only — the wire
+/// payload a client receives is just the inner [`LiveEvent`], unchanged.
+#[derive(Clone, Debug)]
+pub struct Routed {
+    /// The billing account this event concerns; the SSE handler forwards
+    /// an event to a subscriber only when it matches (or the subscriber is
+    /// the unscoped admin).
+    pub account_id: String,
+    /// The event to serialize and deliver.
+    pub event: LiveEvent,
+}
+
+impl Routed {
+    /// Tags a live event with its billing account for scoped fan-out.
+    pub fn new(account_id: impl Into<String>, event: LiveEvent) -> Self {
+        Self {
+            account_id: account_id.into(),
+            event,
+        }
+    }
+}
 
 /// One thing worth showing on a live dashboard.
 #[derive(Clone, Debug, Serialize)]

@@ -23,10 +23,12 @@ mod billing;
 mod config;
 mod crypto;
 mod delivery;
+mod discover;
 mod event;
 mod imap;
 mod live;
 mod metering;
+mod oauth;
 mod ratelimit;
 mod store;
 mod supervisor;
@@ -41,7 +43,7 @@ use anyhow::{Context, Result, bail};
 use rustls::ClientConfig;
 use rustls_platform_verifier::ConfigVerifierExt;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_rustls::TlsConnector;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -62,6 +64,11 @@ const COMMAND_CHANNEL: usize = 64;
 const TEST_MAX_ATTEMPTS: u32 = 5;
 /// `/test` limit: the window over which attempts are counted.
 const TEST_WINDOW: Duration = Duration::from_secs(300);
+/// `/discover` limit: lookups per IP per window (each makes outbound
+/// DNS/HTTP requests, so it is throttled even though it is unauthenticated).
+const DISCOVER_MAX_ATTEMPTS: u32 = 20;
+/// `/discover` limit window.
+const DISCOVER_WINDOW: Duration = Duration::from_secs(300);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -130,6 +137,9 @@ async fn serve(config: Config) -> Result<()> {
 
     let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
+    // Shutdown signal: flipped on ctrl_c so held SSE streams end and do not
+    // block graceful shutdown.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     // Live bus for the SSE stream. The extra receiver is dropped; the
     // sender survives with zero subscribers, and each SSE client makes
     // its own.
@@ -147,7 +157,7 @@ async fn serve(config: Config) -> Result<()> {
     tokio::spawn(metering::run(
         store.clone(),
         live_tx.clone(),
-        http,
+        http.clone(),
         command_tx.clone(),
         metering::tick(),
     ));
@@ -164,16 +174,48 @@ async fn serve(config: Config) -> Result<()> {
     let reconcile_interval = Duration::from_secs(config.server.reconcile_interval_secs.max(5));
     tokio::spawn(supervisor.run(command_rx, reconcile_interval));
 
+    // OAuth redirect/popup URLs: the public API base (for the redirect URI)
+    // and the dashboard origin the callback popup posts its result back to.
+    let public_url = config
+        .api
+        .public_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{}", config.api.listen));
+    let dashboard_url = config
+        .api
+        .dashboard_url
+        .clone()
+        .unwrap_or_else(|| public_url.clone());
+    let dashboard_origin = url::Url::parse(&dashboard_url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| String::from("*"));
+
+    // Own OAuth apps, if configured, override the built-in Thunderbird clients.
+    let to_client = |client: &config::OauthClientConfig| {
+        (client.client_id.clone(), client.client_secret.clone())
+    };
+    let oauth_clients = oauth::StaticClients {
+        google: config.oauth.google.as_ref().map(to_client),
+        microsoft: config.oauth.microsoft.as_ref().map(to_client),
+    };
+
     // Control API.
     let state = AppState {
         store: store.clone(),
         crypto: crypto.clone(),
         commands: command_tx.clone(),
         connector,
+        http,
         test_limiter: Arc::new(RateLimiter::new(TEST_MAX_ATTEMPTS, TEST_WINDOW)),
         auth_limiter: Arc::new(RateLimiter::new(TEST_MAX_ATTEMPTS, TEST_WINDOW)),
+        discover_limiter: Arc::new(RateLimiter::new(DISCOVER_MAX_ATTEMPTS, DISCOVER_WINDOW)),
         live: live_tx,
+        shutdown: shutdown_rx,
         billing: Arc::new(billing::StubBilling),
+        admin_token: config.api.admin_token.clone(),
+        public_url,
+        dashboard_origin,
+        oauth_clients,
     };
     let listener = TcpListener::bind(&config.api.listen)
         .await
@@ -191,6 +233,9 @@ async fn serve(config: Config) -> Result<()> {
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
             info!("shutdown signal received");
+            // End held SSE streams first so they don't stall graceful
+            // shutdown, then stop the watchers.
+            let _ = shutdown_tx.send(true);
             let _ = shutdown_commands.send(SupervisorCmd::Shutdown).await;
         })
         .await
@@ -232,6 +277,7 @@ fn import(config: &Config, path: &Path) -> Result<()> {
             hmac_secret_prev_expires: None,
             // One watch, one billing account until grouped (M7).
             account_id: id.clone(),
+            auth_kind: String::from("password"),
             active: account.active,
         };
         store.upsert_watch(&watch)?;

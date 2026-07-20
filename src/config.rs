@@ -27,6 +27,35 @@ pub struct Config {
     /// Control API settings.
     #[serde(default)]
     pub api: ApiConfig,
+    /// OAuth client overrides (own registered apps instead of the built-in
+    /// Thunderbird public clients).
+    #[serde(default)]
+    pub oauth: OauthConfig,
+}
+
+/// OAuth client overrides for the providers that need a pre-registered app
+/// (Google, Microsoft — they offer no dynamic registration). Unset = the
+/// built-in Thunderbird public clients. Provide your own to use a hosted
+/// redirect URI (Thunderbird's clients only accept loopback redirects).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct OauthConfig {
+    /// `[oauth.google]` — your Google OAuth client.
+    #[serde(default)]
+    pub google: Option<OauthClientConfig>,
+    /// `[oauth.microsoft]` — your Microsoft (Entra) OAuth client.
+    #[serde(default)]
+    pub microsoft: Option<OauthClientConfig>,
+}
+
+/// A registered OAuth client for a provider.
+#[derive(Clone, Debug, Deserialize)]
+pub struct OauthClientConfig {
+    /// The registered client id.
+    pub client_id: String,
+    /// The client secret, if the app is a confidential client (public
+    /// PKCE clients have none).
+    #[serde(default)]
+    pub client_secret: Option<String>,
 }
 
 impl Config {
@@ -97,6 +126,26 @@ pub struct ApiConfig {
     /// (same-origin self-host).
     #[serde(default)]
     pub cors_allow_origin: Option<String>,
+    /// Optional master bearer token granting **unscoped** access to every
+    /// account's watches, deliveries and events. This is the ops /
+    /// headless-self-host escape hatch: with it, a `carillon import`-only
+    /// box (which has no capability link) can still be inspected, and an
+    /// operator can see the whole fleet. Unset (the default) = there is no
+    /// unscoped access at all; every data route is reachable only through a
+    /// capability link scoped to one account (§ DECISIONS 5). Keep it long
+    /// and secret; it is the whole fleet's key.
+    #[serde(default)]
+    pub admin_token: Option<String>,
+    /// Public base URL of this API, used to build the OAuth redirect URI
+    /// (`{public_url}/oauth/callback`). Defaults to `http://{listen}` — fine
+    /// for local self-host; set it to the externally reachable URL when
+    /// exposed (the provider redirects the browser here).
+    #[serde(default)]
+    pub public_url: Option<String>,
+    /// Base URL of the dashboard the OAuth popup posts its result back to; its
+    /// origin is the `postMessage` target. Defaults to `public_url`.
+    #[serde(default)]
+    pub dashboard_url: Option<String>,
 }
 
 impl Default for ApiConfig {
@@ -105,6 +154,9 @@ impl Default for ApiConfig {
             listen: default_listen(),
             ui_dir: None,
             cors_allow_origin: None,
+            admin_token: None,
+            public_url: None,
+            dashboard_url: None,
         }
     }
 }

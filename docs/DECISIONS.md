@@ -234,6 +234,18 @@ Two honest consequences:
 - Headless still needs an **entrypoint to populate the DB** — a thin bundled CLI
   that talks to the local API, or a one-shot `import` command.
 
+**Landed refinement (2026-07-20): scope by default, in every front.** Rather
+than gate the data routes "in SaaS mode" only, *every* front requires a bearer
+token and scopes to it — self-host is a narrow audience and gets the same,
+simpler model. A `Caller` is either a **capability-link account** (scoped to
+its own watches/deliveries/events/pool) or the optional **admin token**
+(`api.admin_token` — the "token for a CLI/script" this section anticipated),
+which is the single unscoped, fleet-wide escape hatch for ops / headless. Unset
+= no unscoped access exists. `carillon import` still writes the store directly
+(no token); only the HTTP API is gated. Cross-account single-resource access
+returns `404` (hides existence); `POST /watches` forces the caller's account
+and requires the mailbox to have been proven via `/auth`.
+
 ## 6. Transport & process architecture
 
 **HTTP for everything.** The browser UI is a first-class client and browsers only

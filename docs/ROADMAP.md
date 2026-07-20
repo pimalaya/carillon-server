@@ -76,10 +76,106 @@ qresync guard, clippy-clean.
   checkout→idempotent webhook credit, signout→401.*
 
 Remaining before production (documented, not blockers to the core):
-gate the watch/account routes behind the capability link in SaaS mode;
-real Stripe + RevenueCat `Billing` impls (need provider keys); the
-`carillon-admin` SPA; deploy infra (VPS, DNS, Caddy). The original
+real Stripe + RevenueCat `Billing` impls (need provider keys); deploy
+infra (VPS, DNS, Caddy); OAuth-based watching (see M9). The original
 milestone briefs are kept below for reference.
+
+---
+
+## M8 — Route scoping & authenticated SSE · LANDED (2026-07-20)
+
+Every data route now requires a bearer token and is scoped to the caller
+— **by default, in every front** (the simplest posture; self-host is a
+narrow audience and gets the same model). No more global/unauthenticated
+watches, deliveries, accounts or stream.
+
+- A `Caller` extractor resolves the bearer to either a **capability-link
+  account** (scoped to its own watches/deliveries/events/pool) or the
+  optional **admin token** (`api.admin_token`, unscoped — ops / headless).
+  Unset admin token = no unscoped access exists.
+- `GET/POST /watches`, `/watches/{id}/…`, `/deliveries`, `/accounts…` are
+  scoped: list routes filter to the account; single-resource routes 404
+  across account boundaries (hiding existence). `POST /watches` forces the
+  caller's account and requires the mailbox to have been proven via `/auth`
+  (you can't watch what you can't log into — the anti-farming linchpin).
+- **`GET /events` (SSE) is authed and scoped.** Live events carry the
+  billing account they concern (`Routed`), and the stream forwards only the
+  subscriber's own (admin sees all). Since `EventSource` can't send an
+  `Authorization` header, `carillon-admin` reads the stream via an
+  authenticated fetch + SSE-frame parser carrying the Bearer link. A
+  forwarding task pumps the scoped broadcast into a bounded channel backing
+  the response body and ends on **either** server shutdown (a `watch` signal
+  flipped on ctrl_c) **or** client disconnect — so a held SSE connection
+  never blocks graceful shutdown (fixed 2026-07-20; hyper waits for
+  in-flight connections, and an open SSE body never completes on its own).
+- Public routes unchanged: `/health`, `/`, `/openapi.yaml`, `POST /test`,
+  `POST /auth`, `GET /billing/packs`, the billing webhook. OpenAPI now
+  declares a default `capabilityLink` requirement with explicit `security:
+  []` opt-outs. 11 unit tests + qresync guard still green, clippy-clean.
+
+## M9 — Discovery · LANDED (2026-07-20); OAuth watching · planned
+
+**Discovery landed.** `POST /discover` (public, rate-limited per IP) takes a
+"put anything" identifier — an email, or a bare domain/server — and returns
+candidate **IMAP** endpoints + the auth methods each accepts, via
+`io-pim-discovery` (provider rules, PACC, Mozilla autoconfig/ISPDB, RFC 6186
+SRV). IMAP-only for now; SMTP/JMAP/DAV later. Results are hints the wizard
+confirms/overrides; an unresolvable input returns an empty list, never an
+error. `src/discover.rs` (blocking std client in `spawn_blocking`) + the
+`ImapCandidate`/`AuthMethod` OpenAPI schemas. Live-verified against
+gmail.com (→ imap.gmail.com:993, Google OAuth + password) and fastmail.com.
+carillon-admin's Identify stage rewritten to email/server → discover →
+choose (himalaya/ortie-style, TLS candidate auto-picked).
+
+**OAuth watching — Stages A–C BUILT (2026-07-20); interactive e2e pending.**
+A watch can authenticate via OAuth instead of a password: the server holds a
+**refresh token** and the held IMAP connection authenticates with SASL
+`OAUTHBEARER`, minting a fresh access token per connect.
+
+- **Stage A** — `src/oauth.rs`: RFC 8414 issuer resolution, RFC 7591 dynamic
+  registration, auth-code + S256 PKCE, code exchange, refresh. `ClientId` =
+  `Dynamic` (Fastmail) | `Static` (config/known client). Live-verified vs
+  Fastmail (opt-in test).
+- **Stage B** — store (`oauth_session` + `oauth_credential` tables, watch
+  `auth_kind`); `session.rs` `ImapAuth::{Password,OauthBearer}`; supervisor
+  refreshes per connect (rotated refresh tokens persisted); `POST /oauth/start`
+  + `GET /oauth/callback` (exchange → verify via IMAP → mint/join capability
+  link like `/auth` → store credential → popup `postMessage`); `create_watch`
+  makes an OAuth watch when the mailbox has a stored credential.
+- **Provider knowledge**: Fastmail = dynamic registration, scope from its
+  advertised metadata (`urn:ietf:params:oauth:scope:mail offline_access`).
+  Google/Microsoft = **Thunderbird's public client IDs** for now (swap for
+  Carillon-owned apps later), mail-only scopes, Google's `access_type=offline`+
+  `prompt=consent`. `/oauth/start` verified non-interactively for both.
+- **Stage C** — carillon-admin: the Authenticate stage branches to an OAuth
+  sign-in popup (`/oauth/start` → provider → callback `postMessage`), Configure
+  creates a password-less OAuth watch.
+
+### IDLE-only watch path · LANDED (2026-07-20)
+
+Gmail (and Yahoo, others) support IDLE but **not QRESYNC**, which the QRESYNC
+watcher requires — confirmed live (`imap.gmail.com`: IDLE yes, QRESYNC no).
+QRESYNC is now an *optimization*, not a requirement:
+
+- **`pump::run_watch_idle`** — a read-only IDLE-only watcher for servers
+  without QRESYNC. It keeps the mailbox's `UIDNEXT` and, on each IDLE wake,
+  re-`EXAMINE`s and `UID FETCH`es the newly-appeared UIDs (bounded range,
+  avoiding the `UIDNEXT:*` gotcha), emitting one `new` event each. **New
+  messages only** — flag changes and deletions need QRESYNC/CONDSTORE. Built
+  from io-imap's public `ImapMailboxExamine`/`ImapMessageFetch`/`ImapIdle`
+  coroutines over the async pump; no io-imap change.
+- **The supervisor picks** `run_watch` (QRESYNC, full deltas) when the server
+  advertises QRESYNC, else `run_watch_idle`. `Probe::watchable()` now requires
+  only **IDLE** (QRESYNC dropped from the gate); the `/test` verdict and OAuth
+  callback carry `qresync` so the dashboard **warns "new messages only"** when
+  it's absent. This broadens Carillon to nearly any IDLE-capable IMAP server.
+
+**Pending**: the interactive consent → callback → live IDLE (QRESYNC *or*
+IDLE-only) needs a real browser sign-in against a real account (can't be
+auto-tested).
+`config.public_url` must be reachable by the browser; Google/Microsoft need a
+loopback/localhost redirect until Carillon registers hosted apps. RFC 8707
+`resource` plumbing is present (unused; add if a provider needs it).
 
 ---
 

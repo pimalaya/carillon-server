@@ -16,6 +16,11 @@ info:
 servers:
   - url: http://127.0.0.1:3000
     description: Self-host (localhost)
+# Default: every operation requires the bearer token (capability link or admin
+# token). Public onboarding/health/billing-callback routes opt out with an
+# explicit empty `security: []`.
+security:
+  - capabilityLink: []
 tags:
   - name: health
   - name: onboarding
@@ -31,6 +36,7 @@ paths:
     get:
       tags: [health]
       summary: Service metadata
+      security: []
       responses:
         "200":
           description: Name, version and useful links.
@@ -41,6 +47,7 @@ paths:
     get:
       tags: [health]
       summary: Liveness probe
+      security: []
       responses:
         "200":
           description: The literal string `ok`.
@@ -51,16 +58,122 @@ paths:
     get:
       tags: [health]
       summary: This document
+      security: []
       responses:
         "200":
           description: The OpenAPI spec.
           content:
             application/yaml: {}
 
+  /discover:
+    post:
+      tags: [onboarding]
+      summary: Discover IMAP config from an email/domain/server
+      security: []
+      description: |
+        Resolves a "put anything" identifier — an email address, or a bare
+        domain / server host — to candidate IMAP endpoints and the auth
+        methods each accepts, via `io-pim-discovery` (provider rules, PACC,
+        Mozilla autoconfig/ISPDB, RFC 6186 SRV). Only IMAP is discovered for
+        now. Every result is a hint the wizard confirms/overrides; an
+        unresolvable input returns an empty list (fall back to manual
+        entry), never an error. Public and rate-limited per client IP
+        (it makes outbound DNS/HTTP requests).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input]
+              properties:
+                input:
+                  type: string
+                  description: An email address, or a bare domain / server host.
+      responses:
+        "200":
+          description: The discovered IMAP choices (possibly empty).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  input: { type: string }
+                  choices:
+                    type: array
+                    items: { $ref: "#/components/schemas/ImapChoice" }
+        "429":
+          description: Too many lookups from this IP.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /oauth/start:
+    post:
+      tags: [onboarding]
+      summary: Begin an OAuth login for a mailbox
+      security: []
+      description: |
+        Resolves the provider (RFC 7591 dynamic registration where the issuer
+        offers it — Fastmail — else a known public client for Google/Microsoft),
+        builds the authorization URL (S256 PKCE + state), and stashes the flow
+        keyed by its CSRF state. The dashboard opens the returned URL in a popup;
+        the provider redirects the browser to `/oauth/callback`. Public,
+        rate-limited per `(IP, login)`. Send a capability link to add the mailbox
+        to that account.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [login, imap_host]
+              properties:
+                issuer: { type: string, description: An OAuth issuer (oauth_issuer choice). }
+                authorization_endpoint: { type: string }
+                token_endpoint: { type: string }
+                scope: { type: string }
+                login: { type: string }
+                imap_host: { type: string }
+                imap_port: { type: integer, default: 993 }
+                mailbox: { type: string, default: INBOX }
+      responses:
+        "200":
+          description: The provider authorization URL to open.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authorization_url: { type: string, format: uri }
+  /oauth/callback:
+    get:
+      tags: [onboarding]
+      summary: OAuth provider redirect (exchanges code, mints link)
+      security: []
+      description: |
+        The provider's redirect. Exchanges the code, verifies the token
+        authenticates to IMAP (`OAUTHBEARER`), mints or joins the capability-link
+        account (like `/auth`), and stores the encrypted refresh token as the
+        mailbox's OAuth credential. Returns an HTML page that posts the result
+        back to the dashboard window that opened the popup.
+      parameters:
+        - { name: state, in: query, required: true, schema: { type: string } }
+        - { name: code, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: HTML that hands the result to the opener via postMessage.
+          content:
+            text/html: {}
   /test:
     post:
       tags: [onboarding]
       summary: Probe credentials, read-only (no credit spent)
+      security: []
       description: |
         Connects, authenticates, inspects capabilities and logs out —
         never selecting a mailbox or spending a credit. `ok` is the green
@@ -87,10 +200,66 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /mailboxes:
+    post:
+      tags: [onboarding]
+      summary: List a mailbox's selectable folders (for the folder picker)
+      security: []
+      description: |
+        Authenticates and issues `LIST`, returning the selectable folders
+        (dropping `\Noselect` containers) with their RFC 6154 special-use
+        role where advertised — so onboarding can offer a picker defaulting
+        to the inbox. A non-empty `password` authenticates with `LOGIN`
+        (unauthenticated, rate-limited per `(IP, login)`); an empty one
+        lists an **OAuth** mailbox using the stored credential, which
+        requires a capability link (`Authorization: Bearer`). Never spends a
+        credit.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MailboxesRequest" }
+      responses:
+        "200":
+          description: The selectable mailboxes (INBOX first).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MailboxesResponse" }
+        "400": { description: Could not authenticate or list. }
+        "401": { description: OAuth flow with an invalid/missing link. }
+        "429": { description: Too many attempts. }
+
+  /webhook/test:
+    post:
+      tags: [onboarding]
+      summary: Send one signed test event to a notify URL
+      security: []
+      description: |
+        POSTs a single synthetic, HMAC-signed `test` event to `notify_url`
+        (signed with `hmac_secret`, exactly like a real delivery, so a
+        receiver already verifying accepts it) — the onboarding "Test
+        webhook" button. Proves the endpoint is reachable and acking
+        **before** activation. Never retried. Rate-limited per IP; the URL
+        must pass the same https-or-loopback policy as a watch.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookTestRequest" }
+      responses:
+        "200":
+          description: The delivery outcome (a non-acking endpoint is still 200).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookTestResult" }
+        "400": { description: Invalid notify URL. }
+        "429": { description: Too many attempts. }
+
   /auth:
     post:
       tags: [identity]
       summary: Prove control of a mailbox (login-less account)
+      security: []
       description: |
         Authenticating proves control. First auth creates an account and
         mints its capability link; a re-auth to a member mailbox recovers
@@ -133,6 +302,7 @@ paths:
     get:
       tags: [billing]
       summary: The credit-pack catalogue (watch-time; price is the provider's)
+      security: []
       responses:
         "200":
           description: Packs.
@@ -161,6 +331,7 @@ paths:
     post:
       tags: [billing]
       summary: Provider payment-confirmed callback (fulfil once, credit pool)
+      security: []
       requestBody:
         required: true
         content:
@@ -190,7 +361,8 @@ paths:
       description: |
         Notify URL must be `https://` (loopback `http://` is allowed for
         local sinks). Creates the watch's billing account and grants its
-        mailbox a one-time trial.
+        mailbox a one-time trial. One watch per account-mailbox: onboarding a
+        mailbox that already has a watch is refused with `409`.
       requestBody:
         required: true
         content:
@@ -208,6 +380,11 @@ paths:
                   id: { type: string }
         "400":
           description: Invalid notify URL.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: This mailbox is already being watched.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -364,7 +541,14 @@ components:
     capabilityLink:
       type: http
       scheme: bearer
-      description: The per-account capability link, sent as `Authorization: Bearer <link>`.
+      description: >
+        The bearer token behind `Authorization: Bearer <token>`. Normally a
+        per-account **capability link**, which scopes every data route to that
+        account's own watches, deliveries, events and pool. A deployment may
+        also configure a master **admin token** (`api.admin_token`) that this
+        same scheme accepts for **unscoped** fleet-wide access (ops / headless
+        self-host). Every data route requires one of these; there is no
+        unauthenticated access to watches, deliveries or events.
   parameters:
     WatchId:
       name: id
@@ -409,7 +593,77 @@ components:
         missing:
           type: array
           items: { type: string }
+        already_watched:
+          type: boolean
+          description: >
+            Advisory — this mailbox already has a watch. Onboarding surfaces
+            it; creating the watch is a hard 409.
         error: { type: [string, "null"] }
+    MailboxesRequest:
+      type: object
+      required: [imap_host, login]
+      properties:
+        imap_host: { type: string }
+        imap_port: { type: integer, default: 993 }
+        login: { type: string }
+        password:
+          type: string
+          description: >
+            Non-empty ⇒ authenticate with LOGIN. Empty ⇒ OAuth (uses the
+            stored credential; requires a capability link).
+    MailboxEntry:
+      type: object
+      properties:
+        name: { type: string, description: Unicode mailbox name (e.g. INBOX). }
+        role:
+          type: [string, "null"]
+          description: >
+            RFC 6154 special-use role where advertised (inbox, sent, drafts,
+            junk, trash, archive, all, flagged), else null.
+    MailboxesResponse:
+      type: object
+      properties:
+        mailboxes:
+          type: array
+          items: { $ref: "#/components/schemas/MailboxEntry" }
+    WebhookTestRequest:
+      type: object
+      required: [notify_url, hmac_secret]
+      properties:
+        notify_url: { type: string, format: uri }
+        hmac_secret: { type: string }
+    WebhookTestResult:
+      type: object
+      properties:
+        ok: { type: boolean, description: The endpoint answered with a 2xx. }
+        status: { type: [integer, "null"], description: The HTTP status, if any. }
+        error: { type: [string, "null"] }
+    ImapChoice:
+      type: object
+      description: >
+        One onboarding choice — a server endpoint + a single auth method,
+        grouped across discovery mechanisms (the mechanism is not exposed).
+        A hint the wizard confirms.
+      properties:
+        host: { type: string }
+        port: { type: integer }
+        security: { type: string, enum: [tls, starttls, plain] }
+        auth: { $ref: "#/components/schemas/AuthMethod" }
+    AuthMethod:
+      type: object
+      description: >
+        A discovered authentication method. `kind` discriminates; OAuth
+        variants carry the endpoints where known.
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [password, bearer, oauth, oauth_device, oauth_issuer]
+        authorization_endpoint: { type: string, description: "oauth: authorization endpoint" }
+        token_endpoint: { type: string, description: "oauth / oauth_device: token endpoint" }
+        device_authorization_endpoint: { type: string, description: "oauth_device: device endpoint" }
+        scope: { type: [string, "null"] }
+        issuer: { type: string, description: "oauth_issuer: the issuer URL" }
     CreateWatch:
       type: object
       required: [id, imap_host, login, password, notify_url, hmac_secret]

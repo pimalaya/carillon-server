@@ -13,6 +13,16 @@ base64 = "0.22"
 hex = "0.4"
 hmac = "0.13"
 io-imap = { version = "0.2", default-features = false }
+# Onboarding discovery (email/server -> IMAP config + auth methods). The
+# `rustls-ring` feature pulls in its blocking std client (`stream` ->
+# `client`); the mechanism features are IMAP-relevant only (autoconfig /
+# provider rules, PACC, SRV) — JMAP/DAV/OAuth-issuer resolution are added
+# with those features later.
+io-pim-discovery = { version = "0.3", default-features = false, features = ["rustls-ring", "autoconfig", "pacc", "rfc6186", "rfc8414"] }
+# OAuth for watch credentials: RFC 7591 dynamic registration + auth-code+PKCE
+# + refresh, over the blocking std client (rustls-ring implies `client`).
+io-oauth = { version = "0.2", default-features = false, features = ["rustls-ring"] }
+pimalaya-stream = { version = "0.1", default-features = false, features = ["std"] }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 rusqlite = { version = "0.40", features = ["bundled"] }

@@ -25,3 +25,30 @@ reconcile_interval_secs = 60
 [api]
 # Listen address of the HTTP control API.
 listen = "127.0.0.1:3000"
+# Serve a built carillon-admin dist/ at the origin (self-host + UI).
+# ui_dir = "/var/lib/carillon/ui"
+# Allow a cross-origin CDN front to call the API (SaaS).
+# cors_allow_origin = "https://app.carillon.example.org"
+# Master bearer token granting UNSCOPED, fleet-wide access to every
+# account (ops / headless self-host). Sent as `Authorization: Bearer …`.
+# Unset (default) = there is no unscoped access; every data route is
+# reachable only through a per-account capability link. Keep it long and
+# secret — it is the whole fleet's key.
+# admin_token = "change-me-to-a-long-random-secret"
+# Public base URL of this API, used to build the OAuth redirect URI
+# ({public_url}/oauth/callback). Defaults to http://{listen} (fine for
+# local self-host); set it to the externally reachable URL when exposed.
+# public_url = "https://carillon.example.org"
+# Base URL of the dashboard the OAuth callback popup posts back to (its
+# origin is the postMessage target). Defaults to public_url.
+# dashboard_url = "https://app.carillon.example.org"
+
+# OAuth client overrides — your own registered apps instead of the built-in
+# Thunderbird public clients. Needed to use a hosted redirect URI (register
+# {public_url}/oauth/callback with the provider). Fastmail needs nothing here
+# (it uses RFC 7591 dynamic registration). Public PKCE clients have no secret.
+# [oauth.google]
+# client_id = "…apps.googleusercontent.com"
+# client_secret = "…"        # omit for a public client
+# [oauth.microsoft]
+# client_id = "…"

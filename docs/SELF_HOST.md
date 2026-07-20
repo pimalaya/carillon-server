@@ -22,22 +22,57 @@ listen = "127.0.0.1:3000"
 # ui_dir = "/var/lib/carillon/ui"
 # Allow a cross-origin CDN front to call the API (SaaS):
 # cors_allow_origin = "https://carillon.example.org"
+# Master bearer token for unscoped, fleet-wide access (ops / headless):
+# admin_token = "<a long random secret>"
 ```
+
+## Authentication (every data route)
+
+Every route that touches watches, deliveries, accounts or the live stream
+requires a bearer token — there is **no unauthenticated data access**, in
+any front (§ DECISIONS 5). Two kinds of token are accepted on
+`Authorization: Bearer <token>`:
+
+- **Capability link** — per account, minted by `POST /auth` (prove control
+  of a mailbox). Scopes every call to that account's own watches,
+  deliveries, events and pool. This is what the dashboard and SaaS users
+  hold.
+- **Admin token** — the optional `api.admin_token`. Grants **unscoped**
+  access to every account: the ops / headless escape hatch. Unset (the
+  default) means no unscoped access exists at all. Keep it long, random and
+  secret — it is the whole fleet's key.
+
+Only `/health`, `/`, `/openapi.yaml`, `POST /discover`, `POST /test`,
+`POST /auth`, `POST /oauth/start`, `GET /oauth/callback`,
+`GET /billing/packs` and the billing webhook are public.
+
+**OAuth mailboxes** (M10): a mailbox can be watched via OAuth instead of a
+password — the server holds a **refresh token**, not a password, and the
+held IMAP connection authenticates with `OAUTHBEARER`. Fastmail uses RFC
+7591 dynamic registration (no setup); Google/Microsoft use Thunderbird's
+public client IDs for now (swap for Carillon-owned apps later). Set
+`public_url` so the OAuth redirect (`{public_url}/oauth/callback`) is
+reachable by the browser; for Google/Microsoft that redirect must be a
+loopback/localhost URL until Carillon registers its own hosted apps.
 
 ## Mode 1 — headless self-host
 
 The daemon and its API on localhost; no UI. Manage watches with the
-control API or the bundled `carillon import`.
+control API or the bundled `carillon import`. `carillon import` writes the
+store directly, so it needs no token; the HTTP API does — set an
+`admin_token` to drive it from a script.
 
 ```toml
 [api]
-listen = "127.0.0.1:3000"   # localhost only
+listen = "127.0.0.1:3000"          # localhost only
+admin_token = "s3cr3t-…-long"      # to read/write via the HTTP API
 ```
 
 ```sh
-carillon import accounts.toml      # bulk-populate the store
+carillon import accounts.toml      # bulk-populate the store (no token needed)
 carillon serve                     # run the daemon
-curl -s localhost:3000/watches     # drive it with the API / a script
+curl -s localhost:3000/watches \
+  -H "Authorization: Bearer s3cr3t-…-long"   # drive the API with the admin token
 ```
 
 Bind to localhost and put it behind your own auth/proxy if you expose it;
@@ -87,6 +122,7 @@ SameSite or CSRF. Terminate TLS at a reverse proxy (e.g. Caddy) in front.
 | `GET /` | Service metadata (headless) or the UI (with `ui_dir`) |
 | `GET /health` | Liveness (`ok`) |
 | `GET /openapi.yaml` | The API contract |
+| `POST /discover` | IMAP config discovery from an email/server (rate-limited) |
 | `POST /test` | Read-only credential probe (rate-limited) |
 | `… /watches …` | Watch CRUD, pause/resume, rotate-secret |
 | `GET /deliveries` | Delivery log |

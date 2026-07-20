@@ -29,7 +29,48 @@ CREATE TABLE IF NOT EXISTS watch (
   hmac_secret_prev_expires INTEGER,
   account_id   TEXT NOT NULL DEFAULT '',
   last_metered INTEGER,
+  -- 'password' (enc_password) or 'oauth' (the oauth_credential for the
+  -- watch's (account_id, mailbox_key)).
+  auth_kind    TEXT NOT NULL DEFAULT 'password',
   active       INTEGER NOT NULL DEFAULT 1
+);
+
+-- Pending OAuth authorization flows: the short-lived state carried between
+-- /oauth/start and /oauth/callback. Consumed (deleted) on use; aged out by
+-- created_at. The verifier is ephemeral and single-use; a client secret (if
+-- the provider issued one) is age-encrypted.
+CREATE TABLE IF NOT EXISTS oauth_session (
+  state          TEXT PRIMARY KEY,
+  verifier       TEXT NOT NULL,
+  redirect_uri   TEXT NOT NULL,
+  token_endpoint TEXT NOT NULL,
+  client_id      TEXT NOT NULL,
+  enc_client_secret TEXT,
+  resource       TEXT,
+  scope          TEXT,
+  account_id     TEXT,
+  login          TEXT NOT NULL,
+  imap_host      TEXT NOT NULL,
+  imap_port      INTEGER NOT NULL,
+  mailbox        TEXT NOT NULL,
+  created_at     INTEGER NOT NULL
+);
+
+-- The OAuth credential for a proven mailbox: the age-encrypted refresh token
+-- plus everything needed to mint fresh access tokens. Keyed by (account,
+-- mailbox); every watch on that mailbox authenticates through it. This is the
+-- long-term secret (the /oauth/callback stores it; the supervisor refreshes).
+CREATE TABLE IF NOT EXISTS oauth_credential (
+  account_id        TEXT NOT NULL,
+  mailbox_key       TEXT NOT NULL,
+  enc_refresh_token TEXT NOT NULL,
+  token_endpoint    TEXT NOT NULL,
+  client_id         TEXT NOT NULL,
+  enc_client_secret TEXT,
+  resource          TEXT,
+  scope             TEXT,
+  updated_at        INTEGER NOT NULL,
+  PRIMARY KEY (account_id, mailbox_key)
 );
 
 CREATE TABLE IF NOT EXISTS delivery (
@@ -129,6 +170,9 @@ pub struct Watch {
     /// the watch id (one watch, one account) until grouped under a shared
     /// account (M7).
     pub account_id: String,
+    /// `password` (uses `enc_password`) or `oauth` (authenticates via the
+    /// `oauth_credential` for this watch's `(account_id, mailbox_key)`).
+    pub auth_kind: String,
     /// Whether the watch is enabled.
     pub active: bool,
 }
@@ -147,6 +191,7 @@ impl Watch {
             hmac_secret_prev: row.get("hmac_secret_prev")?,
             hmac_secret_prev_expires: row.get("hmac_secret_prev_expires")?,
             account_id: row.get("account_id")?,
+            auth_kind: row.get("auth_kind")?,
             active: row.get::<_, i64>("active")? != 0,
         })
     }
@@ -306,6 +351,49 @@ pub struct MembershipRow {
     pub imap_host: String,
 }
 
+/// A pending OAuth authorization flow, carried between `/oauth/start` and
+/// `/oauth/callback` and consumed on the callback.
+#[derive(Clone, Debug)]
+pub struct OauthSession {
+    /// CSRF state (the primary key; echoed back on the callback).
+    pub state: String,
+    /// PKCE code verifier for the token exchange.
+    pub verifier: String,
+    /// Redirect URI the flow was started with (must match on exchange).
+    pub redirect_uri: String,
+    /// Token endpoint to exchange the code at.
+    pub token_endpoint: String,
+    /// Client id (dynamically registered or from config).
+    pub client_id: String,
+    /// Age-encrypted client secret, if the provider issued one.
+    pub enc_client_secret: Option<String>,
+    /// RFC 8707 resource, if the provider needs it.
+    pub resource: Option<String>,
+    /// Scope requested (stored on the credential for refresh).
+    pub scope: Option<String>,
+    /// The capability-link account to join, if the flow carried one.
+    pub account_id: Option<String>,
+    /// Mailbox context, so the callback can build the credential + watch.
+    pub login: String,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub mailbox: String,
+}
+
+/// The stored OAuth credential for a proven mailbox: an age-encrypted refresh
+/// token plus what is needed to mint fresh access tokens.
+#[derive(Clone, Debug)]
+pub struct OauthCredential {
+    pub account_id: String,
+    pub mailbox_key: String,
+    pub enc_refresh_token: String,
+    pub token_endpoint: String,
+    pub client_id: String,
+    pub enc_client_secret: Option<String>,
+    pub resource: Option<String>,
+    pub scope: Option<String>,
+}
+
 /// The sqlite-backed store, cheap to clone via `Arc`.
 pub struct Store {
     conn: Mutex<Connection>,
@@ -343,13 +431,14 @@ impl Store {
         self.lock().execute(
             "INSERT INTO watch
                (id, imap_host, imap_port, login, enc_password, mailbox, notify_url,
-                hmac_secret, hmac_secret_prev, hmac_secret_prev_expires, account_id, active)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                hmac_secret, hmac_secret_prev, hmac_secret_prev_expires, account_id,
+                auth_kind, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET
                imap_host=?2, imap_port=?3, login=?4, enc_password=?5,
                mailbox=?6, notify_url=?7, hmac_secret=?8,
                hmac_secret_prev=?9, hmac_secret_prev_expires=?10,
-               account_id=?11, active=?12",
+               account_id=?11, auth_kind=?12, active=?13",
             params![
                 watch.id,
                 watch.imap_host,
@@ -362,6 +451,7 @@ impl Store {
                 watch.hmac_secret_prev,
                 watch.hmac_secret_prev_expires,
                 watch.account_id,
+                watch.auth_kind,
                 watch.active as i64,
             ],
         )?;
@@ -415,6 +505,17 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The `(id, login, imap_host)` of every watch — the cheap input to the
+    /// onboarding dedup guard, which normalises `(login, host)` into a
+    /// mailbox key (that normalisation lives in `metering`, not here). No
+    /// decrypt, no full row.
+    pub fn watch_identities(&self) -> Result<Vec<(String, String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id, login, imap_host FROM watch")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Looks up a single watch by id.
     pub fn get_watch(&self, id: &str) -> Result<Option<Watch>> {
         let conn = self.lock();
@@ -422,6 +523,19 @@ impl Store {
             .query_row("SELECT * FROM watch WHERE id = ?1", [id], Watch::from_row)
             .optional()?;
         Ok(watch)
+    }
+
+    /// The billing account a watch belongs to, if the watch exists. Cheap
+    /// authorization check for the scoped watch routes (no decrypt, no full
+    /// row): `None` means no such watch.
+    pub fn watch_account(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let account = conn
+            .query_row("SELECT account_id FROM watch WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(account)
     }
 
     /// Enables or disables a watch. Returns whether a row matched.
@@ -459,6 +573,30 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// The most recent deliveries across every watch owned by a billing
+    /// account, newest first — the scoped counterpart of
+    /// [`Store::recent_deliveries`]. Joins on the watch so a capability
+    /// link only ever sees its own account's log. (A delivery whose watch
+    /// was since deleted drops out of the join; that is acceptable — the
+    /// live log is a recent-activity view, not an audit trail.)
+    pub fn recent_deliveries_by_owner(
+        &self,
+        account_id: &str,
+        limit: u32,
+    ) -> Result<Vec<DeliveryRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT d.* FROM delivery d
+               JOIN watch w ON w.id = d.account
+             WHERE w.account_id = ?1
+             ORDER BY d.at DESC, d.id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![account_id, limit], DeliveryRow::from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// Returns the most recent deliveries, optionally filtered by
@@ -730,6 +868,22 @@ impl Store {
         Ok(account)
     }
 
+    /// Whether an account has proven control of a mailbox (its
+    /// membership exists). The create-watch gate: a scoped caller may only
+    /// watch a mailbox it authenticated to via `/auth`, which is what
+    /// recorded the membership — you cannot watch what you cannot log into.
+    pub fn mailbox_belongs(&self, account_id: &str, mailbox_key: &str) -> Result<bool> {
+        let conn = self.lock();
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM account_mailbox WHERE account_id = ?1 AND mailbox_key = ?2",
+                params![account_id, mailbox_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
     /// The mailboxes an account controls.
     pub fn memberships(&self, account_id: &str) -> Result<Vec<MembershipRow>> {
         let conn = self.lock();
@@ -779,6 +933,150 @@ impl Store {
         }
         Ok(row)
     }
+
+    // --- OAuth flows & credentials (M10) ---
+
+    /// Stores a pending OAuth flow, keyed by its CSRF state.
+    pub fn create_oauth_session(&self, session: &OauthSession) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO oauth_session
+               (state, verifier, redirect_uri, token_endpoint, client_id,
+                enc_client_secret, resource, scope, account_id, login,
+                imap_host, imap_port, mailbox, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                session.state,
+                session.verifier,
+                session.redirect_uri,
+                session.token_endpoint,
+                session.client_id,
+                session.enc_client_secret,
+                session.resource,
+                session.scope,
+                session.account_id,
+                session.login,
+                session.imap_host,
+                session.imap_port,
+                session.mailbox,
+                now_secs(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Consumes a pending OAuth flow by its state (single-use), also pruning
+    /// any sessions older than `max_age_secs`. `None` if the state is unknown.
+    pub fn take_oauth_session(
+        &self,
+        state: &str,
+        max_age_secs: i64,
+    ) -> Result<Option<OauthSession>> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM oauth_session WHERE created_at < ?1",
+            [now_secs() - max_age_secs],
+        )?;
+        let session = conn
+            .query_row(
+                "SELECT state, verifier, redirect_uri, token_endpoint, client_id,
+                        enc_client_secret, resource, scope, account_id, login,
+                        imap_host, imap_port, mailbox
+                 FROM oauth_session WHERE state = ?1",
+                [state],
+                |row| {
+                    Ok(OauthSession {
+                        state: row.get(0)?,
+                        verifier: row.get(1)?,
+                        redirect_uri: row.get(2)?,
+                        token_endpoint: row.get(3)?,
+                        client_id: row.get(4)?,
+                        enc_client_secret: row.get(5)?,
+                        resource: row.get(6)?,
+                        scope: row.get(7)?,
+                        account_id: row.get(8)?,
+                        login: row.get(9)?,
+                        imap_host: row.get(10)?,
+                        imap_port: row.get(11)?,
+                        mailbox: row.get(12)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        if session.is_some() {
+            conn.execute("DELETE FROM oauth_session WHERE state = ?1", [state])?;
+        }
+        Ok(session)
+    }
+
+    /// Stores (or replaces) the OAuth credential for a mailbox.
+    pub fn upsert_oauth_credential(&self, cred: &OauthCredential) -> Result<()> {
+        self.lock().execute(
+            "INSERT OR REPLACE INTO oauth_credential
+               (account_id, mailbox_key, enc_refresh_token, token_endpoint,
+                client_id, enc_client_secret, resource, scope, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                cred.account_id,
+                cred.mailbox_key,
+                cred.enc_refresh_token,
+                cred.token_endpoint,
+                cred.client_id,
+                cred.enc_client_secret,
+                cred.resource,
+                cred.scope,
+                now_secs(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The OAuth credential for a mailbox, if any.
+    pub fn get_oauth_credential(
+        &self,
+        account_id: &str,
+        mailbox_key: &str,
+    ) -> Result<Option<OauthCredential>> {
+        let conn = self.lock();
+        let cred = conn
+            .query_row(
+                "SELECT account_id, mailbox_key, enc_refresh_token, token_endpoint,
+                        client_id, enc_client_secret, resource, scope
+                 FROM oauth_credential WHERE account_id = ?1 AND mailbox_key = ?2",
+                params![account_id, mailbox_key],
+                |row| {
+                    Ok(OauthCredential {
+                        account_id: row.get(0)?,
+                        mailbox_key: row.get(1)?,
+                        enc_refresh_token: row.get(2)?,
+                        token_endpoint: row.get(3)?,
+                        client_id: row.get(4)?,
+                        enc_client_secret: row.get(5)?,
+                        resource: row.get(6)?,
+                        scope: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(cred)
+    }
+
+    /// Updates the stored refresh token for a mailbox (the provider rotated
+    /// it on a refresh).
+    pub fn update_oauth_refresh_token(
+        &self,
+        account_id: &str,
+        mailbox_key: &str,
+        enc_refresh_token: &str,
+    ) -> Result<()> {
+        self.lock().execute(
+            "UPDATE oauth_credential
+               SET enc_refresh_token = ?3, updated_at = ?4
+             WHERE account_id = ?1 AND mailbox_key = ?2",
+            params![account_id, mailbox_key, enc_refresh_token, now_secs()],
+        )?;
+        Ok(())
+    }
 }
 
 /// SHA-256 hex of a capability token — what we persist, so a DB leak
@@ -798,6 +1096,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("hmac_secret_prev_expires", "INTEGER"),
         ("account_id", "TEXT NOT NULL DEFAULT ''"),
         ("last_metered", "INTEGER"),
+        ("auth_kind", "TEXT NOT NULL DEFAULT 'password'"),
     ] {
         if !column_exists(conn, "watch", column)? {
             conn.execute(&format!("ALTER TABLE watch ADD COLUMN {column} {decl}"), [])?;

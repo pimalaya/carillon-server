@@ -75,12 +75,21 @@ impl ChangeEvent {
             }
             ImapMailboxWatchEvent::EnvelopeRemoved { uid } => (ChangeKind::Removed, uid.get()),
         };
+        Self::build(account.into(), kind, uid)
+    }
 
+    /// A `new`-mail event for a UID, used by the IDLE-only watcher (which,
+    /// lacking QRESYNC/CONDSTORE, tracks new messages only).
+    pub fn new_mail(account: impl Into<String>, uid: u32) -> Self {
+        Self::build(account.into(), ChangeKind::New, uid)
+    }
+
+    fn build(account: String, event: ChangeKind, uid: u32) -> Self {
         Self {
             id: new_id(),
             ts: now_secs(),
-            account: account.into(),
-            event: kind,
+            account,
+            event,
             uid,
         }
     }

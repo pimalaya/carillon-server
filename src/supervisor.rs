@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use anyhow::Context;
 use io_imap::types::mailbox::Mailbox;
+use io_imap::types::response::Capability;
 use io_imap::watch::ImapMailboxWatch;
 use rand::RngExt;
 use tokio::sync::{Semaphore, mpsc};
@@ -22,14 +24,24 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, interval, sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
+use url::Url;
 
 use crate::crypto::Crypto;
 use crate::event::ChangeEvent;
 use crate::imap::pump;
-use crate::imap::session::{self, ImapAccount};
-use crate::live::{LiveBus, LiveEvent, WatchState};
+use crate::imap::session::{self, ImapAccount, ImapAuth};
+use crate::live::{LiveBus, LiveEvent, Routed, WatchState};
 use crate::metering;
+use crate::oauth;
 use crate::store::{Store, Watch};
+
+/// How a watcher authenticates each time it connects. A password is
+/// constant; OAuth mints a fresh access token from the stored refresh token
+/// on every connect (tokens are short-lived, connections reconnect often).
+enum Credential {
+    Password(String),
+    Oauth,
+}
 
 /// Bound on the whole TCP + TLS + greeting + login handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -52,6 +64,9 @@ pub enum SupervisorCmd {
 struct WatcherHandle {
     shutdown: Arc<AtomicBool>,
     fingerprint: u64,
+    /// The watch's billing account, kept so a stop/shutdown status event
+    /// can be tagged for scoped SSE fan-out without re-reading the store.
+    account_id: String,
     task: JoinHandle<()>,
 }
 
@@ -146,10 +161,12 @@ impl Supervisor {
         for id in stale {
             if let Some(handle) = self.handles.remove(&id) {
                 debug!(watch = %id, "stopping watcher");
+                let account_id = handle.account_id.clone();
                 stop(handle);
-                let _ = self
-                    .live
-                    .send(LiveEvent::status(&id, WatchState::Stopped, None));
+                let _ = self.live.send(Routed::new(
+                    account_id,
+                    LiveEvent::status(&id, WatchState::Stopped, None),
+                ));
             }
         }
 
@@ -174,24 +191,32 @@ impl Supervisor {
         // connection for an account with no watch-time left.
         let mailbox_key = metering::mailbox_key(&watch.login, &watch.imap_host);
         if !metering::has_credit(&self.store, &watch.account_id, &mailbox_key) {
-            let _ = self.live.send(LiveEvent::status(
-                &watch.id,
-                WatchState::Error,
-                Some("no credit".into()),
+            let _ = self.live.send(Routed::new(
+                &watch.account_id,
+                LiveEvent::status(&watch.id, WatchState::Error, Some("no credit".into())),
             ));
             anyhow::bail!("no watch-time credit for account {}", watch.account_id);
         }
 
-        let password = self.crypto.decrypt(&watch.enc_password)?;
+        // Resolve the credential kind. A password is decrypted once; an OAuth
+        // watch defers to the stored `oauth_credential`, minting a fresh
+        // access token per connect (see `watch_loop`). The auth on the
+        // account is a placeholder overwritten before each connect.
+        let credential = if watch.auth_kind == "oauth" {
+            Credential::Oauth
+        } else {
+            Credential::Password(self.crypto.decrypt(&watch.enc_password)?)
+        };
         let account = ImapAccount {
             host: watch.imap_host.clone(),
             port: watch.imap_port,
             login: watch.login.clone(),
-            password,
+            auth: ImapAuth::Password(String::new()),
             mailbox: watch.mailbox.clone(),
         };
 
         let id = watch.id.clone();
+        let account_id = watch.account_id.clone();
         let fingerprint = fingerprint(watch);
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -200,33 +225,43 @@ impl Supervisor {
         let handshake_sem = self.handshake_sem.clone();
         let shutdown_flag = shutdown.clone();
         let live = self.live.clone();
+        let loop_account = account_id.clone();
+        let store = self.store.clone();
+        let crypto = self.crypto.clone();
 
         let task = tokio::spawn(async move {
-            watch_loop(
+            watch_loop(WatchLoop {
                 id,
+                account_id: loop_account,
                 account,
+                credential,
                 connector,
                 events,
                 handshake_sem,
-                shutdown_flag,
+                shutdown: shutdown_flag,
                 live,
-            )
+                store,
+                crypto,
+            })
             .await;
         });
 
         Ok(WatcherHandle {
             shutdown,
             fingerprint,
+            account_id,
             task,
         })
     }
 
     fn stop_all(&mut self) {
         for (id, handle) in self.handles.drain() {
+            let account_id = handle.account_id.clone();
             stop(handle);
-            let _ = self
-                .live
-                .send(LiveEvent::status(&id, WatchState::Stopped, None));
+            let _ = self.live.send(Routed::new(
+                account_id,
+                LiveEvent::status(&id, WatchState::Stopped, None),
+            ));
         }
     }
 }
@@ -245,28 +280,57 @@ fn fingerprint(watch: &Watch) -> u64 {
     watch.imap_port.hash(&mut hasher);
     watch.login.hash(&mut hasher);
     watch.enc_password.hash(&mut hasher);
+    watch.auth_kind.hash(&mut hasher);
     watch.mailbox.hash(&mut hasher);
     hasher.finish()
 }
 
-/// One watch's connect → watch → reconnect loop. Stopped by aborting
-/// the task; the shutdown flag lets the watcher coroutine wind down
-/// cleanly if it happens to be resumed.
-async fn watch_loop(
+/// Everything one watcher task needs. Bundled into a struct to keep the
+/// spawn site readable (and satisfy `clippy::too_many_arguments`).
+struct WatchLoop {
     id: String,
+    /// The billing account (for tagging live status events).
+    account_id: String,
+    /// Connection params; `auth` is a placeholder set before each connect.
     account: ImapAccount,
+    credential: Credential,
     connector: TlsConnector,
     events: mpsc::Sender<ChangeEvent>,
     handshake_sem: Arc<Semaphore>,
     shutdown: Arc<AtomicBool>,
     live: LiveBus,
-) {
+    store: Arc<Store>,
+    crypto: Arc<Crypto>,
+}
+
+/// One watch's connect → watch → reconnect loop. Stopped by aborting
+/// the task; the shutdown flag lets the watcher coroutine wind down
+/// cleanly if it happens to be resumed.
+async fn watch_loop(ctx: WatchLoop) {
+    let WatchLoop {
+        id,
+        account_id,
+        mut account,
+        credential,
+        connector,
+        events,
+        handshake_sem,
+        shutdown,
+        live,
+        store,
+        crypto,
+    } = ctx;
+
+    // Tag every status change with the watch's billing account so the SSE
+    // stream can scope it to the right subscriber.
+    let status =
+        |state, detail| Routed::new(account_id.clone(), LiveEvent::status(&id, state, detail));
+
     let mailbox: Mailbox<'static> = match Mailbox::try_from(account.mailbox.clone()) {
         Ok(mailbox) => mailbox,
         Err(_) => {
             error!(watch = %id, mailbox = %account.mailbox, "invalid mailbox name");
-            let _ = live.send(LiveEvent::status(
-                &id,
+            let _ = live.send(status(
                 WatchState::Error,
                 Some("invalid mailbox name".into()),
             ));
@@ -277,6 +341,31 @@ async fn watch_loop(
     let mut backoff = INITIAL_BACKOFF;
 
     while !shutdown.load(Ordering::SeqCst) {
+        // Resolve this attempt's credential. A password is constant; OAuth
+        // mints a fresh access token from the stored refresh token. A refresh
+        // failure is transient (network, provider): surface it and back off,
+        // exactly like a connect failure.
+        account.auth = match &credential {
+            Credential::Password(password) => ImapAuth::Password(password.clone()),
+            Credential::Oauth => {
+                match resolve_oauth_access(&store, &crypto, &account_id, &account).await {
+                    Ok(token) => ImapAuth::OauthBearer(token),
+                    Err(err) => {
+                        warn!(watch = %id, error = %err, "oauth token refresh failed");
+                        let _ =
+                            live.send(status(WatchState::Error, Some(format!("oauth: {err:#}"))));
+                        if shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let _ = live.send(status(WatchState::Reconnecting, None));
+                        sleep(backoff + jitter(backoff)).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        continue;
+                    }
+                }
+            }
+        };
+
         // Throttle simultaneous handshakes across all watchers.
         let permit = handshake_sem
             .clone()
@@ -289,34 +378,51 @@ async fn watch_loop(
 
         match connected {
             Ok(Ok(mut session)) => {
-                let watcher = match ImapMailboxWatch::new(
-                    &session.capabilities,
-                    mailbox.clone(),
-                    shutdown.clone(),
-                ) {
-                    Ok(watcher) => watcher,
-                    Err(err) => {
-                        error!(watch = %id, error = %err, "watcher cannot start; giving up");
-                        let _ = live.send(LiveEvent::status(
-                            &id,
-                            WatchState::Error,
-                            Some(err.to_string()),
-                        ));
-                        return;
+                // Full QRESYNC deltas where the server supports it, else the
+                // IDLE-only new-mail watcher (Gmail, Yahoo, …).
+                let has_qresync = session.capabilities.contains(&Capability::QResync);
+                info!(
+                    watch = %id,
+                    host = %account.host,
+                    mailbox = %account.mailbox,
+                    qresync = has_qresync,
+                    "watching",
+                );
+                let _ = live.send(status(WatchState::Watching, None));
+
+                let outcome = if has_qresync {
+                    match ImapMailboxWatch::new(
+                        &session.capabilities,
+                        mailbox.clone(),
+                        shutdown.clone(),
+                    ) {
+                        Ok(watcher) => {
+                            pump::run_watch(
+                                &id,
+                                &mut session.stream,
+                                &mut session.fragmentizer,
+                                watcher,
+                                &events,
+                            )
+                            .await
+                        }
+                        Err(err) => {
+                            error!(watch = %id, error = %err, "watcher cannot start; giving up");
+                            let _ = live.send(status(WatchState::Error, Some(err.to_string())));
+                            return;
+                        }
                     }
+                } else {
+                    pump::run_watch_idle(
+                        &id,
+                        &mut session.stream,
+                        &mut session.fragmentizer,
+                        mailbox.clone(),
+                        shutdown.clone(),
+                        &events,
+                    )
+                    .await
                 };
-
-                info!(watch = %id, host = %account.host, mailbox = %account.mailbox, "watching");
-                let _ = live.send(LiveEvent::status(&id, WatchState::Watching, None));
-
-                let outcome = pump::run_watch(
-                    &id,
-                    &mut session.stream,
-                    &mut session.fragmentizer,
-                    watcher,
-                    &events,
-                )
-                .await;
 
                 match outcome {
                     Ok(()) => debug!(watch = %id, "session ended; reconnecting"),
@@ -325,19 +431,11 @@ async fn watch_loop(
             }
             Ok(Err(err)) => {
                 warn!(watch = %id, error = %err, "connect failed");
-                let _ = live.send(LiveEvent::status(
-                    &id,
-                    WatchState::Error,
-                    Some(format!("{err:#}")),
-                ));
+                let _ = live.send(status(WatchState::Error, Some(format!("{err:#}"))));
             }
             Err(_elapsed) => {
                 warn!(watch = %id, "connect timed out");
-                let _ = live.send(LiveEvent::status(
-                    &id,
-                    WatchState::Error,
-                    Some("connect timed out".into()),
-                ));
+                let _ = live.send(status(WatchState::Error, Some("connect timed out".into())));
             }
         }
 
@@ -351,7 +449,7 @@ async fn watch_loop(
             backoff = INITIAL_BACKOFF;
         }
 
-        let _ = live.send(LiveEvent::status(&id, WatchState::Reconnecting, None));
+        let _ = live.send(status(WatchState::Reconnecting, None));
         let wait = backoff + jitter(backoff);
         debug!(watch = %id, wait_ms = wait.as_millis() as u64, "backing off before reconnect");
         sleep(wait).await;
@@ -364,4 +462,58 @@ async fn watch_loop(
 fn jitter(base: Duration) -> Duration {
     let max = (base.as_millis() as u64 / 2).max(1);
     Duration::from_millis(rand::rng().random_range(0..=max))
+}
+
+/// Mints a fresh OAuth access token for a watch: loads its stored
+/// credential, decrypts the refresh token, refreshes (blocking io-oauth in
+/// `spawn_blocking`), and persists the refresh token if the provider rotated
+/// it. Returns the access token to authenticate with (`OAUTHBEARER`).
+pub(crate) async fn resolve_oauth_access(
+    store: &Arc<Store>,
+    crypto: &Arc<Crypto>,
+    account_id: &str,
+    account: &ImapAccount,
+) -> anyhow::Result<String> {
+    let mailbox_key = metering::mailbox_key(&account.login, &account.host);
+
+    let cred = {
+        let store = store.clone();
+        let (owner, key) = (account_id.to_string(), mailbox_key.clone());
+        tokio::task::spawn_blocking(move || store.get_oauth_credential(&owner, &key))
+            .await??
+            .context("no OAuth credential for this mailbox")?
+    };
+
+    let refresh_token = crypto.decrypt(&cred.enc_refresh_token)?;
+    let client_secret = match &cred.enc_client_secret {
+        Some(enc) => Some(crypto.decrypt(enc)?),
+        None => None,
+    };
+    let token_endpoint: Url = cred
+        .token_endpoint
+        .parse()
+        .context("stored token endpoint is not a valid URL")?;
+
+    let client = oauth::ClientId::Static {
+        client_id: cred.client_id.clone(),
+        client_secret,
+    };
+    let refresh_for_call = refresh_token.clone();
+    let tokens = tokio::task::spawn_blocking(move || {
+        oauth::refresh(&token_endpoint, &client, &refresh_for_call)
+    })
+    .await??;
+
+    // Persist a rotated refresh token so the next refresh uses the current one.
+    if let Some(new_refresh) = &tokens.refresh_token
+        && new_refresh != &refresh_token
+    {
+        let enc = crypto.encrypt(new_refresh)?;
+        let store = store.clone();
+        let (owner, key) = (account_id.to_string(), mailbox_key.clone());
+        tokio::task::spawn_blocking(move || store.update_oauth_refresh_token(&owner, &key, &enc))
+            .await??;
+    }
+
+    Ok(tokens.access_token)
 }

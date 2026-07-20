@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use url::{Host, Url};
 
 use crate::event::ChangeEvent;
-use crate::live::{LiveBus, LiveEvent};
+use crate::live::{LiveBus, LiveEvent, Routed};
 use crate::store::{DeliveryOutcome, Store, Watch};
 use crate::util::now_secs;
 
@@ -149,15 +149,19 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: Li
         );
     }
 
-    // Publish the outcome to any live (SSE) subscribers. Ignore the
+    // Publish the outcome to any live (SSE) subscribers, tagged with the
+    // watch's billing account so the stream can scope it. Ignore the
     // error: no subscribers is the normal case.
-    let _ = live.send(LiveEvent::delivery(
-        event.account.clone(),
-        event.event.as_str(),
-        event.uid,
-        ok,
-        last_status,
-        attempts,
+    let _ = live.send(Routed::new(
+        watch.account_id.clone(),
+        LiveEvent::delivery(
+            event.account.clone(),
+            event.event.as_str(),
+            event.uid,
+            ok,
+            last_status,
+            attempts,
+        ),
     ));
 
     let event_kind = event.event.as_str().to_owned();
@@ -210,6 +214,59 @@ pub async fn deliver_notice(client: &Client, watch: &Watch, kind: &str) {
             warn!(account = %watch.id, kind, status = %response.status(), "notice not acked")
         }
         Err(err) => warn!(account = %watch.id, kind, error = %err, "notice delivery failed"),
+    }
+}
+
+/// The outcome of a one-shot webhook test: whether the endpoint acked, the
+/// HTTP status (if any), and the failure reason (if any).
+pub struct TestOutcome {
+    /// The endpoint answered with a 2xx.
+    pub ok: bool,
+    /// The final HTTP status, if a response was received.
+    pub status: Option<u16>,
+    /// The failure reason, if the POST did not ack.
+    pub error: Option<String>,
+}
+
+/// POSTs one synthetic, signed **test** event to `notify_url` — the
+/// onboarding "Test webhook" button. Signed exactly like a real delivery
+/// (with `secret`, so a receiver already wired to verify accepts it) but
+/// carrying `{"type":"test", …}` and never retried. The caller is expected
+/// to have validated the URL with [`validate_notify_url`] first.
+pub async fn deliver_test(client: &Client, notify_url: &str, secret: &str) -> TestOutcome {
+    let ts = now_secs();
+    let body = serde_json::to_vec(&json!({
+        "type": "test",
+        "event": "test",
+        "uid": 0,
+        "ts": ts,
+    }))
+    .expect("test event always serializes");
+    let signature = sign(&[secret], ts, &body);
+
+    let response = client
+        .post(notify_url)
+        .header("content-type", "application/json")
+        .header("x-carillon-event", "test")
+        .header("x-carillon-signature", &signature)
+        .body(body)
+        .send()
+        .await;
+
+    match response {
+        Ok(response) => {
+            let status = response.status();
+            TestOutcome {
+                ok: status.is_success(),
+                status: Some(status.as_u16()),
+                error: (!status.is_success()).then(|| format!("endpoint returned HTTP {status}")),
+            }
+        }
+        Err(err) => TestOutcome {
+            ok: false,
+            status: None,
+            error: Some(err.to_string()),
+        },
     }
 }
 

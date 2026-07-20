@@ -23,7 +23,7 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use crate::delivery::deliver_notice;
-use crate::live::{LiveBus, LiveEvent, NoticeKind};
+use crate::live::{LiveBus, LiveEvent, NoticeKind, Routed};
 use crate::store::{Balance, Store};
 use crate::supervisor::SupervisorCmd;
 use crate::util::now_secs;
@@ -215,6 +215,7 @@ pub async fn run(
                         &store,
                         &live,
                         &http,
+                        &row.account_id,
                         &row.watch_id,
                         NoticeKind::AutoRefilled,
                         Some(format!("+{:.0}s", account.auto_refill_amount)),
@@ -230,6 +231,7 @@ pub async fn run(
                         &store,
                         &live,
                         &http,
+                        &row.account_id,
                         &row.watch_id,
                         NoticeKind::CreditExhausted,
                         None,
@@ -250,6 +252,7 @@ pub async fn run(
                         &store,
                         &live,
                         &http,
+                        &row.account_id,
                         &row.watch_id,
                         NoticeKind::LowBalance,
                         Some(format!("{remaining:.0}s left")),
@@ -264,17 +267,23 @@ pub async fn run(
 }
 
 /// Publishes a notice on the live bus (dashboard) and as a signed webhook
-/// (so a no-dashboard user is not silently cut off).
+/// (so a no-dashboard user is not silently cut off). `account_id` tags the
+/// live event for scoped SSE fan-out; `watch_id` keys the wire payload and
+/// the webhook.
 async fn emit_notice(
     store: &Store,
     live: &LiveBus,
     http: &reqwest::Client,
+    account_id: &str,
     watch_id: &str,
     kind: NoticeKind,
     detail: Option<String>,
 ) {
     info!(account = %watch_id, notice = kind.as_str(), ?detail, "notice");
-    let _ = live.send(LiveEvent::notice(watch_id, kind, detail));
+    let _ = live.send(Routed::new(
+        account_id,
+        LiveEvent::notice(watch_id, kind, detail),
+    ));
     if let Ok(Some(watch)) = store.get_watch(watch_id) {
         deliver_notice(http, &watch, kind.as_str()).await;
     }

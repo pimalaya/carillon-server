@@ -11,14 +11,20 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use io_imap::codec::fragmentizer::Fragmentizer;
 use io_imap::rfc3501::greeting::{ImapGreetingGet, ImapGreetingGetOptions};
+use io_imap::rfc3501::list::ImapMailboxList;
 use io_imap::rfc3501::login::{ImapLogin, ImapLoginOptions};
 use io_imap::rfc3501::logout::ImapLogout;
+use io_imap::rfc7628::auth_oauthbearer::{ImapAuthOauthbearer, ImapAuthOauthbearerOptions};
+use io_imap::types::flag::FlagNameAttribute;
+use io_imap::types::mailbox::{ListMailbox, Mailbox};
 use io_imap::types::response::Capability;
 use rustls::pki_types::ServerName;
+use serde::Serialize;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+use tracing::debug;
 
 use crate::imap::pump;
 
@@ -33,6 +39,17 @@ const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
+/// How to authenticate an IMAP session: a password (`LOGIN`) or an OAuth
+/// 2.0 access token (SASL `OAUTHBEARER`). Resolved just before connecting —
+/// for OAuth, the access token is minted fresh from the stored refresh token.
+#[derive(Clone, Debug)]
+pub enum ImapAuth {
+    /// Cleartext password / app password.
+    Password(String),
+    /// A short-lived OAuth 2.0 bearer access token.
+    OauthBearer(String),
+}
+
 /// Connection parameters for one watch.
 #[derive(Clone, Debug)]
 pub struct ImapAccount {
@@ -42,8 +59,8 @@ pub struct ImapAccount {
     pub port: u16,
     /// Login (authentication identity).
     pub login: String,
-    /// Cleartext password (decrypted just before connecting).
-    pub password: String,
+    /// How to authenticate (resolved just before connecting).
+    pub auth: ImapAuth,
     /// Mailbox to watch.
     pub mailbox: String,
 }
@@ -99,22 +116,39 @@ async fn open(
     Ok((stream, fragmentizer))
 }
 
-/// Authenticates an opened stream with LOGIN, returning the fresh
+/// Authenticates an opened stream — `LOGIN` for a password, SASL
+/// `OAUTHBEARER` for an OAuth access token — returning the fresh
 /// post-authentication capabilities.
 async fn authenticate(
     stream: &mut TlsStream<TcpStream>,
     fragmentizer: &mut Fragmentizer,
     account: &ImapAccount,
 ) -> Result<Vec<Capability<'static>>> {
-    let login_opts = ImapLoginOptions {
-        ensure_capabilities: true,
-        auto_id: None,
-    };
-    let login = ImapLogin::new(&account.login, &account.password, login_opts)
-        .context("Invalid IMAP credentials")?;
-    pump::run(stream, fragmentizer, login)
-        .await?
-        .context("IMAP login failed")
+    match &account.auth {
+        ImapAuth::Password(password) => {
+            let login_opts = ImapLoginOptions {
+                ensure_capabilities: true,
+                auto_id: None,
+            };
+            let login = ImapLogin::new(&account.login, password, login_opts)
+                .context("Invalid IMAP credentials")?;
+            pump::run(stream, fragmentizer, login)
+                .await?
+                .context("IMAP login failed")
+        }
+        ImapAuth::OauthBearer(token) => {
+            let opts = ImapAuthOauthbearerOptions {
+                initial_request: true,
+                ensure_capabilities: true,
+                auto_id: None,
+            };
+            let auth =
+                ImapAuthOauthbearer::new(&account.login, &account.host, account.port, token, opts);
+            pump::run(stream, fragmentizer, auth)
+                .await?
+                .context("IMAP OAUTHBEARER authentication failed")
+        }
+    }
 }
 
 /// Opens TCP + TLS, reads the greeting and authenticates with LOGIN,
@@ -151,22 +185,22 @@ pub struct Probe {
 }
 
 impl Probe {
-    /// Watchable iff reachable, authenticated and advertising the
-    /// capabilities the watcher needs. This is the plan's "green light":
-    /// `TLS + auth + CAPABILITY ⊇ {IDLE, QRESYNC}`, **not** just auth.
+    /// Watchable iff reachable, authenticated and advertising **IDLE** — the
+    /// one hard requirement (the wake signal). QRESYNC is no longer required:
+    /// with it the watcher tracks new/flags/removed via `run_watch`; without
+    /// it (Gmail, Yahoo, …) the IDLE-only `run_watch_idle` path tracks new
+    /// mail only. Callers surface that degrade via [`Probe::qresync`].
     pub fn watchable(&self) -> bool {
-        self.reachable && self.authenticated && self.idle && self.qresync
+        self.reachable && self.authenticated && self.idle
     }
 
-    /// The names of the required capabilities the server does not
-    /// advertise (only meaningful once authenticated).
+    /// The names of the **required** capabilities the server does not
+    /// advertise (only meaningful once authenticated). QRESYNC is an
+    /// enhancement, not a requirement, so it is not listed here.
     pub fn missing(&self) -> Vec<&'static str> {
         let mut missing = Vec::new();
         if !self.idle {
             missing.push("IDLE");
-        }
-        if !self.qresync {
-            missing.push("QRESYNC");
         }
         missing
     }
@@ -201,8 +235,113 @@ pub async fn probe(connector: &TlsConnector, account: &ImapAccount) -> Probe {
     probe.qresync = capabilities.contains(&Capability::QResync);
     probe.condstore = capabilities.contains(&Capability::CondStore);
 
+    // Diagnostic: the exact post-auth capabilities the server advertised.
+    // A provider that supports IDLE but reads as non-watchable here means
+    // the capability was not captured (e.g. inline-vs-follow-up CAPABILITY),
+    // not that the server lacks it.
+    debug!(
+        host = %account.host,
+        idle = probe.idle,
+        qresync = probe.qresync,
+        capabilities = ?capabilities,
+        "imap probe post-auth capabilities",
+    );
+
     // Best-effort clean logout; the verdict is already decided.
     let _ = pump::run(&mut stream, &mut fragmentizer, ImapLogout::new()).await;
 
     probe
+}
+
+/// One selectable mailbox from a LIST, with its RFC 6154 special-use role
+/// if the server advertises one (`inbox`, `sent`, `drafts`, `junk`,
+/// `trash`, `archive`, `all`, `flagged`). Onboarding uses this to fill the
+/// mailbox picker and default to the inbox.
+#[derive(Clone, Debug, Serialize)]
+pub struct MailboxEntry {
+    /// The unicode mailbox name (e.g. `INBOX`, `[Gmail]/All Mail`).
+    pub name: String,
+    /// The special-use role, if the server flags one.
+    pub role: Option<&'static str>,
+}
+
+/// Connects, authenticates, `LIST`s every selectable mailbox and logs out —
+/// the read side behind the onboarding mailbox picker. `\Noselect`
+/// containers (which cannot be watched) are dropped; the result is sorted
+/// with `INBOX` first, then case-insensitively by name.
+pub async fn list_mailboxes(
+    connector: &TlsConnector,
+    account: &ImapAccount,
+) -> Result<Vec<MailboxEntry>> {
+    let (mut stream, mut fragmentizer) = open(connector, account).await?;
+    authenticate(&mut stream, &mut fragmentizer, account).await?;
+
+    let reference = Mailbox::try_from("").expect("empty reference is valid");
+    let pattern = ListMailbox::try_from("*").expect("'*' wildcard is valid");
+    let rows = pump::run(
+        &mut stream,
+        &mut fragmentizer,
+        ImapMailboxList::new(reference, pattern),
+    )
+    .await?
+    .context("IMAP LIST failed")?;
+
+    // Best-effort clean logout; we already have the listing.
+    let _ = pump::run(&mut stream, &mut fragmentizer, ImapLogout::new()).await;
+
+    let mut entries: Vec<MailboxEntry> = rows
+        .into_iter()
+        .filter(|(_, _, attrs)| {
+            !attrs
+                .iter()
+                .any(|attr| matches!(attr, FlagNameAttribute::Noselect))
+        })
+        .map(|(mailbox, _, attrs)| {
+            let (name, is_inbox) = match &mailbox {
+                Mailbox::Inbox => ("INBOX".to_string(), true),
+                Mailbox::Other(other) => (
+                    String::from_utf8_lossy(other.inner().as_ref()).into_owned(),
+                    false,
+                ),
+            };
+            MailboxEntry {
+                role: mailbox_role(is_inbox, &attrs),
+                name,
+            }
+        })
+        .collect();
+
+    // INBOX first, then case-insensitive name; drop any duplicate names.
+    entries.sort_by(|a, b| {
+        let rank = |e: &MailboxEntry| (e.name != "INBOX", e.name.to_ascii_lowercase());
+        rank(a).cmp(&rank(b))
+    });
+    entries.dedup_by(|a, b| a.name == b.name);
+
+    Ok(entries)
+}
+
+/// Maps a mailbox's attributes (RFC 6154 special-use, surfaced as
+/// `\Sent`, `\Drafts`, …) to a coarse role, or `None` for a plain folder.
+fn mailbox_role(is_inbox: bool, attrs: &[FlagNameAttribute]) -> Option<&'static str> {
+    if is_inbox {
+        return Some("inbox");
+    }
+    attrs.iter().find_map(|attr| {
+        match attr
+            .to_string()
+            .trim_start_matches('\\')
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "sent" => Some("sent"),
+            "drafts" => Some("drafts"),
+            "junk" => Some("junk"),
+            "trash" => Some("trash"),
+            "archive" => Some("archive"),
+            "all" => Some("all"),
+            "flagged" => Some("flagged"),
+            _ => None,
+        }
+    })
 }
