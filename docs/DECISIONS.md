@@ -134,41 +134,47 @@ because you can't watch what you can't log into. (Same mailbox-control proof the
 plan reserved for passwordless recovery — one mechanism, two jobs.) Normalise
 aggressively (lowercase, strip plus-addressing, canonical provider domain).
 
-## 3a. Business model — a single subscription (2026-07-21, supersedes §3)
+## 3a. Business model — one flat subscription (2026-07-21, supersedes §3)
 
-Credits shipped, then lost to their own complexity. The pivot:
+Credits shipped, then lost to their own complexity. The pivot went through
+per-mailbox €1 and per-mailbox-quantity before converging (same day) on:
 
-- **A per-mailbox subscription.** Each mailbox is subscribed (and cancelled)
-  independently at `€1/month` (or `€10/year`, two months free) as a recurring
-  Stripe Price; the buyer picks the cadence per mailbox, the price lives in
-  Stripe. Chosen over one account-wide subscription (2026-07-21) because the
-  price is genuinely per-mailbox and users want to pay for the mailboxes they
-  care about, seeing each one's status distinctly. While a mailbox's
-  subscription is `active` (incl. `trialing`/`past_due` during dunning, up to the
-  period end + a short grace), its watches may run; when it lapses, the sweep
-  pauses them. (Trade-off accepted: each €1 charge carries Stripe's fixed fee
-  independently — a quantity-on-one-subscription model would amortise it, but the
-  independent-control UX won.)
-- **Entitlement is a boolean, not a balance.** `entitled = trial_active(mailbox)
-  ∨ subscription_active(account, mailbox)`. No per-second debit, no pool, no
-  runway — a light periodic **sweep** re-checks entitlement and pauses lapsed
-  watches (the same "no silent outage" notices, now `trial_ending` /
-  `watch_paused`).
+- **One flat subscription per account.** The `standard` plan (e.g. `€3/month`,
+  monthly only) as a recurring Stripe Price covers **every mailbox** the account
+  watches. Chosen over per-mailbox €1 (Stripe's fixed fee dominates a €1 charge,
+  ~27%, and multiplies per mailbox) and over per-mailbox-quantity: a flat price
+  amortises the fixed fee (~8% at €3) and keeps one subscription / renewal /
+  portal. Since infra is sub-cent per mailbox, the tail (a 100-mailbox user costs
+  ≈ €0.20–0.50/mo) is a **fair-use** matter, not a pricing one — you can't set a
+  flat price high enough to cover it without killing the 1-mailbox conversion.
+- **Unlimited-with-fair-use.** Marketed as unlimited mailboxes; a configurable
+  soft cap (`[server] max_watches_per_account`, default 25) blocks watch-create
+  beyond it with a `402` "get in touch for a volume plan". You only go underwater
+  around ~1,000 mailboxes on one account — reselling, not a real user.
+- **Account-level free trial.** Every account starts with a **7-day** wall-clock
+  window (`account.trial_expires`, stamped once at creation). Deliberately
+  *service-agnostic* (a generic "7 days of watch", not per-mailbox / per-protocol)
+  so it carries over if Carillon grows beyond IMAP. Trades a little farm-resistance
+  (a new account = a new trial, though each still needs a proven mailbox) for
+  that forward-compatibility.
+- **Entitlement is a boolean, not a balance.** `entitled = trial_active(account)
+  ∨ subscription_active(account)`. No per-second debit, no pool, no runway — a
+  light periodic **sweep** re-checks entitlement and pauses lapsed watches (the
+  same "no silent outage" notices, now `trial_ending` / `watch_paused`).
 - **Why this is not worse than credits.** The only thing credits added was
   time-granular metering, worth ~nothing when the cost is sub-cent and a watch is
   on-or-off. A Stripe subscription **keeps the prepaid property** (the period is
   billed up front — still no arrears, §3's decisive constraint), and is the
   *native* model on the App Store / Play too (RevenueCat unifies all three), so
   it also un-blocks the mobile rails credits were chosen to protect.
-- **Free trial, still un-farmable.** The per-mailbox trial survives as a
-  one-time **wall-clock window** (7 days, granted once per normalised mailbox
-  key — the §3 anti-abuse linchpin is unchanged: you only get a trial for a
-  mailbox you authenticated to). It replaces the drainable trial *pool*.
 - **Payment still stateless on our side.** Checkout binds the Stripe
   subscription to *the account you're logged into via the link*; we persist only
   the subscription state Stripe reports (status + period end + customer id for
-  the portal) — no balance, no PII. Cancel/upgrade go through Stripe's
-  billing portal (`/billing/portal`), not our own screens.
+  the portal) — no balance, no PII. Cancel goes through Stripe's billing portal
+  (`/billing/portal`), not our own screens.
+- **Selecting what to watch** is the natural next surface: with one subscription
+  covering the account, the dashboard should let a user pick which of their
+  authenticated mailboxes are actively watched.
 
 Dropped with credits: the paid pool, auto-refill, `credit`/`auto-refill`
 endpoints, the two-counter metering loop, and the balance/runway/drain UI.

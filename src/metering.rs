@@ -1,14 +1,20 @@
-//! Entitlement — the business model made correct here, not in the payment
-//! vendor (§ DECISIONS 3).
+//! Entitlement & renewal — the business model made correct here, not in the
+//! payment vendor (§ BILLING_MODEL).
 //!
-//! A watch runs while its account is **entitled**, which is a boolean, not a
-//! balance: either the watch's mailbox is still inside its one-time free-trial
-//! **window** (wall-clock, granted once per normalised mailbox — un-farmable),
-//! or the account holds an **active subscription**. There is no per-second
-//! debit; a light [`run`] sweep re-checks entitlement each tick and pauses any
-//! watch whose entitlement has lapsed (so it stops holding an IDLE connection),
-//! emitting a notice on the live bus and as a signed webhook so a no-dashboard
-//! user is never silently cut off.
+//! A **service** (watch) runs while its **PIM account** (mailbox membership) is
+//! watching-paid: `watching_until` is in the future. Activation spends one
+//! credit to set that a month ahead; the pool is the account's prepaid balance.
+//! A light [`run`] sweep, each tick, in **declaration order**:
+//!
+//! - warns once when a paid month is about to end (pre-expiry), and
+//! - at expiry either **auto-renews** (draws the next credit from the pool, if
+//!   the PIM account opted in and the pool is non-empty) or **stops** the PIM
+//!   account's watches — emitting a notice on the live bus and, per watch, as a
+//!   signed webhook so a no-dashboard user is never silently cut off.
+//!
+//! Metering is a **SaaS concern**: with the keyless stub provider (self-host /
+//! dev) the whole sweep is disabled and every watch is entitled — self-host is
+//! not billed.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,26 +25,32 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use crate::delivery::deliver_notice;
+use crate::email::Mailer;
 use crate::live::{LiveBus, LiveEvent, NoticeKind, Routed};
-use crate::store::{Store, SubscriptionRow};
+use crate::store::{Store, Watch};
 use crate::supervisor::SupervisorCmd;
 use crate::util::now_secs;
 
-/// Default free-trial window: one week of watch-time, granted once per
-/// mailbox. Wall-clock from the first authentication.
-const DEFAULT_TRIAL_SECS: f64 = 7.0 * 86_400.0;
-/// Grace past a subscription's period end before entitlement is dropped, so a
-/// delayed renewal / missed webhook does not cause a spurious outage.
-pub const SUB_GRACE_SECS: i64 = 3 * 86_400;
-/// Default "trial ending soon" warning lead time.
-const DEFAULT_WARN_BEFORE_SECS: f64 = 3.0 * 86_400.0;
-/// Default entitlement-sweep interval.
+/// One watch-month: what a credit buys. Overridable via `CARILLON_MONTH_SECS`
+/// (mainly to exercise expiry/renewal in tests without waiting 30 days).
+const DEFAULT_MONTH_SECS: i64 = 30 * 86_400;
+/// Default pre-expiry "watch ending soon" warning lead time.
+const DEFAULT_WARN_BEFORE_SECS: i64 = 3 * 86_400;
+/// Default low-pool warning threshold (credits remaining).
+const DEFAULT_LOW_POOL_CREDITS: i64 = 2;
+/// Default renewal-sweep interval.
 const DEFAULT_TICK_SECS: u64 = 60;
 
-/// The one-time trial window, overridable via `CARILLON_TRIAL_SECS` (mainly to
-/// exercise expiry in tests without waiting days).
-pub fn trial_secs() -> f64 {
-    env_f64("CARILLON_TRIAL_SECS").unwrap_or(DEFAULT_TRIAL_SECS)
+/// Credits granted to a Carillon account on creation — the one free credit
+/// (§ BILLING_MODEL), granted once per account, gated on a validated PIM
+/// account (accounts are only ever created by proving a mailbox).
+pub const FREE_CREDITS_ON_SIGNUP: i64 = 1;
+
+/// One watch-month in seconds (what one credit buys), env-overridable.
+pub fn month_secs() -> i64 {
+    env_i64("CARILLON_MONTH_SECS")
+        .unwrap_or(DEFAULT_MONTH_SECS)
+        .max(1)
 }
 
 /// The sweep interval, overridable via `CARILLON_METER_TICK_SECS`.
@@ -51,13 +63,17 @@ pub fn tick() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// The "trial ending soon" warning lead time, overridable via
-/// `CARILLON_WARN_BEFORE_SECS`.
-fn warn_before_secs() -> f64 {
-    env_f64("CARILLON_WARN_BEFORE_SECS").unwrap_or(DEFAULT_WARN_BEFORE_SECS)
+/// The pre-expiry warning lead time, overridable via `CARILLON_WARN_BEFORE_SECS`.
+fn warn_before_secs() -> i64 {
+    env_i64("CARILLON_WARN_BEFORE_SECS").unwrap_or(DEFAULT_WARN_BEFORE_SECS)
 }
 
-fn env_f64(name: &str) -> Option<f64> {
+/// The low-pool warning threshold, overridable via `CARILLON_LOW_POOL_CREDITS`.
+fn low_pool_credits() -> i64 {
+    env_i64("CARILLON_LOW_POOL_CREDITS").unwrap_or(DEFAULT_LOW_POOL_CREDITS)
+}
+
+fn env_i64(name: &str) -> Option<i64> {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
@@ -65,7 +81,8 @@ fn env_f64(name: &str) -> Option<f64> {
 
 /// The normalised anti-farming key for a mailbox: lowercased, plus-
 /// addressing stripped, keyed on `(local, provider)`. Two logins that
-/// reach the same inbox share one trial, so it cannot be farmed.
+/// reach the same inbox share one PIM account, so a free credit (or a
+/// fair-use slot) cannot be farmed with aliases.
 pub fn mailbox_key(login: &str, imap_host: &str) -> String {
     let login = login.trim().to_ascii_lowercase();
     let (local, domain) = match login.split_once('@') {
@@ -77,144 +94,218 @@ pub fn mailbox_key(login: &str, imap_host: &str) -> String {
     format!("{local}@{domain}")
 }
 
-/// Whether a mailbox's subscription currently entitles its watches. Active,
-/// trialing and (during dunning) past_due count, up to the period end plus a
-/// grace window; a missing period end means we only just recorded it.
-pub fn subscription_active(subscription: &SubscriptionRow, now: i64) -> bool {
-    let paying = matches!(
-        subscription.sub_status.as_deref(),
-        Some("active") | Some("trialing") | Some("past_due")
-    );
-    if !paying {
-        return false;
-    }
-    match subscription.sub_current_period_end {
-        Some(end) => now < end + SUB_GRACE_SECS,
-        None => true,
-    }
+/// Whether a service is currently watching-paid: `watching_until` in the future.
+pub fn pim_entitled(watching_until: Option<i64>, now: i64) -> bool {
+    matches!(watching_until, Some(until) if now < until)
 }
 
-/// Whether a mailbox's one-time free-trial window is still open.
-pub fn trial_active(store: &Store, mailbox_key: &str, now: i64) -> bool {
-    matches!(store.trial_expires(mailbox_key), Ok(Some(expires)) if now < expires)
+/// The entitlement check the supervisor makes when reconciling (the server
+/// boundary): is this service's paid month still in the future?
+pub fn watch_entitled(watch: &Watch, now: i64) -> bool {
+    pim_entitled(watch.watching_until, now)
 }
 
-/// Whether a mailbox is currently subscribed (its per-mailbox subscription is
-/// active). Fails closed on a store error only for entitlement decisions that
-/// combine it with the trial check below.
-pub fn mailbox_subscribed(store: &Store, account_id: &str, mailbox_key: &str, now: i64) -> bool {
-    matches!(
-        store.get_mailbox_subscription(account_id, mailbox_key),
-        Ok(Some(sub)) if subscription_active(&sub, now)
-    )
-}
-
-/// Whether a watch may run: its mailbox is still in trial, or that mailbox's
-/// subscription is active. The entitlement check the supervisor makes at
-/// watch-start (the server boundary).
-pub fn is_entitled(store: &Store, account_id: &str, mailbox_key: &str) -> bool {
-    let now = now_secs();
-    trial_active(store, mailbox_key, now) || mailbox_subscribed(store, account_id, mailbox_key, now)
-}
-
-/// Runs the entitlement sweep until cancelled: every `tick`, pause any active
-/// watch whose account is no longer entitled, and warn once when a trial is
-/// about to lapse with no subscription behind it.
+/// Runs the renewal sweep until cancelled. Disabled (returns immediately) when
+/// `metered` is false — self-host with the stub provider is not billed.
 pub async fn run(
     store: Arc<Store>,
     live: LiveBus,
     http: reqwest::Client,
+    mailer: Arc<Mailer>,
     commands: mpsc::Sender<SupervisorCmd>,
     tick: Duration,
+    metered: bool,
 ) {
+    if !metered {
+        info!("renewal sweep disabled (unmetered — stub billing / self-host)");
+        return;
+    }
+
+    let month = month_secs();
     let warn_before = warn_before_secs();
-    // Watches already warned this trial-ending episode, so the warning fires
-    // once per crossing, not every tick.
-    let mut warned: HashSet<String> = HashSet::new();
+    let low_pool = low_pool_credits();
+    // Keyed by watch id, warned once per crossing so a warning fires on the
+    // crossing, not each tick.
+    let mut ending_warned: HashSet<String> = HashSet::new();
+    let mut stopped_notified: HashSet<String> = HashSet::new();
+    let mut low_pool_warned: HashSet<String> = HashSet::new();
 
     let mut ticker = interval(tick);
     ticker.tick().await; // consume the immediate first tick
 
     info!(
         tick_secs = tick.as_secs(),
+        month_secs = month,
         warn_before_secs = warn_before,
-        "entitlement sweep started"
+        low_pool_credits = low_pool,
+        "renewal sweep started"
     );
 
     loop {
         ticker.tick().await;
-
-        let watches = match store.active_watches() {
-            Ok(watches) => watches,
-            Err(err) => {
-                warn!(error = %err, "sweep: cannot read watches");
-                continue;
-            }
-        };
-
-        let now = now_secs();
-        for watch in watches {
-            let key = mailbox_key(&watch.login, &watch.imap_host);
-            let subscribed = mailbox_subscribed(&store, &watch.account_id, &key, now);
-            let trial_expires = store.trial_expires(&key).ok().flatten();
-            let trial_ok = matches!(trial_expires, Some(expires) if now < expires);
-
-            // Lapsed: no active trial and no subscription — pause the watch.
-            if !subscribed && !trial_ok {
-                let _ = store.set_active(&watch.id, false);
-                warned.remove(&watch.id);
-                emit_notice(
-                    &store,
-                    &live,
-                    &http,
-                    &watch.account_id,
-                    &watch.id,
-                    NoticeKind::WatchPaused,
-                    None,
-                )
-                .await;
-                // Drop the connection promptly rather than waiting for the
-                // next periodic reconcile.
-                let _ = commands.send(SupervisorCmd::Reconcile).await;
-                continue;
-            }
-
-            debug!(watch = %watch.id, subscribed, trial_ok, "entitled");
-
-            // On trial only, and it is about to lapse: warn once per crossing.
-            if !subscribed {
-                if let Some(expires) = trial_expires {
-                    let remaining = (expires - now) as f64;
-                    if remaining <= warn_before {
-                        if warned.insert(watch.id.clone()) {
-                            let days = (remaining / 86_400.0).ceil().max(0.0) as i64;
-                            emit_notice(
-                                &store,
-                                &live,
-                                &http,
-                                &watch.account_id,
-                                &watch.id,
-                                NoticeKind::TrialEnding,
-                                Some(format!("{days}d left")),
-                            )
-                            .await;
-                        }
-                    } else {
-                        warned.remove(&watch.id);
-                    }
-                }
-            } else {
-                warned.remove(&watch.id);
-            }
+        if let Err(err) = sweep(
+            &store,
+            &live,
+            &http,
+            &mailer,
+            &commands,
+            now_secs(),
+            month,
+            warn_before,
+            low_pool,
+            &mut ending_warned,
+            &mut stopped_notified,
+            &mut low_pool_warned,
+        )
+        .await
+        {
+            warn!(error = %err, "renewal sweep tick failed");
         }
     }
 }
 
-/// Publishes a notice on the live bus (dashboard) and as a signed webhook
-/// (so a no-dashboard user is not silently cut off). `account_id` tags the
-/// live event for scoped SSE fan-out; `watch_id` keys the wire payload and
-/// the webhook.
-async fn emit_notice(
+/// One sweep pass, factored out so a store error aborts the tick, not the loop.
+/// Iterates active services (watches) in declaration order — earlier services
+/// win the shared pool when it cannot cover every auto-renew at once.
+#[allow(clippy::too_many_arguments)]
+async fn sweep(
+    store: &Store,
+    live: &LiveBus,
+    http: &reqwest::Client,
+    mailer: &Mailer,
+    commands: &mpsc::Sender<SupervisorCmd>,
+    now: i64,
+    month: i64,
+    warn_before: i64,
+    low_pool: i64,
+    ending_warned: &mut HashSet<String>,
+    stopped_notified: &mut HashSet<String>,
+    low_pool_warned: &mut HashSet<String>,
+) -> anyhow::Result<()> {
+    let watches = store.active_watches()?;
+
+    let mut reconcile = false;
+    // Accounts with an active auto-renew service, for the low-pool check.
+    let mut auto_renew_accounts: HashSet<String> = HashSet::new();
+    let mut accounts: HashSet<String> = HashSet::new();
+
+    for watch in &watches {
+        accounts.insert(watch.account_id.clone());
+        if watch.auto_renew {
+            auto_renew_accounts.insert(watch.account_id.clone());
+        }
+        let Some(until) = watch.watching_until else {
+            continue; // never activated — nothing to expire
+        };
+
+        if now < until {
+            // Still watching: warn once as it nears expiry, and clear any prior
+            // stop bookkeeping (it is paid again).
+            stopped_notified.remove(&watch.id);
+            if until - now <= warn_before {
+                if ending_warned.insert(watch.id.clone()) {
+                    let days = ((until - now) as f64 / 86_400.0).ceil().max(0.0) as i64;
+                    emit_watch_notice(
+                        store,
+                        live,
+                        http,
+                        &watch.account_id,
+                        &watch.id,
+                        NoticeKind::WatchEnding,
+                        Some(format!("{days}d left")),
+                    )
+                    .await;
+                }
+            } else {
+                ending_warned.remove(&watch.id);
+            }
+            continue;
+        }
+
+        // Expired. Renew from the pool (if opted in and the pool is non-empty),
+        // else notify the stop once — the reconcile below drops its connection.
+        ending_warned.remove(&watch.id);
+        if watch.auto_renew && store.debit_credit(&watch.account_id)? {
+            store.set_watch_watching_until(&watch.id, now + month)?;
+            stopped_notified.remove(&watch.id);
+            info!(account = %watch.account_id, watch = %watch.id, "auto-renewed");
+            continue;
+        }
+
+        reconcile = true;
+        if stopped_notified.insert(watch.id.clone()) {
+            emit_watch_notice(
+                store,
+                live,
+                http,
+                &watch.account_id,
+                &watch.id,
+                NoticeKind::WatchStopped,
+                None,
+            )
+            .await;
+            email_account(
+                mailer,
+                store,
+                &watch.account_id,
+                "Carillon: a watch stopped",
+                &format!(
+                    "Watching {} stopped — its month ended and there were no \
+                     credits to renew it. Buy credits and re-activate it to resume.",
+                    mailbox_key(&watch.login, &watch.imap_host)
+                ),
+            )
+            .await;
+        }
+    }
+
+    // Low-pool warning: an account with an active auto-renew service and a pool
+    // running low, warned once per crossing.
+    for account_id in &accounts {
+        let credits = store
+            .get_account(account_id)?
+            .map(|account| account.credits)
+            .unwrap_or(0);
+        let low = auto_renew_accounts.contains(account_id) && credits > 0 && credits <= low_pool;
+        if low {
+            if low_pool_warned.insert(account_id.clone()) {
+                info!(account = %account_id, credits, "low pool");
+                let _ = live.send(Routed::new(
+                    account_id.clone(),
+                    LiveEvent::notice(
+                        account_id,
+                        NoticeKind::LowPool,
+                        Some(format!("{credits} left")),
+                    ),
+                ));
+                email_account(
+                    mailer,
+                    store,
+                    account_id,
+                    "Carillon: credits running low",
+                    &format!(
+                        "Your credit pool is down to {credits}. Top it up so your \
+                         auto-renewing services don't stop when it empties."
+                    ),
+                )
+                .await;
+            }
+        } else {
+            low_pool_warned.remove(account_id);
+        }
+    }
+
+    if reconcile {
+        // Drop the stopped services' connections promptly.
+        let _ = commands.send(SupervisorCmd::Reconcile).await;
+    }
+    debug!(services = watches.len(), "sweep done");
+    Ok(())
+}
+
+/// Publishes a per-watch notice on the live bus (dashboard) and as a signed
+/// webhook (so a no-dashboard user is not silently cut off).
+async fn emit_watch_notice(
     store: &Store,
     live: &LiveBus,
     http: &reqwest::Client,
@@ -223,7 +314,7 @@ async fn emit_notice(
     kind: NoticeKind,
     detail: Option<String>,
 ) {
-    info!(account = %watch_id, notice = kind.as_str(), ?detail, "notice");
+    info!(watch = %watch_id, notice = kind.as_str(), ?detail, "notice");
     let _ = live.send(Routed::new(
         account_id,
         LiveEvent::notice(watch_id, kind, detail),
@@ -233,64 +324,38 @@ async fn emit_notice(
     }
 }
 
+/// Emails an account-level notice to the account's magic-link address, if it
+/// has one (a self-host / anonymous account has none — it relies on the
+/// per-watch webhook instead). Best-effort: a send failure is logged, not fatal.
+async fn email_account(
+    mailer: &Mailer,
+    store: &Store,
+    account_id: &str,
+    subject: &str,
+    body: &str,
+) {
+    let email = store
+        .get_account(account_id)
+        .ok()
+        .flatten()
+        .and_then(|account| account.email);
+    if let Some(email) = email
+        && let Err(err) = mailer.send_notice(&email, subject, body).await
+    {
+        warn!(account = %account_id, error = %err, "notice email failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn subscription(status: Option<&str>, period_end: Option<i64>) -> SubscriptionRow {
-        SubscriptionRow {
-            sub_status: status.map(str::to_string),
-            sub_current_period_end: period_end,
-            stripe_customer_id: None,
-            plan: None,
-        }
-    }
-
     #[test]
-    fn active_subscription_within_period_is_entitled() {
+    fn pim_entitled_tracks_watching_until() {
         let now = 1_000_000;
-        assert!(subscription_active(
-            &subscription(Some("active"), Some(now + 10)),
-            now
-        ));
-    }
-
-    #[test]
-    fn active_subscription_keeps_grace_past_period_end() {
-        let now = 1_000_000;
-        // One day past the period end is still inside the 3-day grace.
-        assert!(subscription_active(
-            &subscription(Some("active"), Some(now - 86_400)),
-            now
-        ));
-    }
-
-    #[test]
-    fn active_subscription_lapses_after_grace() {
-        let now = 1_000_000;
-        assert!(!subscription_active(
-            &subscription(Some("active"), Some(now - SUB_GRACE_SECS - 1)),
-            now
-        ));
-    }
-
-    #[test]
-    fn past_due_still_entitles_during_dunning() {
-        let now = 1_000_000;
-        assert!(subscription_active(
-            &subscription(Some("past_due"), Some(now + 10)),
-            now
-        ));
-    }
-
-    #[test]
-    fn canceled_or_unsubscribed_is_not_entitled() {
-        let now = 1_000_000;
-        assert!(!subscription_active(
-            &subscription(Some("canceled"), Some(now + 10)),
-            now
-        ));
-        assert!(!subscription_active(&subscription(None, None), now));
+        assert!(pim_entitled(Some(now + 10), now));
+        assert!(!pim_entitled(Some(now - 10), now));
+        assert!(!pim_entitled(None, now));
     }
 
     #[test]

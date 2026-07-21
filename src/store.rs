@@ -32,6 +32,13 @@ CREATE TABLE IF NOT EXISTS watch (
   -- 'password' (enc_password) or 'oauth' (the oauth_credential for the
   -- watch's (account_id, mailbox_key)).
   auth_kind    TEXT NOT NULL DEFAULT 'password',
+  -- Per-service billing (§ BILLING_MODEL): the watch is the billed unit.
+  -- `watching_until` is the paid-through time — activation spends one credit to
+  -- set it a month ahead, and the service runs (when metered) only while it is
+  -- in the future. `auto_renew` (off by default) draws the next credit from the
+  -- pool at expiry instead of stopping.
+  watching_until INTEGER,
+  auto_renew   INTEGER NOT NULL DEFAULT 0,
   active       INTEGER NOT NULL DEFAULT 1
 );
 
@@ -73,6 +80,20 @@ CREATE TABLE IF NOT EXISTS oauth_credential (
   PRIMARY KEY (account_id, mailbox_key)
 );
 
+-- The password credential for a proven PIM account (§ BILLING_MODEL: the
+-- credential lives on the PIM account, not the service). Age-encrypted; every
+-- password service under this (account, mailbox) authenticates through it, so a
+-- re-auth updates them all at once. Stored at 'Add account' (POST /auth); reused
+-- when adding services. Self-host import instead carries the password on the
+-- watch (watch.enc_password), which takes precedence when present.
+CREATE TABLE IF NOT EXISTS password_credential (
+  account_id   TEXT NOT NULL,
+  mailbox_key  TEXT NOT NULL,
+  enc_password TEXT NOT NULL,
+  updated_at   INTEGER NOT NULL,
+  PRIMARY KEY (account_id, mailbox_key)
+);
+
 CREATE TABLE IF NOT EXISTS delivery (
   id       INTEGER PRIMARY KEY AUTOINCREMENT,
   account  TEXT NOT NULL,
@@ -87,39 +108,30 @@ CREATE TABLE IF NOT EXISTS delivery (
 
 CREATE INDEX IF NOT EXISTS delivery_account_at ON delivery (account, at DESC);
 
--- The billing account: a login-less grouping of the mailboxes a user proved
--- control of. Subscriptions are per-mailbox (see mailbox_subscription), not
--- per-account, so the account row itself is just an identity anchor.
+-- The Carillon account (§ BILLING_MODEL): a magic-link-verified email plus a
+-- prepaid, fungible **credit pool**. One credit buys one PIM account one month
+-- of watching. Payment is stateless on our side: a one-shot purchase tops the
+-- pool up; we persist only the integer balance, never card/PII. `email` is the
+-- magic-link identity (null for a self-host / import account, which is keyed by
+-- the watch id and never billed).
 CREATE TABLE IF NOT EXISTS account (
-  id TEXT PRIMARY KEY
+  id            TEXT PRIMARY KEY,
+  email         TEXT,
+  credits       INTEGER NOT NULL DEFAULT 0,
+  -- Set once the account's one free credit has been granted (on its first
+  -- validated PIM account), so it is never granted twice.
+  free_credited INTEGER NOT NULL DEFAULT 0
 );
 
--- Per-mailbox Stripe subscription (§ DECISIONS 3a): one subscription per
--- (account, mailbox), independently active/cancelled. Payment is stateless on
--- our side — we persist only the subscription state Stripe reports (status,
--- period end, customer/subscription ids for the portal), never card/PII.
-CREATE TABLE IF NOT EXISTS mailbox_subscription (
-  account_id             TEXT NOT NULL,
-  mailbox_key            TEXT NOT NULL,
-  sub_status             TEXT,
-  sub_current_period_end INTEGER,
-  stripe_customer_id     TEXT,
-  stripe_subscription_id TEXT,
-  plan                   TEXT,
-  PRIMARY KEY (account_id, mailbox_key)
-);
+CREATE INDEX IF NOT EXISTS account_email ON account (email);
 
-CREATE INDEX IF NOT EXISTS mailbox_subscription_sub
-  ON mailbox_subscription (stripe_subscription_id);
-
--- Per-mailbox free trial: a one-time wall-clock window, granted once ever,
--- keyed on the normalised (login, provider) so it cannot be farmed. The
--- window length (seconds) is stored in `trial_secs`; the trial is open while
--- now < granted_at + trial_secs. A dead trial stays dead forever.
-CREATE TABLE IF NOT EXISTS mailbox_trial (
-  mailbox_key TEXT PRIMARY KEY,
-  trial_secs  REAL NOT NULL,
-  granted_at  INTEGER NOT NULL
+-- Pending magic-link sign-ins: a short-lived, single-use token e-mailed to an
+-- address to prove control of it (the human identity flow). Only the SHA-256
+-- hash is stored; consumed on verify, aged out by created_at.
+CREATE TABLE IF NOT EXISTS magic_link (
+  token_hash TEXT PRIMARY KEY,
+  email      TEXT NOT NULL,
+  created_at INTEGER NOT NULL
 );
 
 -- Capability links: the login-less bearer credential for an account
@@ -132,8 +144,10 @@ CREATE TABLE IF NOT EXISTS capability (
   expires_at INTEGER
 );
 
--- Mailbox membership of an account: the mailboxes a user has proven
--- control of (by authenticating), grouped under one account.
+-- Mailbox membership = a **PIM account** (§ BILLING_MODEL): a credential the
+-- user has proven control of (by authenticating), grouped under one Carillon
+-- account. It is the ownership/credential unit; billing is per **service**
+-- (watch) under it, not per membership.
 CREATE TABLE IF NOT EXISTS account_mailbox (
   account_id  TEXT NOT NULL,
   mailbox_key TEXT NOT NULL,
@@ -143,18 +157,16 @@ CREATE TABLE IF NOT EXISTS account_mailbox (
   PRIMARY KEY (account_id, mailbox_key)
 );
 
--- Pending checkout sessions: payment is stateless on our side — we keep
--- only what to bind on fulfilment (the plan, and a nominal cadence length in
--- `secs` for a provisional period end), never card/PII (the provider owns
--- the customer + receipt).
+-- Pending checkout sessions: payment is stateless on our side — we keep only
+-- what to credit on fulfilment (the account and the number of credits bought),
+-- never card/PII (the provider owns the customer + receipt). Fulfilment is
+-- once-only (idempotent against retried payment webhooks).
 CREATE TABLE IF NOT EXISTS checkout_session (
-  session_id  TEXT PRIMARY KEY,
-  account_id  TEXT NOT NULL,
-  mailbox_key TEXT NOT NULL DEFAULT '',
-  plan        TEXT NOT NULL DEFAULT '',
-  secs        REAL NOT NULL,
-  fulfilled   INTEGER NOT NULL DEFAULT 0,
-  created_at  INTEGER NOT NULL
+  session_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  quantity   INTEGER NOT NULL DEFAULT 0,
+  fulfilled  INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
 );
 ";
 
@@ -191,7 +203,13 @@ pub struct Watch {
     /// `password` (uses `enc_password`) or `oauth` (authenticates via the
     /// `oauth_credential` for this watch's `(account_id, mailbox_key)`).
     pub auth_kind: String,
-    /// Whether the watch is enabled.
+    /// Paid-through time (§ BILLING_MODEL): the service runs, when metered, only
+    /// while this is in the future. `None` = never activated.
+    pub watching_until: Option<i64>,
+    /// Whether the next credit is drawn from the pool at expiry.
+    pub auto_renew: bool,
+    /// Whether the watch is enabled (the user's pause toggle, independent of
+    /// billing).
     pub active: bool,
 }
 
@@ -210,6 +228,8 @@ impl Watch {
             hmac_secret_prev_expires: row.get("hmac_secret_prev_expires")?,
             account_id: row.get("account_id")?,
             auth_kind: row.get("auth_kind")?,
+            watching_until: row.get("watching_until")?,
+            auto_renew: row.get::<_, i64>("auto_renew")? != 0,
             active: row.get::<_, i64>("active")? != 0,
         })
     }
@@ -283,34 +303,31 @@ pub struct DeliveryOutcome<'a> {
     pub attempts: u32,
 }
 
-/// A per-mailbox Stripe subscription: the state that gates one mailbox's
-/// watches. Keyed externally by `(account_id, mailbox_key)`.
+/// A Carillon account: the magic-link email identity and the prepaid credit
+/// pool every PIM account draws its watch-months from.
 #[derive(Clone, Debug)]
-pub struct SubscriptionRow {
-    /// Subscription status as Stripe reports it (`active`, `trialing`,
-    /// `past_due`, `canceled`, …). `None` = never subscribed.
-    pub sub_status: Option<String>,
-    /// Unix time the current paid period ends (the entitlement backstop when
-    /// a renewal/cancel event is missed).
-    pub sub_current_period_end: Option<i64>,
-    /// Stripe customer id, for the billing-portal (manage/cancel) link.
-    pub stripe_customer_id: Option<String>,
-    /// The plan id chosen (`month`, `year`, …), for display.
-    pub plan: Option<String>,
+pub struct AccountRow {
+    /// Account id.
+    pub id: String,
+    /// Magic-link email identity. `None` for a self-host / import account.
+    pub email: Option<String>,
+    /// Fungible credit-pool balance (one credit = one PIM-account-month).
+    pub credits: i64,
 }
 
-impl SubscriptionRow {
+impl AccountRow {
     fn from_row(row: &Row) -> rusqlite::Result<Self> {
         Ok(Self {
-            sub_status: row.get("sub_status")?,
-            sub_current_period_end: row.get("sub_current_period_end")?,
-            stripe_customer_id: row.get("stripe_customer_id")?,
-            plan: row.get("plan")?,
+            id: row.get("id")?,
+            email: row.get("email")?,
+            credits: row.get("credits")?,
         })
     }
 }
 
-/// A mailbox an account has proven control of.
+/// A PIM account (mailbox membership): a credential an account has proven
+/// control of. Ownership/credential unit; services (watches) under it are the
+/// billed unit.
 #[derive(Clone, Debug)]
 pub struct MembershipRow {
     /// Normalised mailbox key.
@@ -319,6 +336,16 @@ pub struct MembershipRow {
     pub login: String,
     /// IMAP host.
     pub imap_host: String,
+}
+
+impl MembershipRow {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            mailbox_key: row.get("mailbox_key")?,
+            login: row.get("login")?,
+            imap_host: row.get("imap_host")?,
+        })
+    }
 }
 
 /// A pending OAuth authorization flow, carried between `/oauth/start` and
@@ -451,10 +478,11 @@ impl Store {
         Ok((n > 0).then_some(expires))
     }
 
-    /// Returns every active watch, ordered by id.
+    /// Returns every active watch, in **declaration order** (`rowid` =
+    /// insertion order) — the order the renewal sweep debits the shared pool in.
     pub fn active_watches(&self) -> Result<Vec<Watch>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT * FROM watch WHERE active = 1 ORDER BY id")?;
+        let mut stmt = conn.prepare("SELECT * FROM watch WHERE active = 1 ORDER BY rowid")?;
         let rows = stmt.query_map([], Watch::from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -475,14 +503,18 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The `(id, login, imap_host)` of every watch — the cheap input to the
-    /// onboarding dedup guard, which normalises `(login, host)` into a
-    /// mailbox key (that normalisation lives in `metering`, not here). No
-    /// decrypt, no full row.
-    pub fn watch_identities(&self) -> Result<Vec<(String, String, String)>> {
+    /// The `(id, login, imap_host, mailbox)` of every watch — the cheap input to
+    /// the service dedup guard. A service is unique by `(login, service-type,
+    /// target)`; for an IMAP watch the target is the mailbox (folder), so one
+    /// login can run several services (INBOX, Archive, …). The `(login, host)`
+    /// normalisation into a mailbox key lives in `metering`. No decrypt, no full
+    /// row.
+    pub fn watch_identities(&self) -> Result<Vec<(String, String, String, String)>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT id, login, imap_host FROM watch")?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let mut stmt = conn.prepare("SELECT id, login, imap_host, mailbox FROM watch")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -591,25 +623,56 @@ impl Store {
         Ok(rows)
     }
 
-    // --- Accounts, subscriptions & trials ---
+    // --- Carillon accounts & the credit pool ---
 
-    /// Creates the account row if it does not exist yet (no-op if it does).
-    /// Called when a watch is created so its billing account exists.
-    pub fn ensure_account(&self, id: &str) -> Result<()> {
-        self.lock()
-            .execute("INSERT OR IGNORE INTO account (id) VALUES (?1)", [id])?;
-        Ok(())
+    /// Creates the account row if it does not exist yet (with an empty pool).
+    /// The free credit is granted separately by [`Store::grant_free_credit`], on
+    /// the first validated PIM account — not here, so a magic-link signup with no
+    /// mailbox cannot claim it. Returns whether the account was newly created.
+    pub fn ensure_account(&self, id: &str, email: Option<&str>) -> Result<bool> {
+        let created = self.lock().execute(
+            "INSERT OR IGNORE INTO account (id, email) VALUES (?1, ?2)",
+            params![id, email],
+        )?;
+        Ok(created > 0)
     }
 
-    /// Whether an account row exists.
-    pub fn account_exists(&self, id: &str) -> Result<bool> {
+    /// Grants the one free credit (§ BILLING_MODEL) to an account exactly once,
+    /// on its first validated PIM account. Idempotent (guarded by
+    /// `free_credited`); returns whether the grant fired this call.
+    pub fn grant_free_credit(&self, account_id: &str, amount: i64) -> Result<bool> {
+        let n = self.lock().execute(
+            "UPDATE account SET credits = credits + ?2, free_credited = 1
+             WHERE id = ?1 AND free_credited = 0",
+            params![account_id, amount],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The account bearing a magic-link email, if one exists.
+    pub fn account_by_email(&self, email: &str) -> Result<Option<String>> {
         let conn = self.lock();
-        let exists: Option<i64> = conn
-            .query_row("SELECT 1 FROM account WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
+        let id = conn
+            .query_row(
+                "SELECT id FROM account WHERE email = ?1 ORDER BY rowid LIMIT 1",
+                [email],
+                |row| row.get(0),
+            )
             .optional()?;
-        Ok(exists.is_some())
+        Ok(id)
+    }
+
+    /// Looks up an account's pool state.
+    pub fn get_account(&self, id: &str) -> Result<Option<AccountRow>> {
+        let conn = self.lock();
+        let account = conn
+            .query_row(
+                "SELECT id, email, credits FROM account WHERE id = ?1",
+                [id],
+                AccountRow::from_row,
+            )
+            .optional()?;
+        Ok(account)
     }
 
     /// Every account id, ordered.
@@ -620,119 +683,94 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The subscription covering one mailbox, if any.
-    pub fn get_mailbox_subscription(
-        &self,
-        account_id: &str,
-        mailbox_key: &str,
-    ) -> Result<Option<SubscriptionRow>> {
+    /// The `(login, imap_host)` of every watch owned by an account — cheap
+    /// input to the fair-use cap, which normalises them into mailbox keys.
+    pub fn account_watch_identities(&self, account_id: &str) -> Result<Vec<(String, String)>> {
         let conn = self.lock();
-        let sub = conn
-            .query_row(
-                "SELECT sub_status, sub_current_period_end, stripe_customer_id, plan
-                 FROM mailbox_subscription WHERE account_id = ?1 AND mailbox_key = ?2",
-                params![account_id, mailbox_key],
-                SubscriptionRow::from_row,
-            )
-            .optional()?;
-        Ok(sub)
+        let mut stmt = conn.prepare("SELECT login, imap_host FROM watch WHERE account_id = ?1")?;
+        let rows = stmt.query_map([account_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Binds a paid Stripe subscription to one mailbox and marks it active with
-    /// a provisional period end (refined by later lifecycle events). Ensures
-    /// the account exists. This is what a fulfilled checkout lands.
-    pub fn activate_subscription(
-        &self,
-        account_id: &str,
-        mailbox_key: &str,
-        subscription_id: &str,
-        customer_id: Option<&str>,
-        plan: &str,
-        period_end: i64,
-    ) -> Result<()> {
+    /// Adds `n` credits to an account's pool (a fulfilled purchase). Ensures the
+    /// account exists first.
+    pub fn add_credits(&self, account_id: &str, n: i64) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "INSERT OR IGNORE INTO account (id) VALUES (?1)",
             [account_id],
         )?;
         conn.execute(
-            "INSERT INTO mailbox_subscription
-               (account_id, mailbox_key, sub_status, sub_current_period_end,
-                stripe_customer_id, stripe_subscription_id, plan)
-             VALUES (?1, ?2, 'active', ?3, ?4, ?5, ?6)
-             ON CONFLICT(account_id, mailbox_key) DO UPDATE SET
-               sub_status = 'active',
-               sub_current_period_end = ?3,
-               stripe_customer_id = COALESCE(?4, stripe_customer_id),
-               stripe_subscription_id = ?5,
-               plan = ?6",
-            params![
-                account_id,
-                mailbox_key,
-                period_end,
-                customer_id,
-                subscription_id,
-                plan
-            ],
+            "UPDATE account SET credits = credits + ?2 WHERE id = ?1",
+            params![account_id, n],
         )?;
         Ok(())
     }
 
-    /// Applies a subscription lifecycle change (renew, cancel, past_due),
-    /// keyed by the Stripe subscription id the event references. Returns the
-    /// affected `(account_id, mailbox_key)`, or `None` if the subscription is
-    /// unknown. A `period_end` of `None` leaves the stored one untouched.
-    pub fn update_subscription(
-        &self,
-        subscription_id: &str,
-        status: &str,
-        period_end: Option<i64>,
-    ) -> Result<Option<(String, String)>> {
-        let conn = self.lock();
-        let target: Option<(String, String)> = conn
-            .query_row(
-                "SELECT account_id, mailbox_key FROM mailbox_subscription
-                 WHERE stripe_subscription_id = ?1",
-                [subscription_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        if target.is_some() {
-            conn.execute(
-                "UPDATE mailbox_subscription
-                   SET sub_status = ?2,
-                       sub_current_period_end = COALESCE(?3, sub_current_period_end)
-                 WHERE stripe_subscription_id = ?1",
-                params![subscription_id, status, period_end],
-            )?;
-        }
-        Ok(target)
+    /// Spends one credit from an account's pool, atomically (only when the
+    /// balance is positive). Returns whether a credit was drawn.
+    pub fn debit_credit(&self, account_id: &str) -> Result<bool> {
+        let n = self.lock().execute(
+            "UPDATE account SET credits = credits - 1 WHERE id = ?1 AND credits > 0",
+            [account_id],
+        )?;
+        Ok(n > 0)
     }
 
-    /// Grants a mailbox its one-time free-trial window (`window_secs` long),
-    /// keyed on the normalised mailbox key. A no-op if the key was ever
-    /// granted before — the anti-farming linchpin (a dead trial stays dead).
-    pub fn grant_trial(&self, mailbox_key: &str, window_secs: f64) -> Result<()> {
+    // --- Magic-link sign-in ---
+
+    /// Stores a pending magic-link token (by hash) for an email address.
+    pub fn create_magic_link(&self, token: &str, email: &str) -> Result<()> {
         self.lock().execute(
-            "INSERT OR IGNORE INTO mailbox_trial (mailbox_key, trial_secs, granted_at)
+            "INSERT OR REPLACE INTO magic_link (token_hash, email, created_at)
              VALUES (?1, ?2, ?3)",
-            params![mailbox_key, window_secs, now_secs()],
+            params![token_hash(token), email, now_secs()],
         )?;
         Ok(())
     }
 
-    /// The wall-clock expiry of a mailbox's free trial (`granted_at + window`),
-    /// or `None` if the mailbox was never granted a trial.
-    pub fn trial_expires(&self, mailbox_key: &str) -> Result<Option<i64>> {
+    /// Consumes a magic-link token (single-use), returning the email it proves,
+    /// and prunes tokens older than `max_age_secs`. `None` if unknown/expired.
+    pub fn take_magic_link(&self, token: &str, max_age_secs: i64) -> Result<Option<String>> {
         let conn = self.lock();
-        let row: Option<(i64, f64)> = conn
+        conn.execute(
+            "DELETE FROM magic_link WHERE created_at < ?1",
+            [now_secs() - max_age_secs],
+        )?;
+        let hash = token_hash(token);
+        let email: Option<String> = conn
             .query_row(
-                "SELECT granted_at, trial_secs FROM mailbox_trial WHERE mailbox_key = ?1",
-                [mailbox_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT email FROM magic_link WHERE token_hash = ?1",
+                [&hash],
+                |row| row.get(0),
             )
             .optional()?;
-        Ok(row.map(|(granted_at, window)| granted_at + window as i64))
+        if email.is_some() {
+            conn.execute("DELETE FROM magic_link WHERE token_hash = ?1", [&hash])?;
+        }
+        Ok(email)
+    }
+
+    // --- Services (watch activation) ---
+
+    /// Sets a service's (watch's) paid-through time (activation / renewal).
+    /// Returns whether the watch matched.
+    pub fn set_watch_watching_until(&self, watch_id: &str, until: i64) -> Result<bool> {
+        let n = self.lock().execute(
+            "UPDATE watch SET watching_until = ?2 WHERE id = ?1",
+            params![watch_id, until],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Turns auto-renew on or off for a service (watch). Returns whether the
+    /// watch matched.
+    pub fn set_watch_auto_renew(&self, watch_id: &str, on: bool) -> Result<bool> {
+        let n = self.lock().execute(
+            "UPDATE watch SET auto_renew = ?2 WHERE id = ?1",
+            params![watch_id, on as i64],
+        )?;
+        Ok(n > 0)
     }
 
     // --- Capability links, membership & checkout (M7) ---
@@ -829,57 +867,40 @@ impl Store {
         Ok(exists.is_some())
     }
 
-    /// The mailboxes an account controls.
+    /// The PIM accounts (mailboxes) a Carillon account controls, in declaration
+    /// order.
     pub fn memberships(&self, account_id: &str) -> Result<Vec<MembershipRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT mailbox_key, login, imap_host FROM account_mailbox
-             WHERE account_id = ?1 ORDER BY added_at",
+            "SELECT mailbox_key, login, imap_host
+             FROM account_mailbox WHERE account_id = ?1 ORDER BY added_at",
         )?;
-        let rows = stmt.query_map([account_id], |row| {
-            Ok(MembershipRow {
-                mailbox_key: row.get(0)?,
-                login: row.get(1)?,
-                imap_host: row.get(2)?,
-            })
-        })?;
+        let rows = stmt.query_map([account_id], MembershipRow::from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Records a pending checkout session: the account + mailbox, the plan
-    /// chosen, and a nominal cadence length (`secs`) for the provisional period
-    /// end.
-    pub fn create_session(
-        &self,
-        session_id: &str,
-        account_id: &str,
-        mailbox_key: &str,
-        plan: &str,
-        secs: f64,
-    ) -> Result<()> {
+    /// Records a pending checkout session: the account and the number of
+    /// credits to add to its pool on fulfilment.
+    pub fn create_session(&self, session_id: &str, account_id: &str, quantity: i64) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO checkout_session
-               (session_id, account_id, mailbox_key, plan, secs, fulfilled, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-            params![session_id, account_id, mailbox_key, plan, secs, now_secs()],
+            "INSERT INTO checkout_session (session_id, account_id, quantity, fulfilled, created_at)
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            params![session_id, account_id, quantity, now_secs()],
         )?;
         Ok(())
     }
 
-    /// Fulfils a session exactly once, returning `(account_id, mailbox_key,
-    /// plan, secs)`. `None` if the session is unknown or already fulfilled
-    /// (idempotency against retried payment webhooks).
-    pub fn fulfill_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<(String, String, String, f64)>> {
+    /// Fulfils a session exactly once, returning `(account_id, quantity)`.
+    /// `None` if the session is unknown or already fulfilled (idempotency
+    /// against retried payment webhooks).
+    pub fn fulfill_session(&self, session_id: &str) -> Result<Option<(String, i64)>> {
         let conn = self.lock();
-        let row: Option<(String, String, String, f64)> = conn
+        let row: Option<(String, i64)> = conn
             .query_row(
-                "SELECT account_id, mailbox_key, plan, secs FROM checkout_session
+                "SELECT account_id, quantity FROM checkout_session
                  WHERE session_id = ?1 AND fulfilled = 0",
                 [session_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
 
@@ -1035,6 +1056,43 @@ impl Store {
         )?;
         Ok(())
     }
+
+    // --- Password credentials (per PIM account) ---
+
+    /// Stores (or replaces) the password credential for a PIM account. Called at
+    /// 'Add account' (auth); a re-auth updates it for every service under it.
+    pub fn upsert_password_credential(
+        &self,
+        account_id: &str,
+        mailbox_key: &str,
+        enc_password: &str,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT OR REPLACE INTO password_credential
+               (account_id, mailbox_key, enc_password, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![account_id, mailbox_key, enc_password, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// The age-encrypted password for a PIM account, if one is stored.
+    pub fn get_password_credential(
+        &self,
+        account_id: &str,
+        mailbox_key: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.lock();
+        let enc = conn
+            .query_row(
+                "SELECT enc_password FROM password_credential
+                 WHERE account_id = ?1 AND mailbox_key = ?2",
+                params![account_id, mailbox_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(enc)
+    }
 }
 
 /// SHA-256 hex of a capability token — what we persist, so a DB leak
@@ -1055,16 +1113,15 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("watch", "account_id", "TEXT NOT NULL DEFAULT ''"),
         ("watch", "last_metered", "INTEGER"),
         ("watch", "auth_kind", "TEXT NOT NULL DEFAULT 'password'"),
-        // Subscription billing replaced the paid pool; a pre-existing
-        // checkout_session gains the plan + mailbox it now binds. (Old `account`
-        // pool/subscription columns, if a prior build added any, are left inert
-        // — subscriptions live in mailbox_subscription now.)
-        ("checkout_session", "plan", "TEXT NOT NULL DEFAULT ''"),
-        (
-            "checkout_session",
-            "mailbox_key",
-            "TEXT NOT NULL DEFAULT ''",
-        ),
+        // Credit-pool accounts (§ BILLING_MODEL). Any older subscription / trial
+        // columns from an intermediate build are simply left inert.
+        ("account", "email", "TEXT"),
+        ("account", "credits", "INTEGER NOT NULL DEFAULT 0"),
+        ("account", "free_credited", "INTEGER NOT NULL DEFAULT 0"),
+        // Per-service activation state lives on the watch (the billed unit).
+        ("watch", "watching_until", "INTEGER"),
+        ("watch", "auto_renew", "INTEGER NOT NULL DEFAULT 0"),
+        ("checkout_session", "quantity", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !column_exists(conn, table, column)? {
             conn.execute(
@@ -1085,4 +1142,189 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut names = stmt.query_map([], |row| row.get::<_, String>(1))?;
     Ok(names.any(|name| matches!(name, Ok(name) if name == column)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A fresh store on a unique temp-file path (each test isolated).
+    fn temp_store() -> Store {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("carillon-test-{}-{n}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Store::open(&path).unwrap()
+    }
+
+    #[test]
+    fn free_credit_is_granted_exactly_once() {
+        let store = temp_store();
+        store.ensure_account("acc", Some("a@b.test")).unwrap();
+        assert_eq!(store.get_account("acc").unwrap().unwrap().credits, 0);
+
+        assert!(store.grant_free_credit("acc", 1).unwrap()); // fires
+        assert!(!store.grant_free_credit("acc", 1).unwrap()); // idempotent
+        assert_eq!(store.get_account("acc").unwrap().unwrap().credits, 1);
+    }
+
+    #[test]
+    fn credits_add_and_debit() {
+        let store = temp_store();
+        store.ensure_account("acc", None).unwrap();
+        store.add_credits("acc", 3).unwrap();
+        assert_eq!(store.get_account("acc").unwrap().unwrap().credits, 3);
+
+        assert!(store.debit_credit("acc").unwrap());
+        assert!(store.debit_credit("acc").unwrap());
+        assert!(store.debit_credit("acc").unwrap());
+        assert!(!store.debit_credit("acc").unwrap()); // empty pool refuses
+        assert_eq!(store.get_account("acc").unwrap().unwrap().credits, 0);
+    }
+
+    /// A minimal watch for activation tests.
+    fn watch(id: &str, account_id: &str) -> Watch {
+        Watch {
+            id: id.into(),
+            imap_host: "imap.x".into(),
+            imap_port: 993,
+            login: "u@x".into(),
+            enc_password: String::new(),
+            mailbox: "INBOX".into(),
+            notify_url: "https://x/hook".into(),
+            hmac_secret: "s".into(),
+            hmac_secret_prev: None,
+            hmac_secret_prev_expires: None,
+            account_id: account_id.into(),
+            auth_kind: "password".into(),
+            watching_until: None,
+            auto_renew: false,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn service_activation_state_round_trips() {
+        let store = temp_store();
+        store.ensure_account("acc", None).unwrap();
+        store.upsert_watch(&watch("w1", "acc")).unwrap();
+
+        // Never activated: no watching_until, auto_renew off.
+        let w = store.get_watch("w1").unwrap().unwrap();
+        assert_eq!(w.watching_until, None);
+        assert!(!w.auto_renew);
+
+        assert!(store.set_watch_watching_until("w1", 5_000).unwrap());
+        assert!(store.set_watch_auto_renew("w1", true).unwrap());
+        let w = store.get_watch("w1").unwrap().unwrap();
+        assert_eq!(w.watching_until, Some(5_000));
+        assert!(w.auto_renew);
+
+        // A missing watch does not match.
+        assert!(!store.set_watch_watching_until("nope", 1).unwrap());
+    }
+
+    #[test]
+    fn upsert_preserves_activation_across_edits() {
+        let store = temp_store();
+        store.ensure_account("acc", None).unwrap();
+        store.upsert_watch(&watch("w1", "acc")).unwrap();
+        store.set_watch_watching_until("w1", 9_000).unwrap();
+
+        // Re-upsert (an edit-in-place, e.g. a new notify_url) must not wipe the
+        // paid-through time.
+        let mut edited = watch("w1", "acc");
+        edited.notify_url = "https://x/new".into();
+        store.upsert_watch(&edited).unwrap();
+
+        let w = store.get_watch("w1").unwrap().unwrap();
+        assert_eq!(w.watching_until, Some(9_000));
+        assert_eq!(w.notify_url, "https://x/new");
+    }
+
+    #[test]
+    fn active_watches_are_in_declaration_order() {
+        let store = temp_store();
+        store.ensure_account("acc", None).unwrap();
+        store.upsert_watch(&watch("first", "acc")).unwrap();
+        store.upsert_watch(&watch("second", "acc")).unwrap();
+        let ids: Vec<String> = store
+            .active_watches()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.id)
+            .collect();
+        assert_eq!(ids, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn magic_link_is_single_use_and_maps_email() {
+        let store = temp_store();
+        store.create_magic_link("tok", "user@x.test").unwrap();
+        assert_eq!(
+            store.take_magic_link("tok", 900).unwrap().as_deref(),
+            Some("user@x.test")
+        );
+        // Consumed: a second take finds nothing.
+        assert_eq!(store.take_magic_link("tok", 900).unwrap(), None);
+    }
+
+    #[test]
+    fn account_looked_up_by_email() {
+        let store = temp_store();
+        store.ensure_account("acc", Some("me@x.test")).unwrap();
+        assert_eq!(
+            store.account_by_email("me@x.test").unwrap().as_deref(),
+            Some("acc")
+        );
+        assert_eq!(store.account_by_email("nobody@x.test").unwrap(), None);
+    }
+
+    #[test]
+    fn one_shot_session_fulfils_once() {
+        let store = temp_store();
+        store.ensure_account("acc", None).unwrap();
+        store.create_session("sess", "acc", 10).unwrap();
+        assert_eq!(
+            store.fulfill_session("sess").unwrap(),
+            Some(("acc".to_string(), 10))
+        );
+        // Idempotent against a retried webhook.
+        assert_eq!(store.fulfill_session("sess").unwrap(), None);
+    }
+
+    #[test]
+    fn password_credential_lives_on_the_pim_account() {
+        let store = temp_store();
+        store.ensure_account("acc", None).unwrap();
+        assert_eq!(store.get_password_credential("acc", "u@p").unwrap(), None);
+
+        store
+            .upsert_password_credential("acc", "u@p", "enc-1")
+            .unwrap();
+        assert_eq!(
+            store
+                .get_password_credential("acc", "u@p")
+                .unwrap()
+                .as_deref(),
+            Some("enc-1")
+        );
+
+        // A re-auth replaces it (one credential per PIM account, shared by every
+        // service under it).
+        store
+            .upsert_password_credential("acc", "u@p", "enc-2")
+            .unwrap();
+        assert_eq!(
+            store
+                .get_password_credential("acc", "u@p")
+                .unwrap()
+                .as_deref(),
+            Some("enc-2")
+        );
+    }
 }

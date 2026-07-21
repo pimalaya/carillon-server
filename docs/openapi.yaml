@@ -298,80 +298,140 @@ paths:
       responses:
         "200": { description: Revoked (or already gone). }
 
-  /billing/plans:
-    get:
-      tags: [billing]
-      summary: The subscription plans on offer (month/year)
-      security: []
-      responses:
-        "200":
-          description: >
-            `{ provider, plans: [{ id, cadence_secs }] }`. The price is set in
-            the provider and shown on its hosted checkout page.
-          content:
-            application/json: {}
-  /billing/checkout:
+  /auth/magic/request:
     post:
-      tags: [billing]
-      summary: Start a subscription to a plan for one of the link's mailboxes
-      description: >
-        Subscriptions are per-mailbox. `mailbox_key` must be a mailbox the
-        caller has proven control of via `/auth` (else `403`).
-      security: [{ capabilityLink: [] }]
+      tags: [identity]
+      summary: Email a single-use magic-link sign-in
+      security: []
+      description: |
+        Magic-link is the human identity flow (§ BILLING_MODEL) and the sybil
+        barrier for the free credit — a new account needs a real inbox. Emails a
+        single-use link; opening it mints a capability link. Rate-limited per
+        `(IP, email)`. A delivery failure is surfaced (the user must get the link).
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [plan, mailbox_key]
+              required: [email]
               properties:
-                plan: { type: string, enum: [month, year] }
-                mailbox_key: { type: string }
+                email: { type: string, format: email }
+      responses:
+        "200": { description: The sign-in email was sent. }
+        "400": { description: Invalid email. }
+        "429": { description: Too many attempts. }
+        "502": { description: Could not send the email; try again. }
+  /auth/magic/verify:
+    get:
+      tags: [identity]
+      summary: Complete a magic-link sign-in (browser)
+      security: []
+      description: |
+        What the emailed link opens. Consumes the token and hands the minted
+        capability link to the dashboard window that opened it (`postMessage`),
+        mirroring the OAuth popup.
+      parameters:
+        - in: query
+          name: token
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: HTML popup that posts the result to the dashboard. }
+    post:
+      tags: [identity]
+      summary: Exchange a magic-link token for a capability link
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+      responses:
+        "200":
+          description: "`{ account_id, link }` — the account and its capability link."
+          content:
+            application/json: {}
+        "401": { description: Invalid or expired sign-in link. }
+
+  /watches/{id}/activate:
+    post:
+      tags: [billing]
+      summary: Spend one credit to start (or extend) a service's watching
+      security: [{ capabilityLink: [] }]
+      parameters: [{ $ref: "#/components/parameters/WatchId" }]
+      description: |
+        Draws one credit from the pool to give the service (watch) a month of
+        watching (§ BILLING_MODEL); stacks onto any time still remaining. It
+        starts on the next reconcile.
+      responses:
+        "200":
+          description: "`{ id, watching_until, credits }`."
+          content:
+            application/json: {}
+        "402": { description: No credits — buy a pack first. }
+        "404": { description: The caller does not own that service. }
+  /watches/{id}/auto-renew:
+    post:
+      tags: [billing]
+      summary: Toggle auto-renew for a service
+      security: [{ capabilityLink: [] }]
+      parameters: [{ $ref: "#/components/parameters/WatchId" }]
+      description: |
+        When on, the next credit is drawn from the pool at expiry instead of
+        stopping. Off by default.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        "200": { description: "`{ id, auto_renew }`." }
+        "404": { description: The caller does not own that service. }
+  /billing/checkout:
+    post:
+      tags: [billing]
+      summary: Buy credit packs in one payment
+      security: [{ capabilityLink: [] }]
+      description: |
+        The only refill unit is a pack of 5 credits (§ BILLING_MODEL); `packs`
+        is the number of packs.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                packs: { type: integer, minimum: 1, default: 1 }
       responses:
         "200":
           description: >
             A pending session and the provider checkout URL (Stripe hosted
-            Checkout, `mode=subscription`). Send the buyer to `checkout_url`.
+            Checkout, `mode=payment`). Send the buyer to `checkout_url`; the
+            pool is topped up on the verified webhook.
           content:
             application/json: {}
-        "400": { description: Unknown plan, or the provider rejected checkout. }
-        "403": { description: The mailbox has not been authenticated by this account. }
-  /billing/portal:
-    post:
-      tags: [billing]
-      summary: A self-service billing-portal session for one mailbox's subscription
-      security: [{ capabilityLink: [] }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [mailbox_key]
-              properties:
-                mailbox_key: { type: string }
-      responses:
-        "200":
-          description: >
-            `{ portal_url }` — Stripe billing-portal URL for that mailbox's
-            subscription. Send the customer there to update their card or cancel.
-          content:
-            application/json: {}
-        "400": { description: That mailbox has no subscription (no Stripe customer to manage). }
+        "400": { description: Invalid pack count, or the provider rejected checkout. }
   /billing/webhook:
     post:
       tags: [billing]
-      summary: Provider subscription callback (verify signature, apply event)
+      summary: Provider payment callback (verify signature, credit the pool)
       security: []
       description: |
         The provider's raw event. For Stripe, the `Stripe-Signature` header
         HMAC is verified over the **raw body** (within a 5-minute skew) before
-        anything is trusted. A paid `checkout.session.completed` activates the
-        subscription for the referenced session (idempotent against retries);
-        a `customer.subscription.updated`/`deleted` event updates its status and
-        period end. The stub provider trusts a `{session_id}` (activate) or
-        `{subscription_id, status}` (update) body.
+        anything is trusted. A paid `checkout.session.completed` tops the
+        account's pool up by the quantity the session recorded (idempotent
+        against retries). The stub provider trusts a `{session_id}` body.
       requestBody:
         required: true
         description: The provider's raw event body (do not re-serialize).
@@ -398,9 +458,12 @@ paths:
       summary: Create a watch
       description: |
         Notify URL must be `https://` (loopback `http://` is allowed for
-        local sinks). Creates the watch's billing account and grants its
-        mailbox a one-time trial. One watch per account-mailbox: onboarding a
-        mailbox that already has a watch is refused with `409`.
+        local sinks). Declaring a service is free; on the metered SaaS it only
+        starts once activated (`POST /watches/{id}/activate`, one credit). A
+        service is unique by `(login, service-type, target folder)`: a PIM
+        account may run several services (different folders), but re-adding the
+        exact same one is refused with `409`. A scoped account may watch up to
+        the fair-use cap; beyond it, `402`.
       requestBody:
         required: true
         content:
@@ -418,6 +481,11 @@ paths:
                   id: { type: string }
         "400":
           description: Invalid notify URL.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "402":
+          description: Fair-use mailbox cap reached — a volume plan is needed.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -506,7 +574,7 @@ paths:
   /accounts:
     get:
       tags: [accounts]
-      summary: List billing accounts with their subscription state
+      summary: List Carillon accounts with their credit pool and PIM accounts
       responses:
         "200":
           description: Every account.
@@ -518,7 +586,7 @@ paths:
   /accounts/{id}:
     get:
       tags: [accounts]
-      summary: One account's subscription state and per-mailbox trials
+      summary: One account's credit pool and per-PIM-account activation state
       parameters: [{ $ref: "#/components/parameters/AccountId" }]
       responses:
         "200":
@@ -713,27 +781,24 @@ components:
     AccountView:
       type: object
       description: >
-        Per-mailbox billing view. Subscriptions are per-mailbox, so each entry
-        carries its own subscription + free-trial state.
+        Carillon account view: the prepaid credit pool and each service's
+        activation state (§ BILLING_MODEL). One credit = one service-month.
       properties:
         id: { type: string }
-        entitled: { type: boolean, description: Whether any mailbox may currently watch. }
+        email: { type: [string, "null"], description: Magic-link email identity, if any. }
+        credits: { type: integer, description: Fungible credit-pool balance. }
         mailboxes:
           type: array
+          description: The account's services (billed units) + any proven-but-unwatched mailboxes.
           items:
             type: object
             properties:
-              watch_id: { type: [string, "null"] }
               mailbox_key: { type: string }
-              trial_active: { type: boolean }
-              trial_expires: { type: [integer, "null"] }
-              subscribed: { type: boolean, description: This mailbox's own subscription is active (incl. dunning grace). }
-              status:
-                type: string
-                description: active / trialing / past_due / canceled from Stripe, `trial` when only the free trial is open, else `none`.
-              plan: { type: [string, "null"], description: Plan id this mailbox is subscribed on (month/year). }
-              current_period_end: { type: [integer, "null"], description: Unix time this mailbox's paid period ends. }
-              can_manage: { type: boolean, description: A Stripe customer exists, so a billing-portal session can be opened. }
+              watch_id: { type: [string, "null"], description: The service (watch) on this PIM account, if any. }
+              mailbox: { type: [string, "null"], description: The watched folder — distinguishes several services on one PIM account. }
+              watching_until: { type: [integer, "null"], description: Unix time watching is paid up to. }
+              watching: { type: boolean, description: Currently watching (paid month in the future). }
+              auto_renew: { type: boolean, description: Next credit drawn from the pool at expiry. }
     AuthRequest:
       type: object
       required: [imap_host, login, password]

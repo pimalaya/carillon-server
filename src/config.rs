@@ -34,6 +34,32 @@ pub struct Config {
     /// Payment provider (Stripe). Unset = the keyless stub provider.
     #[serde(default)]
     pub billing: BillingConfig,
+    /// Transactional email provider (magic links + notices). Unset = the
+    /// keyless stub mailer (logs instead of sending).
+    #[serde(default)]
+    pub email: EmailConfig,
+}
+
+/// Transactional email configuration. Unset (`[email]` absent) = the keyless
+/// stub mailer used for local/dev (it logs the magic-link URL). Deliverability
+/// guidance (authenticated sending subdomain, SPF/DKIM/DMARC, no link tracking
+/// on the auth stream) lives in `docs/EMAIL.md`.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct EmailConfig {
+    /// `[email.resend]` — the Resend adapter. Absent = the stub.
+    #[serde(default)]
+    pub resend: Option<ResendConfig>,
+}
+
+/// Resend configuration. `api_key` is a **secret** — inject it via systemd
+/// `LoadCredential` / a secrets manager in production.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ResendConfig {
+    /// Resend API key (`re_…`).
+    pub api_key: String,
+    /// The `From:` header — a monitored address on your authenticated sending
+    /// subdomain, e.g. `Carillon <no-reply@mail.carillon.pimalaya.org>`.
+    pub from: String,
 }
 
 /// OAuth client overrides for the providers that need a pre-registered app
@@ -73,9 +99,10 @@ pub struct BillingConfig {
 /// Stripe configuration. `secret_key` and `webhook_secret` are **secrets** —
 /// in production inject them via systemd `LoadCredential` / a secrets manager
 /// rather than a world-readable file (see `docs/DEPLOY_HARDENING.md`). The
-/// price *lives in Stripe*: `prices` maps each plan id to a **recurring**
-/// Stripe Price id created in the dashboard. Only the **secret** key is needed
-/// — hosted Checkout needs no publishable key server-side.
+/// price *lives in Stripe*: `prices` maps the `pack` key to a **one-time**
+/// Stripe Price id — the price of one credit pack (`PACK_SIZE` credits) —
+/// created in the dashboard. Only the **secret** key is needed — hosted
+/// Checkout needs no publishable key server-side.
 #[derive(Clone, Debug, Deserialize)]
 pub struct StripeConfig {
     /// Secret API key (`sk_test_…` in the sandbox, `sk_live_…` in production).
@@ -128,6 +155,11 @@ pub struct ServerConfig {
     /// posts to a loopback sink.
     #[serde(default)]
     pub allow_private_targets: bool,
+    /// Fair-use cap: the most distinct mailboxes a single (SaaS) account may
+    /// watch before it needs a volume plan. A generous backstop against
+    /// reselling, not a product tier — the flat plan is "unlimited" below it.
+    #[serde(default = "default_max_watches")]
+    pub max_watches_per_account: usize,
 }
 
 impl Default for ServerConfig {
@@ -138,6 +170,7 @@ impl Default for ServerConfig {
             max_concurrent_handshakes: default_max_handshakes(),
             reconcile_interval_secs: default_reconcile_secs(),
             allow_private_targets: false,
+            max_watches_per_account: default_max_watches(),
         }
     }
 }
@@ -313,6 +346,10 @@ fn default_max_handshakes() -> usize {
 
 fn default_reconcile_secs() -> u64 {
     60
+}
+
+fn default_max_watches() -> usize {
+    25
 }
 
 fn default_listen() -> String {

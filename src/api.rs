@@ -37,6 +37,7 @@ use crate::billing::{self, Billing};
 use crate::crypto::Crypto;
 use crate::delivery::{self, validate_notify_url};
 use crate::discover;
+use crate::email::Mailer;
 use crate::guard;
 use crate::imap::session::{self, ImapAccount, ImapAuth};
 use crate::live::LiveBus;
@@ -87,6 +88,13 @@ pub struct AppState {
     pub shutdown: watch::Receiver<bool>,
     /// Payment provider adapter (stubbed until keys are wired).
     pub billing: Arc<Billing>,
+    /// Transactional email sender (magic links + notices).
+    pub mailer: Arc<Mailer>,
+    /// Whether watching is credit-metered (SaaS). Surfaced so the dashboard can
+    /// hide credit UI on an unmetered self-host.
+    pub metered: bool,
+    /// Fair-use cap: max distinct mailboxes a scoped account may watch.
+    pub max_watches: usize,
     /// Optional master token granting unscoped access to every account
     /// (ops / headless self-host). `None` = no unscoped access exists;
     /// every data route is reachable only via a capability link.
@@ -116,6 +124,11 @@ pub fn router(state: AppState, ui_dir: Option<PathBuf>, cors_origin: Option<Stri
         .route("/mailboxes", post(list_mailboxes))
         .route("/webhook/test", post(test_webhook))
         .route("/auth", post(auth))
+        .route("/auth/magic/request", post(magic_request))
+        .route(
+            "/auth/magic/verify",
+            get(magic_verify_get).post(magic_verify),
+        )
         .route("/me", get(me))
         .route("/signout", post(signout))
         .route("/watches", get(list_watches).post(create_watch))
@@ -123,13 +136,13 @@ pub fn router(state: AppState, ui_dir: Option<PathBuf>, cors_origin: Option<Stri
         .route("/watches/{id}/pause", post(pause_watch))
         .route("/watches/{id}/resume", post(resume_watch))
         .route("/watches/{id}/rotate-secret", post(rotate_secret))
+        .route("/watches/{id}/activate", post(activate_watch))
+        .route("/watches/{id}/auto-renew", post(set_watch_auto_renew))
         .route("/deliveries", get(list_deliveries))
         .route("/events", get(events))
         .route("/accounts", get(list_accounts))
         .route("/accounts/{id}", get(get_account))
-        .route("/billing/plans", get(billing_plans))
         .route("/billing/checkout", post(billing_checkout))
-        .route("/billing/portal", post(billing_portal))
         .route("/billing/webhook", post(billing_webhook));
 
     // With a UI, static files own `/` (and unknown paths fall back to the
@@ -469,9 +482,10 @@ async fn oauth_callback(
 
     let mailbox_key = metering::mailbox_key(&oauth_session.login, &oauth_session.imap_host);
     // Advisory dedup hint for the wizard (create still enforces the 409).
-    let already_watched = mailbox_already_watched(&state, &mailbox_key, None)
-        .await
-        .unwrap_or(false);
+    let already_watched =
+        service_already_watched(&state, &mailbox_key, &oauth_session.mailbox, None)
+            .await
+            .unwrap_or(false);
     let expires = Some(now_secs() + CAPABILITY_TTL.as_secs() as i64);
     // Keep the mailbox context for the success payload before the session moves.
     let login = oauth_session.login.clone();
@@ -497,7 +511,7 @@ async fn oauth_callback(
                 }
                 None => {
                     let id = random_secret();
-                    store.ensure_account(&id)?;
+                    store.ensure_account(&id, None)?;
                     let link = random_secret();
                     store.issue_capability(&id, &link, expires)?;
                     (id, link)
@@ -510,7 +524,8 @@ async fn oauth_callback(
             &oauth_session.login,
             &oauth_session.imap_host,
         )?;
-        store.grant_trial(&mailbox_key, metering::trial_secs())?;
+        // First validated PIM account under this account earns the free credit.
+        store.grant_free_credit(&account_id, metering::FREE_CREDITS_ON_SIGNUP)?;
         store.upsert_oauth_credential(&OauthCredential {
             account_id: account_id.clone(),
             mailbox_key,
@@ -637,7 +652,7 @@ async fn test_connect(
     let probe = session::probe(&state.connector, &account).await;
     // Advisory dedup hint (never blocks the probe itself); create enforces it.
     let mailbox_key = metering::mailbox_key(&account.login, &account.host);
-    let already_watched = mailbox_already_watched(&state, &mailbox_key, None)
+    let already_watched = service_already_watched(&state, &mailbox_key, &account.mailbox, None)
         .await
         .unwrap_or(false);
     let verdict = TestVerdict {
@@ -708,8 +723,9 @@ async fn list_mailboxes(
         mailbox: default_mailbox(),
     };
 
-    // Empty password ⇒ OAuth: resolve the stored credential for the caller's
-    // account and mint a fresh access token, exactly as the watcher does.
+    // Empty password ⇒ reuse the PIM account's stored credential (the folder
+    // picker for 'Add service'): a password (decrypt + LOGIN) or, failing that,
+    // OAuth (mint a fresh bearer token) — exactly as the watcher resolves it.
     if request.password.is_empty() {
         let Some(token) = bearer(&headers) else {
             return unauthorized();
@@ -718,11 +734,27 @@ async fn list_mailboxes(
             Ok(Some(id)) => id,
             _ => return unauthorized(),
         };
-        match supervisor::resolve_oauth_access(&state.store, &state.crypto, &account_id, &account)
-            .await
+        let mailbox_key = metering::mailbox_key(&account.login, &account.host);
+        match state
+            .store
+            .get_password_credential(&account_id, &mailbox_key)
         {
-            Ok(token) => account.auth = ImapAuth::OauthBearer(token),
-            Err(err) => return bad_request(&format!("cannot authenticate mailbox: {err:#}")),
+            Ok(Some(enc)) => match state.crypto.decrypt(&enc) {
+                Ok(password) => account.auth = ImapAuth::Password(password),
+                Err(err) => return AppError(err).into_response(),
+            },
+            Ok(None) => match supervisor::resolve_oauth_access(
+                &state.store,
+                &state.crypto,
+                &account_id,
+                &account,
+            )
+            .await
+            {
+                Ok(token) => account.auth = ImapAuth::OauthBearer(token),
+                Err(err) => return bad_request(&format!("cannot authenticate mailbox: {err:#}")),
+            },
+            Err(err) => return AppError(err).into_response(),
         }
     }
 
@@ -782,20 +814,25 @@ async fn test_webhook(
     .into_response()
 }
 
-/// Whether some existing watch (other than `exclude_id`) already watches the
-/// same mailbox identity (normalised `login`+`host`). The onboarding dedup
-/// guard: one watch per account-mailbox, so re-onboarding a watched mailbox
-/// is refused rather than silently doubled.
-async fn mailbox_already_watched(
+/// Whether some existing watch (other than `exclude_id`) is already the **same
+/// service**: same PIM account (normalised `login`+`host`) *and* same target
+/// mailbox (folder). A service is unique by `(login, service-type, target)`; for
+/// an IMAP watch the service-type is fixed, so this is `(mailbox_key, mailbox)`.
+/// One login may run several services (different folders); re-adding the exact
+/// same one is refused rather than silently doubled.
+async fn service_already_watched(
     state: &AppState,
     mailbox_key: &str,
+    mailbox: &str,
     exclude_id: Option<&str>,
 ) -> Result<bool, AppError> {
     let store = state.store.clone();
     let identities = tokio::task::spawn_blocking(move || store.watch_identities()).await??;
     let exclude = exclude_id.map(str::to_owned);
-    Ok(identities.iter().any(|(id, login, host)| {
-        Some(id.as_str()) != exclude.as_deref() && metering::mailbox_key(login, host) == mailbox_key
+    Ok(identities.iter().any(|(id, login, host, folder)| {
+        Some(id.as_str()) != exclude.as_deref()
+            && metering::mailbox_key(login, host) == mailbox_key
+            && folder == mailbox
     }))
 }
 
@@ -884,11 +921,14 @@ async fn create_watch(
 
     let mailbox_key = metering::mailbox_key(&request.login, &request.imap_host);
 
-    // Dedup guard: refuse to onboard a mailbox that already has a watch
-    // (§ one watch per account-mailbox). An upsert of the *same* watch id is
-    // still allowed (edit-in-place); a new id for a watched mailbox is not.
-    if mailbox_already_watched(&state, &mailbox_key, Some(&request.id)).await? {
-        return Ok(conflict("this mailbox is already being watched"));
+    // Dedup guard: refuse to add the *same service* twice — same PIM account and
+    // same target folder. A different folder on the same login is a distinct
+    // service and is allowed. An upsert of the *same* watch id is still allowed
+    // (edit-in-place); a new id for an existing service is not.
+    if service_already_watched(&state, &mailbox_key, &request.mailbox, Some(&request.id)).await? {
+        return Ok(conflict(
+            "this service already exists (same mailbox and folder)",
+        ));
     }
 
     // Resolve the billing account and enforce ownership. A scoped caller
@@ -915,8 +955,30 @@ async fn create_watch(
             .unwrap_or_else(|| request.id.clone()),
     };
 
-    // Credential kind: an explicit password, else an OAuth credential the
-    // caller proved earlier via `/oauth/callback` for this mailbox.
+    // Fair-use cap: a scoped account may watch up to `max_watches` distinct
+    // mailboxes; beyond that it needs a volume plan (the ops/import path is
+    // exempt). Cost is negligible per mailbox — this only stops reselling.
+    if caller.scope().is_some() {
+        let store = state.store.clone();
+        let (owner, key, cap) = (account_id.clone(), mailbox_key.clone(), state.max_watches);
+        let over_cap = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let keys: std::collections::HashSet<String> = store
+                .account_watch_identities(&owner)?
+                .into_iter()
+                .map(|(login, host)| metering::mailbox_key(&login, &host))
+                .collect();
+            Ok(!keys.contains(&key) && keys.len() >= cap)
+        })
+        .await??;
+        if over_cap {
+            return Ok(fair_use(state.max_watches));
+        }
+    }
+
+    // Credential kind. An explicit password is stored on the watch (self-host /
+    // import). Otherwise the service reuses the credential already on the PIM
+    // account (§ BILLING_MODEL): a stored password (from `/auth`) or an OAuth
+    // credential (from `/oauth/callback`); the supervisor resolves it per connect.
     let (auth_kind, enc_password) = if !request.password.is_empty() {
         (
             "password".to_string(),
@@ -925,16 +987,24 @@ async fn create_watch(
     } else {
         let store = state.store.clone();
         let (owner, key) = (account_id.clone(), mailbox_key.clone());
-        let has_oauth =
-            tokio::task::spawn_blocking(move || store.get_oauth_credential(&owner, &key))
-                .await??
-                .is_some();
-        if !has_oauth {
-            return Ok(bad_request(
-                "no credential: provide a password, or complete OAuth for this mailbox first",
-            ));
+        let kind = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<&'static str>> {
+            if store.get_password_credential(&owner, &key)?.is_some() {
+                Ok(Some("password"))
+            } else if store.get_oauth_credential(&owner, &key)?.is_some() {
+                Ok(Some("oauth"))
+            } else {
+                Ok(None)
+            }
+        })
+        .await??;
+        match kind {
+            Some(kind) => (kind.to_string(), String::new()),
+            None => {
+                return Ok(bad_request(
+                    "no credential for this PIM account — add the account (POST /auth or OAuth) first",
+                ));
+            }
         }
-        ("oauth".to_string(), String::new())
     };
 
     let watch = Watch {
@@ -950,6 +1020,11 @@ async fn create_watch(
         hmac_secret_prev_expires: None,
         account_id: account_id.clone(),
         auth_kind,
+        // Not activated yet: on the metered SaaS the service starts only after
+        // `POST /watches/{id}/activate` spends a credit (upsert leaves these,
+        // so an edit-in-place keeps the activation).
+        watching_until: None,
+        auto_renew: false,
         active: request.active,
     };
 
@@ -957,8 +1032,8 @@ async fn create_watch(
     let store = state.store.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         store.upsert_watch(&watch)?;
-        store.ensure_account(&account_id)?;
-        store.grant_trial(&mailbox_key, metering::trial_secs())?;
+        store.ensure_account(&account_id, None)?;
+        store.grant_free_credit(&account_id, metering::FREE_CREDITS_ON_SIGNUP)?;
         Ok(())
     })
     .await??;
@@ -1236,38 +1311,36 @@ async fn events(
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
-/// A member mailbox's free-trial state, within an account view. `watch_id`
-/// is null for a proven mailbox that has no watch yet.
+/// A slot within an account view: a service (watch) with its per-service
+/// activation state, or a proven PIM account (mailbox) that has no service yet.
 #[derive(Serialize)]
 struct MailboxView {
-    watch_id: Option<String>,
+    /// The PIM account key (normalised login) this slot belongs to.
     mailbox_key: String,
-    /// Whether this mailbox's one-time free trial is still open.
-    trial_active: bool,
-    /// Unix time the free trial ends, if the mailbox has one.
-    trial_expires: Option<i64>,
-    /// Whether this mailbox's own subscription is currently active.
-    subscribed: bool,
-    /// Coarse per-mailbox status: `active` / `trialing` / `past_due` /
-    /// `canceled` from Stripe, `trial` when only the free trial is open, else
-    /// `none`.
-    status: String,
-    /// The plan id this mailbox is subscribed on (`month`/`year`), if any.
-    plan: Option<String>,
-    /// Unix time this mailbox's paid period ends, if subscribed.
-    current_period_end: Option<i64>,
-    /// Whether a billing-portal session can be opened (a Stripe customer
-    /// exists — i.e. it was subscribed at least once).
-    can_manage: bool,
+    /// The service (watch) on this PIM account, or null (proven, no service yet).
+    watch_id: Option<String>,
+    /// The watched target — the IMAP mailbox (folder) — that distinguishes
+    /// several services on one PIM account. Null for a service-less PIM account.
+    mailbox: Option<String>,
+    /// Unix time watching is paid up to; null/past = not currently watching.
+    watching_until: Option<i64>,
+    /// Whether this service currently watches (paid month in the future).
+    watching: bool,
+    /// Whether the next credit is drawn from the pool at expiry.
+    auto_renew: bool,
 }
 
-/// Public view of a billing account: each member mailbox's own subscription +
-/// free-trial state (subscriptions are per-mailbox). What the dashboard renders.
+/// Public view of a Carillon account: the credit pool and each service's
+/// activation state. What the dashboard renders.
 #[derive(Serialize)]
 struct AccountView {
     id: String,
-    /// Whether any of the account's mailboxes may currently watch.
-    entitled: bool,
+    /// Magic-link email identity, if any.
+    email: Option<String>,
+    /// Fungible credit-pool balance (1 credit = one service-month).
+    credits: i64,
+    /// The account's services (billed units) plus any proven-but-unwatched
+    /// mailboxes, each activated independently.
     mailboxes: Vec<MailboxView>,
 }
 
@@ -1306,9 +1379,10 @@ async fn get_account(
     let store = state.store.clone();
     let exists = tokio::task::spawn_blocking({
         let id = id.clone();
-        move || store.account_exists(&id)
+        move || store.get_account(&id)
     })
-    .await??;
+    .await??
+    .is_some();
 
     if !exists {
         return Ok(not_found(&id));
@@ -1319,62 +1393,52 @@ async fn get_account(
     Ok(Json(view).into_response())
 }
 
-/// Builds an account view, reading each member mailbox's own subscription +
-/// trial state. Blocking; call inside `spawn_blocking`.
+/// Builds an account view: the credit pool and each service's activation state
+/// (which lives on the watch). Blocking; call inside `spawn_blocking`.
 fn account_view(store: &Store, id: &str, now: i64) -> anyhow::Result<AccountView> {
-    // Union the account's mailboxes from both proven memberships (which
-    // may exist before any watch) and watches (which may exist without a
-    // membership, in self-host), keyed by the normalised mailbox key.
-    let mut keyed: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let account = store.get_account(id)?.unwrap_or(crate::store::AccountRow {
+        id: id.to_string(),
+        email: None,
+        credits: 0,
+    });
+
+    // One slot per service (watch), carrying its activation state — a PIM account
+    // may have several. Then any PIM account with no service yet (a slot the user
+    // can add a service to).
+    let mut with_service: BTreeMap<String, ()> = BTreeMap::new();
+    let mut mailboxes: Vec<MailboxView> = store
+        .watches_by_account(id)?
+        .into_iter()
+        .map(|watch| {
+            let mailbox_key = metering::mailbox_key(&watch.login, &watch.imap_host);
+            with_service.insert(mailbox_key.clone(), ());
+            MailboxView {
+                watch_id: Some(watch.id),
+                mailbox: Some(watch.mailbox),
+                watching_until: watch.watching_until,
+                watching: metering::pim_entitled(watch.watching_until, now),
+                auto_renew: watch.auto_renew,
+                mailbox_key,
+            }
+        })
+        .collect();
     for member in store.memberships(id)? {
-        keyed.entry(member.mailbox_key).or_insert(None);
-    }
-    for watch in store.watches_by_account(id)? {
-        let key = metering::mailbox_key(&watch.login, &watch.imap_host);
-        keyed.insert(key, Some(watch.id));
-    }
-
-    let mut mailboxes = Vec::new();
-    let mut entitled = false;
-    for (key, watch_id) in keyed {
-        let expires = store.trial_expires(&key)?;
-        let trial_active = matches!(expires, Some(expires) if now < expires);
-
-        let sub = store.get_mailbox_subscription(id, &key)?;
-        let subscribed = sub
-            .as_ref()
-            .is_some_and(|sub| metering::subscription_active(sub, now));
-        entitled |= trial_active || subscribed;
-
-        let status = if subscribed {
-            sub.as_ref()
-                .and_then(|s| s.sub_status.clone())
-                .unwrap_or_else(|| "active".into())
-        } else if trial_active {
-            "trial".to_string()
-        } else {
-            sub.as_ref()
-                .and_then(|s| s.sub_status.clone())
-                .filter(|s| s == "canceled" || s == "past_due")
-                .unwrap_or_else(|| "none".into())
-        };
-
-        mailboxes.push(MailboxView {
-            watch_id,
-            mailbox_key: key,
-            trial_active,
-            trial_expires: expires,
-            subscribed,
-            status,
-            plan: sub.as_ref().and_then(|s| s.plan.clone()),
-            current_period_end: sub.as_ref().and_then(|s| s.sub_current_period_end),
-            can_manage: sub.as_ref().is_some_and(|s| s.stripe_customer_id.is_some()),
-        });
+        if !with_service.contains_key(&member.mailbox_key) {
+            mailboxes.push(MailboxView {
+                watch_id: None,
+                mailbox: None,
+                watching_until: None,
+                watching: false,
+                auto_renew: false,
+                mailbox_key: member.mailbox_key,
+            });
+        }
     }
 
     Ok(AccountView {
-        id: id.to_string(),
-        entitled,
+        id: account.id,
+        email: account.email,
+        credits: account.credits,
         mailboxes,
     })
 }
@@ -1511,7 +1575,7 @@ async fn auth(
         host: request.imap_host.clone(),
         port: request.imap_port,
         login: request.login.clone(),
-        auth: ImapAuth::Password(request.password),
+        auth: ImapAuth::Password(request.password.clone()),
         mailbox: request.mailbox,
     };
     let probe = session::probe(&state.connector, &account).await;
@@ -1522,6 +1586,13 @@ async fn auth(
         )
             .into_response();
     }
+
+    // The proven password becomes the PIM account's credential (§ BILLING_MODEL:
+    // the credential lives on the PIM account) — reused when adding services.
+    let enc_password = match state.crypto.encrypt(&request.password) {
+        Ok(enc) => enc,
+        Err(err) => return AppError(err).into_response(),
+    };
 
     let existing = bearer(&headers);
     let store = state.store.clone();
@@ -1550,7 +1621,7 @@ async fn auth(
                     }
                     None => {
                         let id = random_secret();
-                        store.ensure_account(&id)?;
+                        store.ensure_account(&id, None)?;
                         let link = random_secret();
                         store.issue_capability(&id, &link, expires)?;
                         (id, "created", link)
@@ -1559,7 +1630,9 @@ async fn auth(
             };
 
             store.add_membership(&account_id, &mailbox_key, &login, &host)?;
-            store.grant_trial(&mailbox_key, metering::trial_secs())?;
+            store.upsert_password_credential(&account_id, &mailbox_key, &enc_password)?;
+            // First validated PIM account under this account earns the free credit.
+            store.grant_free_credit(&account_id, metering::FREE_CREDITS_ON_SIGNUP)?;
             Ok((account_id, action, link))
         })
         .await;
@@ -1581,6 +1654,167 @@ async fn auth(
     }
 }
 
+/// How long a magic-link sign-in token stays valid.
+const MAGIC_LINK_TTL: i64 = 15 * 60;
+
+/// Body of `POST /auth/magic/request`: the email to send a sign-in link to.
+#[derive(Deserialize)]
+struct MagicRequest {
+    email: String,
+}
+
+/// `POST /auth/magic/request` — email a single-use sign-in link (§ BILLING_MODEL:
+/// magic-link is the human identity flow, and the sybil barrier for the free
+/// credit — a new account needs a real inbox). Rate-limited per `(IP, email)`.
+/// A delivery failure is surfaced: the user must receive the link to sign in.
+async fn magic_request(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(request): Json<MagicRequest>,
+) -> Response {
+    let email = request.email.trim().to_ascii_lowercase();
+    if email.len() < 3 || !email.contains('@') {
+        return bad_request("a valid email is required");
+    }
+    let key = format!("{}|{}", peer.ip(), email);
+    if let Err(retry_after) = state.auth_limiter.check(&key) {
+        let seconds = retry_after.as_secs().max(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", seconds.to_string())],
+            Json(json!({ "error": "too many attempts", "retry_after": seconds })),
+        )
+            .into_response();
+    }
+
+    let token = random_secret();
+    let store = state.store.clone();
+    let (store_token, store_email) = (token.clone(), email.clone());
+    match tokio::task::spawn_blocking(move || store.create_magic_link(&store_token, &store_email))
+        .await
+    {
+        Ok(Ok(())) => {}
+        _ => return AppError(anyhow::anyhow!("cannot store sign-in token")).into_response(),
+    }
+
+    // Point the emailed link at the dashboard's `/verify` route (it exchanges the
+    // token via POST /auth/magic/verify), falling back to the API's own GET
+    // verify endpoint when no distinct dashboard origin is configured.
+    let base = state.dashboard_origin.trim_end_matches('/');
+    let link = if base.is_empty() || base == "*" {
+        format!(
+            "{}/auth/magic/verify?token={token}",
+            state.public_url.trim_end_matches('/')
+        )
+    } else {
+        format!("{base}/verify?token={token}")
+    };
+    match state.mailer.send_magic_link(&email, &link).await {
+        Ok(()) => {
+            info!(email, "magic link sent");
+            Json(json!({ "status": "sent" })).into_response()
+        }
+        Err(err) => {
+            warn!(email, error = %err, "magic link send failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": "could not send the sign-in email; try again" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Verifies a magic-link token, minting a fresh capability link for the account
+/// that owns the email — creating the account (no free credit yet: that waits
+/// for a validated PIM account) on first sign-in. Blocking; call inside
+/// `spawn_blocking`. `None` = unknown or expired token.
+fn verify_magic(store: &Store, token: &str) -> anyhow::Result<Option<(String, String)>> {
+    let Some(email) = store.take_magic_link(token, MAGIC_LINK_TTL)? else {
+        return Ok(None);
+    };
+    let account_id = match store.account_by_email(&email)? {
+        Some(id) => id,
+        None => {
+            let id = random_secret();
+            store.ensure_account(&id, Some(&email))?;
+            id
+        }
+    };
+    let link = random_secret();
+    let expires = Some(now_secs() + CAPABILITY_TTL.as_secs() as i64);
+    store.issue_capability(&account_id, &link, expires)?;
+    Ok(Some((account_id, link)))
+}
+
+/// Body of `POST /auth/magic/verify`: the token from the emailed link.
+#[derive(Deserialize)]
+struct MagicVerifyRequest {
+    token: String,
+}
+
+/// `POST /auth/magic/verify` — exchange a magic-link token for a capability
+/// link (programmatic / dashboard). Returns `{ account_id, link }`.
+async fn magic_verify(
+    State(state): State<AppState>,
+    Json(request): Json<MagicVerifyRequest>,
+) -> Response {
+    let store = state.store.clone();
+    let token = request.token;
+    match tokio::task::spawn_blocking(move || verify_magic(&store, &token)).await {
+        Ok(Ok(Some((account_id, link)))) => {
+            info!(account = %account_id, "magic sign-in");
+            Json(json!({ "account_id": account_id, "link": link })).into_response()
+        }
+        Ok(Ok(None)) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid or expired sign-in link" })),
+        )
+            .into_response(),
+        _ => AppError(anyhow::anyhow!("sign-in failed")).into_response(),
+    }
+}
+
+/// Query of `GET /auth/magic/verify`: the token from the emailed link.
+#[derive(Deserialize)]
+struct MagicVerifyQuery {
+    #[serde(default)]
+    token: String,
+}
+
+/// `GET /auth/magic/verify` — what the emailed link opens in the browser. Mints
+/// the capability link and hands it to the dashboard window that opened it (via
+/// `postMessage`), mirroring the OAuth popup.
+async fn magic_verify_get(
+    State(state): State<AppState>,
+    Query(query): Query<MagicVerifyQuery>,
+) -> Response {
+    if query.token.is_empty() {
+        return oauth_popup(&state.dashboard_origin, magic_err("missing token"));
+    }
+    let store = state.store.clone();
+    let token = query.token.clone();
+    match tokio::task::spawn_blocking(move || verify_magic(&store, &token)).await {
+        Ok(Ok(Some((account_id, link)))) => {
+            info!(account = %account_id, "magic sign-in");
+            oauth_popup(
+                &state.dashboard_origin,
+                json!({ "type": "carillon-magic", "ok": true, "link": link, "account_id": account_id }),
+            )
+        }
+        Ok(Ok(None)) => oauth_popup(
+            &state.dashboard_origin,
+            magic_err("invalid or expired sign-in link"),
+        ),
+        _ => oauth_popup(&state.dashboard_origin, magic_err("server error")),
+    }
+}
+
+/// A content-free error payload for the magic-link popup.
+fn magic_err(message: &str) -> serde_json::Value {
+    json!({ "type": "carillon-magic", "ok": false, "error": message })
+}
+
 /// `GET /me` — the account behind the capability link: its members,
 /// watches and balance.
 async fn me(
@@ -1588,6 +1822,7 @@ async fn me(
     CapabilityAccount(account_id): CapabilityAccount,
 ) -> Result<Response, AppError> {
     let store = state.store.clone();
+    let metered = state.metered;
     let body = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         let balance = account_view(&store, &account_id, now_secs())?;
         let mailboxes: Vec<_> = store
@@ -1605,6 +1840,7 @@ async fn me(
             "mailboxes": mailboxes,
             "watches": watches,
             "balance": balance,
+            "metered": metered,
         }))
     })
     .await??;
@@ -1624,62 +1860,131 @@ async fn signout(State(state): State<AppState>, headers: HeaderMap) -> Response 
     Json(json!({ "status": "ok", "revoked": revoked })).into_response()
 }
 
-/// `GET /billing/plans` — the subscription plans on offer (`month`, `year`,
-/// …). The price is set in the payment provider and shown on its hosted
-/// checkout page; only the plan id + nominal cadence are returned here.
-async fn billing_plans(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({
-        "provider": state.billing.provider(),
-        "plans": state.billing.plans(),
-    }))
+/// `POST /watches/{id}/activate` — spend one credit to give a service a month
+/// of watching (§ BILLING_MODEL); it stacks onto any time still remaining.
+/// `402` when the pool is empty, `404` when the caller does not own the service.
+async fn activate_watch(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    if let Some(reject) = authorize_watch(&state, &caller, &id).await? {
+        return Ok(reject);
+    }
+
+    enum Outcome {
+        Gone,
+        NoCredits,
+        Activated { until: i64, credits: i64 },
+    }
+
+    let month = metering::month_secs();
+    let store = state.store.clone();
+    let watch_id = id.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<Outcome> {
+        let Some(watch) = store.get_watch(&watch_id)? else {
+            return Ok(Outcome::Gone);
+        };
+        if !store.debit_credit(&watch.account_id)? {
+            return Ok(Outcome::NoCredits);
+        }
+        // Stack onto any time still remaining, else start from now.
+        let now = now_secs();
+        let base = watch
+            .watching_until
+            .filter(|until| *until > now)
+            .unwrap_or(now);
+        let until = base + month;
+        store.set_watch_watching_until(&watch_id, until)?;
+        let credits = store
+            .get_account(&watch.account_id)?
+            .map(|account| account.credits)
+            .unwrap_or(0);
+        Ok(Outcome::Activated { until, credits })
+    })
+    .await??;
+
+    Ok(match outcome {
+        Outcome::Gone => not_found(&id),
+        Outcome::NoCredits => no_credits(),
+        Outcome::Activated { until, credits } => {
+            info!(watch = %id, until, "service activated");
+            // Start it now that it is paid.
+            state.commands.send(SupervisorCmd::Reconcile).await.ok();
+            Json(json!({
+                "status": "ok",
+                "id": id,
+                "watching_until": until,
+                "credits": credits,
+            }))
+            .into_response()
+        }
+    })
 }
 
-/// Body of `POST /billing/checkout`: the plan, and which mailbox to subscribe
-/// (subscriptions are per-mailbox).
+/// Body of `POST /watches/{id}/auto-renew`: whether to auto-renew.
+#[derive(Deserialize)]
+struct AutoRenewRequest {
+    enabled: bool,
+}
+
+/// `POST /watches/{id}/auto-renew` — draw the next credit from the pool at
+/// expiry instead of stopping. Off by default.
+async fn set_watch_auto_renew(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(id): Path<String>,
+    Json(request): Json<AutoRenewRequest>,
+) -> Result<Response, AppError> {
+    if let Some(reject) = authorize_watch(&state, &caller, &id).await? {
+        return Ok(reject);
+    }
+    let enabled = request.enabled;
+    let store = state.store.clone();
+    let watch_id = id.clone();
+    let matched =
+        tokio::task::spawn_blocking(move || store.set_watch_auto_renew(&watch_id, enabled))
+            .await??;
+    if !matched {
+        return Ok(not_found(&id));
+    }
+    info!(watch = %id, enabled, "auto-renew set");
+    Ok(Json(json!({ "status": "ok", "id": id, "auto_renew": enabled })).into_response())
+}
+
+/// Body of `POST /billing/checkout`: how many packs to buy (min 1 pack).
 #[derive(Deserialize)]
 struct CheckoutRequest {
-    plan: String,
-    mailbox_key: String,
+    #[serde(default = "default_packs")]
+    packs: i64,
 }
 
-/// `POST /billing/checkout` — start a subscription to `plan` for one of the
-/// link's **mailboxes** (proven via `/auth`). Records a pending session (the
-/// mailbox + plan + provisional cadence) and returns the provider checkout URL.
-/// Payment stays stateless on our side.
+/// `POST /billing/checkout` — buy `packs` packs of credits in one payment
+/// (§ BILLING_MODEL: the only refill unit is a pack of `PACK_SIZE`). Records a
+/// pending session for the resolved credit count and returns the provider
+/// checkout URL; the pool is topped up on the verified webhook.
 async fn billing_checkout(
     State(state): State<AppState>,
     CapabilityAccount(account_id): CapabilityAccount,
     Json(request): Json<CheckoutRequest>,
 ) -> Result<Response, AppError> {
-    let plan = request.plan.trim().to_string();
-    if !state.billing.plans().iter().any(|p| p.id == plan) {
-        return Ok(bad_request("unknown plan"));
+    let packs = request.packs;
+    if packs < 1 {
+        return Ok(bad_request("must buy at least one pack"));
     }
-    let mailbox_key = request.mailbox_key.trim().to_string();
-    // You may only subscribe a mailbox you have proven control of (the same
-    // gate as watching it).
-    let store = state.store.clone();
-    let (owner, key) = (account_id.clone(), mailbox_key.clone());
-    let owns_mailbox =
-        tokio::task::spawn_blocking(move || store.mailbox_belongs(&owner, &key)).await??;
-    if !owns_mailbox {
-        return Ok(forbidden(
-            "authenticate this mailbox first (POST /auth) before subscribing it",
-        ));
-    }
-    let cadence_secs = billing::cadence_secs(&plan);
+    let credits = packs * billing::PACK_SIZE;
 
     // Create the provider checkout first (it can fail / call out); only then
     // record the pending session, so a failed checkout leaves no orphan row.
     let session_id = random_secret();
     let url = match state
         .billing
-        .create_checkout(&session_id, &account_id, &plan)
+        .create_checkout(&session_id, &account_id, packs)
         .await
     {
         Ok(url) => url,
         Err(err) => {
-            warn!(account = %account_id, plan = %plan, error = %err, "checkout failed");
+            warn!(account = %account_id, packs, error = %err, "checkout failed");
             return Ok(bad_request(&format!("could not start checkout: {err}")));
         }
     };
@@ -1687,71 +1992,24 @@ async fn billing_checkout(
     let store = state.store.clone();
     let create_id = account_id.clone();
     let create_session = session_id.clone();
-    let create_plan = plan.clone();
-    let create_key = mailbox_key.clone();
-    tokio::task::spawn_blocking(move || {
-        store.create_session(
-            &create_session,
-            &create_id,
-            &create_key,
-            &create_plan,
-            cadence_secs,
-        )
-    })
-    .await??;
+    tokio::task::spawn_blocking(move || store.create_session(&create_session, &create_id, credits))
+        .await??;
 
-    info!(account = %account_id, mailbox = %mailbox_key, plan = %plan, "checkout created");
+    info!(account = %account_id, packs, credits, "checkout created");
     Ok(Json(json!({
         "provider": state.billing.provider(),
         "session_id": session_id,
         "checkout_url": url,
-        "plan": plan,
-        "mailbox_key": mailbox_key,
+        "packs": packs,
+        "credits": credits,
     }))
     .into_response())
 }
 
-/// Body of `POST /billing/portal`: which mailbox's subscription to manage.
-#[derive(Deserialize)]
-struct PortalRequest {
-    mailbox_key: String,
-}
-
-/// `POST /billing/portal` — a self-service billing-portal session (update
-/// card, cancel) for one **mailbox's** subscription. Requires that mailbox to
-/// have a Stripe customer (i.e. it was subscribed at least once).
-async fn billing_portal(
-    State(state): State<AppState>,
-    CapabilityAccount(account_id): CapabilityAccount,
-    Json(request): Json<PortalRequest>,
-) -> Result<Response, AppError> {
-    let store = state.store.clone();
-    let (owner, key) = (account_id.clone(), request.mailbox_key.trim().to_string());
-    let subscription =
-        tokio::task::spawn_blocking(move || store.get_mailbox_subscription(&owner, &key)).await??;
-    let Some(customer_id) = subscription.and_then(|sub| sub.stripe_customer_id) else {
-        return Ok(bad_request(
-            "no subscription for this mailbox — nothing to manage",
-        ));
-    };
-
-    let return_url = format!("{}/billing", state.dashboard_origin.trim_end_matches('/'));
-    match state.billing.create_portal(&customer_id, &return_url).await {
-        Ok(url) => Ok(Json(json!({ "portal_url": url })).into_response()),
-        Err(err) => {
-            warn!(account = %account_id, error = %err, "portal failed");
-            Ok(bad_request(&format!(
-                "could not open billing portal: {err}"
-            )))
-        }
-    }
-}
-
-/// `POST /billing/webhook` — the provider's subscription callback. The **raw
-/// body** is verified against the provider signature (Stripe's
-/// `Stripe-Signature` HMAC) before it is trusted, then the event is applied:
-/// a completed checkout activates the subscription for the referenced session
-/// (idempotent against retries); a lifecycle event updates its status/period.
+/// `POST /billing/webhook` — the provider's payment callback. The **raw body**
+/// is verified against the provider signature (Stripe's `Stripe-Signature`
+/// HMAC) before it is trusted, then a paid checkout tops the account's pool up
+/// by the quantity that session recorded (idempotent against retried webhooks).
 async fn billing_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1771,47 +2029,21 @@ async fn billing_webhook(
     let store = state.store.clone();
     let applied = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         match outcome {
-            billing::WebhookOutcome::Activate {
-                session_id,
-                subscription_id,
-                customer_id,
-            } => {
-                let Some((account_id, mailbox_key, plan, cadence_secs)) =
-                    store.fulfill_session(&session_id)?
-                else {
-                    return Ok(json!({ "status": "ignored", "reason": "unknown or already fulfilled" }));
+            billing::WebhookOutcome::Credit { session_id } => {
+                let Some((account_id, quantity)) = store.fulfill_session(&session_id)? else {
+                    return Ok(
+                        json!({ "status": "ignored", "reason": "unknown or already fulfilled" }),
+                    );
                 };
-                let period_end = now_secs() + cadence_secs as i64;
-                store.activate_subscription(
-                    &account_id,
-                    &mailbox_key,
-                    &subscription_id,
-                    customer_id.as_deref(),
-                    &plan,
-                    period_end,
-                )?;
-                info!(account = %account_id, mailbox = %mailbox_key, plan = %plan, "subscription activated");
-                Ok(json!({ "status": "activated", "mailbox_key": mailbox_key, "plan": plan }))
+                store.add_credits(&account_id, quantity)?;
+                info!(account = %account_id, quantity, "pool credited");
+                Ok(json!({ "status": "credited", "account_id": account_id, "quantity": quantity }))
             }
-            billing::WebhookOutcome::Update {
-                subscription_id,
-                status,
-                current_period_end,
-            } => match store.update_subscription(&subscription_id, &status, current_period_end)? {
-                Some((account_id, mailbox_key)) => {
-                    info!(account = %account_id, mailbox = %mailbox_key, status = %status, "subscription updated");
-                    Ok(json!({ "status": "updated", "mailbox_key": mailbox_key, "sub_status": status }))
-                }
-                None => Ok(json!({ "status": "ignored", "reason": "unknown subscription" })),
-            },
             billing::WebhookOutcome::Ignore => Ok(json!({ "status": "ignored" })),
         }
     })
     .await??;
 
-    // A subscription that just lapsed should stop its watches promptly; nudge
-    // the supervisor (the sweep would catch it anyway).
-    state.commands.send(SupervisorCmd::Reconcile).await.ok();
     Ok(Json(applied).into_response())
 }
 
@@ -1833,6 +2065,29 @@ fn forbidden(message: &str) -> Response {
 
 fn conflict(message: &str) -> Response {
     (StatusCode::CONFLICT, Json(json!({ "error": message }))).into_response()
+}
+
+/// `402` — the pool is empty; buy a pack of credits before activating a service.
+fn no_credits() -> Response {
+    (
+        StatusCode::PAYMENT_REQUIRED,
+        Json(json!({ "error": "no credits — buy a pack to activate this service" })),
+    )
+        .into_response()
+}
+
+/// `402` — the account hit its fair-use mailbox cap and needs a volume plan.
+fn fair_use(cap: usize) -> Response {
+    (
+        StatusCode::PAYMENT_REQUIRED,
+        Json(json!({
+            "error": format!(
+                "fair-use limit reached ({cap} mailboxes) — get in touch for a volume plan"
+            ),
+            "limit": cap,
+        })),
+    )
+        .into_response()
 }
 
 /// A random 256-bit hex secret, for a rotation with no supplied secret.
@@ -1877,4 +2132,8 @@ fn default_true() -> bool {
 
 fn default_limit() -> u32 {
     50
+}
+
+fn default_packs() -> i64 {
+    1
 }

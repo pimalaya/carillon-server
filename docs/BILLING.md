@@ -1,13 +1,22 @@
 # Carillon — Billing (Stripe) setup & sandbox testing
 
-Carillon sells a **per-mailbox subscription** — each mailbox is subscribed (and
-cancelled) independently. It ships in two cadences — **`month`** and **`year`** —
-and the buyer picks one per mailbox. The price lives in **Stripe** (a recurring
-Price object), never in the code; the year's discount is just its Price. Payment
+> **Model superseded — see [`BILLING_MODEL.md`](BILLING_MODEL.md).** Carillon no
+> longer sells a recurring subscription with a 7-day trial. The current model is
+> a **prepaid credit pool**, billed **per service** (1 credit = 1 € = one
+> service-month), refilled **only in 5-credit packs** (€5), with magic-link
+> accounts and one free credit. The Stripe *operational* steps below stay useful
+> once re-pointed at **one-shot `payment`-mode Checkout** with a one-time **pack**
+> Price (the `pack` key). The subscription description in this section is retained
+> only for historical context.
+
+Carillon sells **one flat subscription per account** (the `standard` plan, e.g.
+**€3/month**) that covers **every mailbox** the account watches — unlimited, up
+to a generous fair-use cap (`[server] max_watches_per_account`, default 25). The
+price lives in **Stripe** (a recurring Price object), never in the code. Payment
 is stateless on our side: Stripe owns the customer and receipt; we persist only
-the subscription *state* Stripe reports (status + period end). A new mailbox gets
-a one-time **free-trial window** (7 days by default) so it can be tried before
-subscribing.
+the subscription *state* Stripe reports (status + period end). Every account
+starts with a **7-day free trial** (`[server]`-agnostic — a generic free period,
+so it extends to non-IMAP services later).
 
 Provider is chosen by config: no `[billing.stripe]` → the keyless **stub**
 (dev); `[billing.stripe]` present → the real **Stripe** adapter.
@@ -37,15 +46,14 @@ Stripe Elements/embedded checkout in the dashboard — not now.
 
 1. Create a Stripe account — it starts in **Test mode**. Keep the "Test mode"
    toggle **on** for all of the below (test keys/prices are separate from live).
-2. **Products → Prices**: create **two products**, each with a **recurring**
-   Price in your currency: e.g. "Carillon — monthly" at €1 billed **monthly**,
-   and "Carillon — yearly" at €10 billed **yearly**. Copy each **Price id**
-   (`price_…`).
+2. **Products → Prices**: create **one product** with a **recurring** Price in
+   your currency — e.g. "Carillon" at **€3 billed monthly**. Copy its **Price
+   id** (`price_…`).
 3. **Developers → API keys**: copy the **Secret key** (`sk_test_…`).
 4. **Settings → Billing → Customer portal**: activate the portal (once) so the
    Manage / Cancel button works.
 
-Put them in `carillon.toml` (the price keys must be `month` and `year`):
+Put them in `carillon.toml` (the price key must be `standard`):
 
 ```toml
 [billing.stripe]
@@ -53,8 +61,7 @@ secret_key = "sk_test_…"
 webhook_secret = "whsec_…"                 # from step below
 
 [billing.stripe.prices]
-month = "price_…"                          # €1/month  (recurring)
-year  = "price_…"                          # €10/year  (recurring — the discount)
+standard = "price_…"                        # €3/month (recurring)
 ```
 
 `success_url` / `cancel_url` are **optional** — where Stripe returns the browser
@@ -93,20 +100,18 @@ Copy that endpoint's signing secret (`whsec_…`).
    ```sh
    curl -X POST http://localhost:3000/billing/checkout \
      -H "Authorization: Bearer <capability-link>" \
-     -H "content-type: application/json" \
-     -d '{"plan":"year","mailbox_key":"you@example.com"}'
+     -H "content-type: application/json" -d '{}'
    ```
 
-   (`mailbox_key` is a mailbox you authenticated via `/auth`; it appears in
-   `GET /me` under `balance.mailboxes[].mailbox_key`.) →
+   (No body needed — one flat plan.) →
    `{"provider":"stripe","checkout_url":"https://checkout.stripe.com/…", …}`.
 4. Open `checkout_url`, subscribe with a **test card**: `4242 4242 4242 4242`,
    any future expiry, any CVC/ZIP.
 5. Stripe fires `checkout.session.completed` → `/billing/webhook` → signature
-   verified → subscription bound to that mailbox and activated. Server logs
+   verified → subscription bound to the account and activated. Server logs
    `subscription activated`.
-6. Verify: `GET /me` → the mailbox's entry in `balance.mailboxes` has
-   `subscribed: true`, `status: "active"`, and a `current_period_end`.
+6. Verify: `GET /me` → `balance.subscribed` is `true`, `balance.status` is
+   `active`, and `balance.current_period_end` is set.
 7. In the Stripe **customer portal** (via the dashboard's Manage button, or the
    portal URL from `POST /billing/portal`), cancel the subscription →
    `customer.subscription.updated`/`deleted` → `/billing/webhook` → status flips

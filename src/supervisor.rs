@@ -34,6 +34,7 @@ use crate::live::{LiveBus, LiveEvent, Routed, WatchState};
 use crate::metering;
 use crate::oauth;
 use crate::store::{Store, Watch};
+use crate::util::now_secs;
 
 /// How a watcher authenticates each time it connects. A password is
 /// constant; OAuth mints a fresh access token from the stored refresh token
@@ -80,11 +81,16 @@ pub struct Supervisor {
     handshake_sem: Arc<Semaphore>,
     handles: HashMap<String, WatcherHandle>,
     live: LiveBus,
+    /// Whether watching is credit-metered (SaaS, Stripe). When false (self-host
+    /// / stub billing) the entitlement gate is bypassed — self-host is not billed.
+    metered: bool,
 }
 
 impl Supervisor {
     /// Creates a supervisor. `max_handshakes` caps simultaneous TLS
-    /// handshakes across all watchers.
+    /// handshakes across all watchers. `metered` gates watches on the credit
+    /// pool (SaaS); unmetered self-host runs every active watch.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Store>,
         crypto: Arc<Crypto>,
@@ -92,6 +98,7 @@ impl Supervisor {
         events: mpsc::Sender<ChangeEvent>,
         max_handshakes: usize,
         live: LiveBus,
+        metered: bool,
     ) -> Self {
         Self {
             store,
@@ -101,6 +108,7 @@ impl Supervisor {
             handshake_sem: Arc::new(Semaphore::new(max_handshakes.max(1))),
             handles: HashMap::new(),
             live,
+            metered,
         }
     }
 
@@ -141,8 +149,15 @@ impl Supervisor {
             }
         };
 
+        // Desired = active watches that are also entitled (paid) when metered.
+        // Filtering here (not just at spawn) makes the gate continuous: a service
+        // whose paid month lapsed drops out of `desired` and is stopped below;
+        // re-activating it (a fresh credit) brings it back on the next reconcile.
+        let now = now_secs();
+        let metered = self.metered;
         let desired: HashMap<String, Watch> = watches
             .into_iter()
+            .filter(|watch| !metered || metering::watch_entitled(watch, now))
             .map(|watch| (watch.id.clone(), watch))
             .collect();
 
@@ -187,29 +202,27 @@ impl Supervisor {
     }
 
     fn spawn_watcher(&self, watch: &Watch) -> anyhow::Result<WatcherHandle> {
-        // Entitlement at the server boundary: never hold a standing IDLE
-        // connection for an account with no active trial or subscription.
-        let mailbox_key = metering::mailbox_key(&watch.login, &watch.imap_host);
-        if !metering::is_entitled(&self.store, &watch.account_id, &mailbox_key) {
-            let _ = self.live.send(Routed::new(
-                &watch.account_id,
-                LiveEvent::status(
-                    &watch.id,
-                    WatchState::Error,
-                    Some("subscription required".into()),
-                ),
-            ));
-            anyhow::bail!("account {} is not entitled to watch", watch.account_id);
-        }
+        // Entitlement (the paid-month gate) is enforced in `reconcile`, which
+        // only ever hands `spawn_watcher` an entitled service when metered.
 
-        // Resolve the credential kind. A password is decrypted once; an OAuth
-        // watch defers to the stored `oauth_credential`, minting a fresh
-        // access token per connect (see `watch_loop`). The auth on the
-        // account is a placeholder overwritten before each connect.
+        // Resolve the credential kind. An OAuth watch defers to the stored
+        // `oauth_credential`, minting a fresh access token per connect (see
+        // `watch_loop`). A password is decrypted once from the watch itself
+        // (self-host / import) or, when the watch carries none, from the PIM
+        // account's stored password credential (§ BILLING_MODEL) — so a re-auth
+        // that updates that credential is picked up on the next reconnect.
         let credential = if watch.auth_kind == "oauth" {
             Credential::Oauth
         } else {
-            Credential::Password(self.crypto.decrypt(&watch.enc_password)?)
+            let enc = if watch.enc_password.is_empty() {
+                let mailbox_key = metering::mailbox_key(&watch.login, &watch.imap_host);
+                self.store
+                    .get_password_credential(&watch.account_id, &mailbox_key)?
+                    .ok_or_else(|| anyhow::anyhow!("no password credential for the PIM account"))?
+            } else {
+                watch.enc_password.clone()
+            };
+            Credential::Password(self.crypto.decrypt(&enc)?)
         };
         let account = ImapAccount {
             host: watch.imap_host.clone(),

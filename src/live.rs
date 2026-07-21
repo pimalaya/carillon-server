@@ -75,24 +75,28 @@ pub enum LiveEvent {
     },
 }
 
-/// An entitlement / billing notice. Delivered on the SSE bus and, so a
-/// no-dashboard user is not silently cut off, also as a signed webhook.
+/// A billing notice (§ BILLING_MODEL: the guardrail against silent coverage
+/// gaps). Delivered on the SSE bus and, so a no-dashboard user is not silently
+/// cut off, also as a signed webhook (per-watch notices) — email delivery of
+/// account-level notices lands in a later stage.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoticeKind {
-    /// A mailbox's free trial is about to end with no subscription behind it.
-    TrialEnding,
-    /// Entitlement lapsed (trial ended, no active subscription); the watch
-    /// was paused.
-    WatchPaused,
+    /// A PIM account's paid month is about to end (pre-expiry warning).
+    WatchEnding,
+    /// A PIM account's month ended with no renewal; its watches stopped.
+    WatchStopped,
+    /// The credit pool is running low (account-level).
+    LowPool,
 }
 
 impl NoticeKind {
     /// The wire string for the webhook `notice` field.
     pub fn as_str(&self) -> &'static str {
         match self {
-            NoticeKind::TrialEnding => "trial_ending",
-            NoticeKind::WatchPaused => "watch_paused",
+            NoticeKind::WatchEnding => "watch_ending",
+            NoticeKind::WatchStopped => "watch_stopped",
+            NoticeKind::LowPool => "low_pool",
         }
     }
 }

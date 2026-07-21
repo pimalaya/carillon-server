@@ -26,6 +26,10 @@ reconcile_interval_secs = 60
 # for local dev or a self-host that watches a LAN mail server or posts to a
 # loopback webhook sink (e.g. examples/webhook_sink.rs on 127.0.0.1).
 # allow_private_targets = true
+# Fair-use cap: the most distinct mailboxes (PIM accounts) ONE SaaS account may
+# watch before it needs a volume plan (default 25). A reselling backstop, not a
+# product tier — "fair unlimited". Self-host / admin-token callers are exempt.
+# max_watches_per_account = 25
 
 [api]
 # Listen address of the HTTP control API.
@@ -59,12 +63,15 @@ listen = "127.0.0.1:3000"
 # client_id = "…"
 
 # Payment provider. Unset (default) = the keyless STUB provider (checkout
-# returns a placeholder URL and the webhook activates on trust) — fine for local
-# dev. Configure [billing.stripe] to take real money. Each MAILBOX is
-# subscribed independently (per-mailbox subscription); hosted Checkout needs
-# ONLY the secret key server-side — no publishable key. In production inject the
+# returns a placeholder URL and the webhook credits the pool on trust) — fine for
+# local dev, and the marker for a NON-metered self-host (watches just run; no
+# credits). Configure [billing.stripe] to take real money and turn metering ON.
+# Billing is a PREPAID CREDIT POOL (§ docs/BILLING_MODEL.md): per SERVICE, one
+# credit = one service-month (€1). The only refill unit is a PACK of 5 credits
+# (€5) — checkout buys N packs. Hosted Checkout needs ONLY the secret key
+# server-side — no publishable key, no subscription. In production inject the
 # secrets via systemd LoadCredential, not this file (see docs/DEPLOY_HARDENING.md).
-# Create the recurring Prices in the Stripe dashboard; the price lives THERE.
+# Create ONE one-time Price in Stripe (the PACK price, e.g. €5); the price lives THERE.
 # [billing.stripe]
 # secret_key = "sk_test_…"          # sandbox key; sk_live_… in production
 # webhook_secret = "whsec_…"        # from `stripe listen` or the dashboard endpoint
@@ -72,6 +79,16 @@ listen = "127.0.0.1:3000"
 # `public_url`) with a ?checkout=success/cancel marker. Set them to override:
 # success_url = "https://app.carillon.example.org/?checkout=success"
 # cancel_url  = "https://app.carillon.example.org/?checkout=cancel"
-# [billing.stripe.prices]           # plan id → RECURRING Stripe Price id
-# month = "price_…"                 # e.g. €1/month
-# year  = "price_…"                 # e.g. €10/year (2 months free — the discount)
+# [billing.stripe.prices]           # the `pack` key → ONE-TIME Stripe Price id
+# pack = "price_…"                  # the 5-credit pack price, e.g. €5
+
+# Transactional email — magic-link sign-in + billing notices. Unset (default) =
+# the keyless STUB mailer (it LOGS the magic-link URL instead of sending, so a
+# dev flow works with no provider). Configure [email.resend] to actually send.
+# Deliverability is existential (a spam-foldered magic link = no sign-in): send
+# from an authenticated sending SUBDOMAIN with SPF + DKIM + DMARC, tracking OFF
+# on the auth stream (see docs/EMAIL.md). Inject api_key via LoadCredential in
+# production.
+# [email.resend]
+# api_key = "re_…"
+# from = "Carillon <no-reply@mail.carillon.example.org>"

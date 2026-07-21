@@ -24,6 +24,7 @@ mod config;
 mod crypto;
 mod delivery;
 mod discover;
+mod email;
 mod event;
 mod guard;
 mod imap;
@@ -124,6 +125,10 @@ async fn serve(config: Config) -> Result<()> {
     // Egress policy first: every outbound connect (IMAP + webhooks) consults it.
     guard::set_allow_private_targets(config.server.allow_private_targets);
 
+    // Watching is credit-metered only on the SaaS (Stripe configured); the
+    // keyless stub provider means self-host / dev, which is not billed.
+    let metered = config.billing.stripe.is_some();
+
     let store = Arc::new(Store::open(&config.server.db_path()).context("Cannot open store")?);
     let crypto =
         Arc::new(Crypto::load_or_create(&config.server.age_key_path()).context("Cannot load key")?);
@@ -138,6 +143,9 @@ async fn serve(config: Config) -> Result<()> {
         .timeout(Duration::from_secs(30))
         .build()
         .context("Cannot build HTTP client")?;
+
+    // Transactional email: Resend when configured, else the keyless stub.
+    let mailer = Arc::new(email::Mailer::new(http.clone(), &config.email));
 
     let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
@@ -157,13 +165,16 @@ async fn serve(config: Config) -> Result<()> {
         live_tx.clone(),
     ));
 
-    // Entitlement sweep: pause watches whose trial/subscription has lapsed.
+    // Renewal sweep: auto-renew or stop PIM accounts whose month lapsed
+    // (disabled when unmetered).
     tokio::spawn(metering::run(
         store.clone(),
         live_tx.clone(),
         http.clone(),
+        mailer.clone(),
         command_tx.clone(),
         metering::tick(),
+        metered,
     ));
 
     // Supervisor. Keep a clone of the connector for the `/test` probe.
@@ -174,6 +185,7 @@ async fn serve(config: Config) -> Result<()> {
         event_tx,
         config.server.max_concurrent_handshakes,
         live_tx.clone(),
+        metered,
     );
     let reconcile_interval = Duration::from_secs(config.server.reconcile_interval_secs.max(5));
     tokio::spawn(supervisor.run(command_rx, reconcile_interval));
@@ -232,6 +244,9 @@ async fn serve(config: Config) -> Result<()> {
         live: live_tx,
         shutdown: shutdown_rx,
         billing,
+        mailer,
+        metered,
+        max_watches: config.server.max_watches_per_account.max(1),
         admin_token: config.api.admin_token.clone(),
         public_url,
         dashboard_origin,
@@ -298,14 +313,15 @@ fn import(config: &Config, path: &Path) -> Result<()> {
             // One watch, one billing account until grouped (M7).
             account_id: id.clone(),
             auth_kind: String::from("password"),
+            // Self-host import is unmetered, so activation is moot (watches run
+            // regardless); leave the service un-activated.
+            watching_until: None,
+            auto_renew: false,
             active: account.active,
         };
         store.upsert_watch(&watch)?;
-        store.ensure_account(id)?;
-        store.grant_trial(
-            &metering::mailbox_key(&account.login, &account.imap_host),
-            metering::trial_secs(),
-        )?;
+        store.ensure_account(id, None)?;
+        store.grant_free_credit(id, metering::FREE_CREDITS_ON_SIGNUP)?;
         imported += 1;
         info!(watch = %id, "imported");
     }
