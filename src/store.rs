@@ -87,20 +87,35 @@ CREATE TABLE IF NOT EXISTS delivery (
 
 CREATE INDEX IF NOT EXISTS delivery_account_at ON delivery (account, at DESC);
 
--- The billing account: one shared, refillable paid pool of watch-seconds
--- (§ DECISIONS 3). Watches draw from their account_id's pool.
+-- The billing account: a login-less grouping of the mailboxes a user proved
+-- control of. Subscriptions are per-mailbox (see mailbox_subscription), not
+-- per-account, so the account row itself is just an identity anchor.
 CREATE TABLE IF NOT EXISTS account (
-  id                    TEXT PRIMARY KEY,
-  paid_secs             REAL NOT NULL DEFAULT 0,
-  paid_expires          INTEGER,
-  auto_refill           INTEGER NOT NULL DEFAULT 0,
-  auto_refill_threshold REAL NOT NULL DEFAULT 0,
-  auto_refill_amount    REAL NOT NULL DEFAULT 0
+  id TEXT PRIMARY KEY
 );
 
--- Per-mailbox free trial: non-refillable once emptied, granted once ever,
--- keyed on the normalised (login, provider). Drained BEFORE the pool, so
--- a dead trial is dead forever and money only ever touches the pool.
+-- Per-mailbox Stripe subscription (§ DECISIONS 3a): one subscription per
+-- (account, mailbox), independently active/cancelled. Payment is stateless on
+-- our side — we persist only the subscription state Stripe reports (status,
+-- period end, customer/subscription ids for the portal), never card/PII.
+CREATE TABLE IF NOT EXISTS mailbox_subscription (
+  account_id             TEXT NOT NULL,
+  mailbox_key            TEXT NOT NULL,
+  sub_status             TEXT,
+  sub_current_period_end INTEGER,
+  stripe_customer_id     TEXT,
+  stripe_subscription_id TEXT,
+  plan                   TEXT,
+  PRIMARY KEY (account_id, mailbox_key)
+);
+
+CREATE INDEX IF NOT EXISTS mailbox_subscription_sub
+  ON mailbox_subscription (stripe_subscription_id);
+
+-- Per-mailbox free trial: a one-time wall-clock window, granted once ever,
+-- keyed on the normalised (login, provider) so it cannot be farmed. The
+-- window length (seconds) is stored in `trial_secs`; the trial is open while
+-- now < granted_at + trial_secs. A dead trial stays dead forever.
 CREATE TABLE IF NOT EXISTS mailbox_trial (
   mailbox_key TEXT PRIMARY KEY,
   trial_secs  REAL NOT NULL,
@@ -129,14 +144,17 @@ CREATE TABLE IF NOT EXISTS account_mailbox (
 );
 
 -- Pending checkout sessions: payment is stateless on our side — we keep
--- only what to grant on fulfilment, never card/PII (the provider owns
+-- only what to bind on fulfilment (the plan, and a nominal cadence length in
+-- `secs` for a provisional period end), never card/PII (the provider owns
 -- the customer + receipt).
 CREATE TABLE IF NOT EXISTS checkout_session (
-  session_id TEXT PRIMARY KEY,
-  account_id TEXT NOT NULL,
-  secs       REAL NOT NULL,
-  fulfilled  INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL
+  session_id  TEXT PRIMARY KEY,
+  account_id  TEXT NOT NULL,
+  mailbox_key TEXT NOT NULL DEFAULT '',
+  plan        TEXT NOT NULL DEFAULT '',
+  secs        REAL NOT NULL,
+  fulfilled   INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL
 );
 ";
 
@@ -265,78 +283,30 @@ pub struct DeliveryOutcome<'a> {
     pub attempts: u32,
 }
 
-/// A billing account: one shared, refillable pool of watch-seconds plus
-/// its auto-refill settings.
+/// A per-mailbox Stripe subscription: the state that gates one mailbox's
+/// watches. Keyed externally by `(account_id, mailbox_key)`.
 #[derive(Clone, Debug)]
-pub struct AccountRow {
-    /// Account id.
-    pub id: String,
-    /// Remaining paid watch-seconds (the refillable pool).
-    pub paid_secs: f64,
-    /// Unix time the pool expires (bounds deferred-revenue liability).
-    pub paid_expires: Option<i64>,
-    /// Whether auto-refill is enabled.
-    pub auto_refill: bool,
-    /// Refill when the pool falls below this many seconds.
-    pub auto_refill_threshold: f64,
-    /// Seconds to add on each auto-refill.
-    pub auto_refill_amount: f64,
+pub struct SubscriptionRow {
+    /// Subscription status as Stripe reports it (`active`, `trialing`,
+    /// `past_due`, `canceled`, …). `None` = never subscribed.
+    pub sub_status: Option<String>,
+    /// Unix time the current paid period ends (the entitlement backstop when
+    /// a renewal/cancel event is missed).
+    pub sub_current_period_end: Option<i64>,
+    /// Stripe customer id, for the billing-portal (manage/cancel) link.
+    pub stripe_customer_id: Option<String>,
+    /// The plan id chosen (`month`, `year`, …), for display.
+    pub plan: Option<String>,
 }
 
-impl AccountRow {
+impl SubscriptionRow {
     fn from_row(row: &Row) -> rusqlite::Result<Self> {
         Ok(Self {
-            id: row.get("id")?,
-            paid_secs: row.get("paid_secs")?,
-            paid_expires: row.get("paid_expires")?,
-            auto_refill: row.get::<_, i64>("auto_refill")? != 0,
-            auto_refill_threshold: row.get("auto_refill_threshold")?,
-            auto_refill_amount: row.get("auto_refill_amount")?,
+            sub_status: row.get("sub_status")?,
+            sub_current_period_end: row.get("sub_current_period_end")?,
+            stripe_customer_id: row.get("stripe_customer_id")?,
+            plan: row.get("plan")?,
         })
-    }
-}
-
-/// The metering-relevant fields of one active watch.
-#[derive(Clone, Debug)]
-pub struct MeterRow {
-    /// Watch id.
-    pub watch_id: String,
-    /// Billing account the watch draws from.
-    pub account_id: String,
-    /// Login, for the mailbox-trial key.
-    pub login: String,
-    /// IMAP host, for the mailbox-trial key.
-    pub imap_host: String,
-    /// When this watch was last debited (`None` before its first tick).
-    pub last_metered: Option<i64>,
-}
-
-impl MeterRow {
-    fn from_row(row: &Row) -> rusqlite::Result<Self> {
-        Ok(Self {
-            watch_id: row.get("id")?,
-            account_id: row.get("account_id")?,
-            login: row.get("login")?,
-            imap_host: row.get("imap_host")?,
-            last_metered: row.get("last_metered")?,
-        })
-    }
-}
-
-/// The two counters available to a watch right now: its per-mailbox trial
-/// and its account's paid pool (already zeroed here if expired).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Balance {
-    /// Remaining trial seconds for the mailbox.
-    pub trial: f64,
-    /// Remaining paid pool seconds for the account (0 if expired).
-    pub pool: f64,
-}
-
-impl Balance {
-    /// Total watch-seconds the watch can still spend.
-    pub fn available(&self) -> f64 {
-        self.trial + self.pool
     }
 }
 
@@ -621,173 +591,148 @@ impl Store {
         Ok(rows)
     }
 
-    // --- Metering & accounts (M5) ---
+    // --- Accounts, subscriptions & trials ---
 
-    /// Creates the account row if it does not exist yet (no-op if it
-    /// does). Called when a watch is created so its pool exists.
+    /// Creates the account row if it does not exist yet (no-op if it does).
+    /// Called when a watch is created so its billing account exists.
     pub fn ensure_account(&self, id: &str) -> Result<()> {
         self.lock()
             .execute("INSERT OR IGNORE INTO account (id) VALUES (?1)", [id])?;
         Ok(())
     }
 
-    /// Looks up an account.
-    pub fn get_account(&self, id: &str) -> Result<Option<AccountRow>> {
+    /// Whether an account row exists.
+    pub fn account_exists(&self, id: &str) -> Result<bool> {
         let conn = self.lock();
-        let account = conn
-            .query_row(
-                "SELECT * FROM account WHERE id = ?1",
-                [id],
-                AccountRow::from_row,
-            )
+        let exists: Option<i64> = conn
+            .query_row("SELECT 1 FROM account WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
             .optional()?;
-        Ok(account)
+        Ok(exists.is_some())
     }
 
-    /// Every account, ordered by id.
-    pub fn all_accounts(&self) -> Result<Vec<AccountRow>> {
+    /// Every account id, ordered.
+    pub fn all_account_ids(&self) -> Result<Vec<String>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT * FROM account ORDER BY id")?;
-        let rows = stmt.query_map([], AccountRow::from_row)?;
+        let mut stmt = conn.prepare("SELECT id FROM account ORDER BY id")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Adds paid watch-seconds to an account's pool and sets its expiry.
-    /// Ensures the account exists. This is the sole thing money touches
-    /// (top-up and auto-refill both land here).
-    pub fn add_credit(&self, id: &str, secs: f64, expires: i64) -> Result<()> {
+    /// The subscription covering one mailbox, if any.
+    pub fn get_mailbox_subscription(
+        &self,
+        account_id: &str,
+        mailbox_key: &str,
+    ) -> Result<Option<SubscriptionRow>> {
         let conn = self.lock();
-        conn.execute("INSERT OR IGNORE INTO account (id) VALUES (?1)", [id])?;
+        let sub = conn
+            .query_row(
+                "SELECT sub_status, sub_current_period_end, stripe_customer_id, plan
+                 FROM mailbox_subscription WHERE account_id = ?1 AND mailbox_key = ?2",
+                params![account_id, mailbox_key],
+                SubscriptionRow::from_row,
+            )
+            .optional()?;
+        Ok(sub)
+    }
+
+    /// Binds a paid Stripe subscription to one mailbox and marks it active with
+    /// a provisional period end (refined by later lifecycle events). Ensures
+    /// the account exists. This is what a fulfilled checkout lands.
+    pub fn activate_subscription(
+        &self,
+        account_id: &str,
+        mailbox_key: &str,
+        subscription_id: &str,
+        customer_id: Option<&str>,
+        plan: &str,
+        period_end: i64,
+    ) -> Result<()> {
+        let conn = self.lock();
         conn.execute(
-            "UPDATE account SET paid_secs = paid_secs + ?2, paid_expires = ?3 WHERE id = ?1",
-            params![id, secs, expires],
+            "INSERT OR IGNORE INTO account (id) VALUES (?1)",
+            [account_id],
+        )?;
+        conn.execute(
+            "INSERT INTO mailbox_subscription
+               (account_id, mailbox_key, sub_status, sub_current_period_end,
+                stripe_customer_id, stripe_subscription_id, plan)
+             VALUES (?1, ?2, 'active', ?3, ?4, ?5, ?6)
+             ON CONFLICT(account_id, mailbox_key) DO UPDATE SET
+               sub_status = 'active',
+               sub_current_period_end = ?3,
+               stripe_customer_id = COALESCE(?4, stripe_customer_id),
+               stripe_subscription_id = ?5,
+               plan = ?6",
+            params![
+                account_id,
+                mailbox_key,
+                period_end,
+                customer_id,
+                subscription_id,
+                plan
+            ],
         )?;
         Ok(())
     }
 
-    /// Configures auto-refill for an account.
-    pub fn set_auto_refill(
+    /// Applies a subscription lifecycle change (renew, cancel, past_due),
+    /// keyed by the Stripe subscription id the event references. Returns the
+    /// affected `(account_id, mailbox_key)`, or `None` if the subscription is
+    /// unknown. A `period_end` of `None` leaves the stored one untouched.
+    pub fn update_subscription(
         &self,
-        id: &str,
-        enabled: bool,
-        threshold: f64,
-        amount: f64,
-    ) -> Result<bool> {
+        subscription_id: &str,
+        status: &str,
+        period_end: Option<i64>,
+    ) -> Result<Option<(String, String)>> {
         let conn = self.lock();
-        conn.execute("INSERT OR IGNORE INTO account (id) VALUES (?1)", [id])?;
-        let n = conn.execute(
-            "UPDATE account
-               SET auto_refill = ?2, auto_refill_threshold = ?3, auto_refill_amount = ?4
-             WHERE id = ?1",
-            params![id, enabled as i64, threshold, amount],
-        )?;
-        Ok(n > 0)
+        let target: Option<(String, String)> = conn
+            .query_row(
+                "SELECT account_id, mailbox_key FROM mailbox_subscription
+                 WHERE stripe_subscription_id = ?1",
+                [subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if target.is_some() {
+            conn.execute(
+                "UPDATE mailbox_subscription
+                   SET sub_status = ?2,
+                       sub_current_period_end = COALESCE(?3, sub_current_period_end)
+                 WHERE stripe_subscription_id = ?1",
+                params![subscription_id, status, period_end],
+            )?;
+        }
+        Ok(target)
     }
 
-    /// Grants a mailbox its one-time trial, keyed on the normalised
-    /// mailbox key. A no-op if the key was ever granted before — this is
-    /// the anti-farming linchpin (a dead trial stays dead).
-    pub fn grant_trial(&self, mailbox_key: &str, secs: f64) -> Result<()> {
+    /// Grants a mailbox its one-time free-trial window (`window_secs` long),
+    /// keyed on the normalised mailbox key. A no-op if the key was ever
+    /// granted before — the anti-farming linchpin (a dead trial stays dead).
+    pub fn grant_trial(&self, mailbox_key: &str, window_secs: f64) -> Result<()> {
         self.lock().execute(
             "INSERT OR IGNORE INTO mailbox_trial (mailbox_key, trial_secs, granted_at)
              VALUES (?1, ?2, ?3)",
-            params![mailbox_key, secs, now_secs()],
+            params![mailbox_key, window_secs, now_secs()],
         )?;
         Ok(())
     }
 
-    /// The metering rows for every active watch.
-    pub fn meter_rows(&self) -> Result<Vec<MeterRow>> {
+    /// The wall-clock expiry of a mailbox's free trial (`granted_at + window`),
+    /// or `None` if the mailbox was never granted a trial.
+    pub fn trial_expires(&self, mailbox_key: &str) -> Result<Option<i64>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, account_id, login, imap_host, last_metered FROM watch WHERE active = 1",
-        )?;
-        let rows = stmt.query_map([], MeterRow::from_row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    /// The two counters available to a watch right now. The pool reads as
-    /// `0` (with `pool_expired`) once its expiry has passed.
-    pub fn balance(&self, account_id: &str, mailbox_key: &str, now: i64) -> Result<Balance> {
-        let conn = self.lock();
-        let trial: f64 = conn
+        let row: Option<(i64, f64)> = conn
             .query_row(
-                "SELECT trial_secs FROM mailbox_trial WHERE mailbox_key = ?1",
+                "SELECT granted_at, trial_secs FROM mailbox_trial WHERE mailbox_key = ?1",
                 [mailbox_key],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or(0.0);
-
-        let account = conn
-            .query_row(
-                "SELECT * FROM account WHERE id = ?1",
-                [account_id],
-                AccountRow::from_row,
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-
-        let pool = match account {
-            Some(account) => match account.paid_expires {
-                Some(expires) if now >= expires => 0.0,
-                _ => account.paid_secs,
-            },
-            None => 0.0,
-        };
-
-        Ok(Balance { trial, pool })
-    }
-
-    /// Debits a watch's consumed time: `from_trial` off the mailbox trial
-    /// and `from_pool` off the account pool, and stamps `last_metered`.
-    /// Clamped at zero so rounding never drives a balance negative.
-    pub fn apply_debit(
-        &self,
-        watch_id: &str,
-        account_id: &str,
-        mailbox_key: &str,
-        from_trial: f64,
-        from_pool: f64,
-        now: i64,
-    ) -> Result<()> {
-        let conn = self.lock();
-        if from_trial > 0.0 {
-            conn.execute(
-                "UPDATE mailbox_trial SET trial_secs = MAX(0, trial_secs - ?2) WHERE mailbox_key = ?1",
-                params![mailbox_key, from_trial],
-            )?;
-        }
-        if from_pool > 0.0 {
-            conn.execute(
-                "UPDATE account SET paid_secs = MAX(0, paid_secs - ?2) WHERE id = ?1",
-                params![account_id, from_pool],
-            )?;
-        }
-        conn.execute(
-            "UPDATE watch SET last_metered = ?2 WHERE id = ?1",
-            params![watch_id, now],
-        )?;
-        Ok(())
-    }
-
-    /// Stamps `last_metered` without debiting (first observation of a
-    /// watch, so it is not charged for downtime before the daemon saw it).
-    pub fn mark_metered(&self, watch_id: &str, now: i64) -> Result<()> {
-        self.lock().execute(
-            "UPDATE watch SET last_metered = ?2 WHERE id = ?1",
-            params![watch_id, now],
-        )?;
-        Ok(())
-    }
-
-    /// Deactivates a watch whose credit ran out and clears its metering
-    /// clock, so it stops debiting and reconcile stops the connection.
-    pub fn exhaust_watch(&self, watch_id: &str) -> Result<()> {
-        self.lock().execute(
-            "UPDATE watch SET active = 0, last_metered = NULL WHERE id = ?1",
-            [watch_id],
-        )?;
-        Ok(())
+        Ok(row.map(|(granted_at, window)| granted_at + window as i64))
     }
 
     // --- Capability links, membership & checkout (M7) ---
@@ -901,27 +846,40 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Records a pending checkout session (what to grant on fulfilment).
-    pub fn create_session(&self, session_id: &str, account_id: &str, secs: f64) -> Result<()> {
+    /// Records a pending checkout session: the account + mailbox, the plan
+    /// chosen, and a nominal cadence length (`secs`) for the provisional period
+    /// end.
+    pub fn create_session(
+        &self,
+        session_id: &str,
+        account_id: &str,
+        mailbox_key: &str,
+        plan: &str,
+        secs: f64,
+    ) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO checkout_session (session_id, account_id, secs, fulfilled, created_at)
-             VALUES (?1, ?2, ?3, 0, ?4)",
-            params![session_id, account_id, secs, now_secs()],
+            "INSERT INTO checkout_session
+               (session_id, account_id, mailbox_key, plan, secs, fulfilled, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+            params![session_id, account_id, mailbox_key, plan, secs, now_secs()],
         )?;
         Ok(())
     }
 
-    /// Fulfils a session exactly once, returning `(account_id, secs)` to
-    /// credit. `None` if the session is unknown or already fulfilled
+    /// Fulfils a session exactly once, returning `(account_id, mailbox_key,
+    /// plan, secs)`. `None` if the session is unknown or already fulfilled
     /// (idempotency against retried payment webhooks).
-    pub fn fulfill_session(&self, session_id: &str) -> Result<Option<(String, f64)>> {
+    pub fn fulfill_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, String, String, f64)>> {
         let conn = self.lock();
-        let row: Option<(String, f64)> = conn
+        let row: Option<(String, String, String, f64)> = conn
             .query_row(
-                "SELECT account_id, secs FROM checkout_session
+                "SELECT account_id, mailbox_key, plan, secs FROM checkout_session
                  WHERE session_id = ?1 AND fulfilled = 0",
                 [session_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
 
@@ -1091,15 +1049,28 @@ fn token_hash(token: &str) -> String {
 /// database. `CREATE TABLE IF NOT EXISTS` never alters an existing
 /// table, so older stores need their new columns backfilled here.
 fn migrate(conn: &Connection) -> Result<()> {
-    for (column, decl) in [
-        ("hmac_secret_prev", "TEXT"),
-        ("hmac_secret_prev_expires", "INTEGER"),
-        ("account_id", "TEXT NOT NULL DEFAULT ''"),
-        ("last_metered", "INTEGER"),
-        ("auth_kind", "TEXT NOT NULL DEFAULT 'password'"),
+    for (table, column, decl) in [
+        ("watch", "hmac_secret_prev", "TEXT"),
+        ("watch", "hmac_secret_prev_expires", "INTEGER"),
+        ("watch", "account_id", "TEXT NOT NULL DEFAULT ''"),
+        ("watch", "last_metered", "INTEGER"),
+        ("watch", "auth_kind", "TEXT NOT NULL DEFAULT 'password'"),
+        // Subscription billing replaced the paid pool; a pre-existing
+        // checkout_session gains the plan + mailbox it now binds. (Old `account`
+        // pool/subscription columns, if a prior build added any, are left inert
+        // — subscriptions live in mailbox_subscription now.)
+        ("checkout_session", "plan", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "checkout_session",
+            "mailbox_key",
+            "TEXT NOT NULL DEFAULT ''",
+        ),
     ] {
-        if !column_exists(conn, "watch", column)? {
-            conn.execute(&format!("ALTER TABLE watch ADD COLUMN {column} {decl}"), [])?;
+        if !column_exists(conn, table, column)? {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                [],
+            )?;
         }
     }
     // Backfill the billing account for pre-metering rows: one watch, one

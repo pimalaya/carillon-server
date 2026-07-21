@@ -21,6 +21,11 @@ max_concurrent_handshakes = 50
 # Safety-net interval (seconds) at which the supervisor re-reads the
 # store, on top of API-triggered reconciles.
 reconcile_interval_secs = 60
+# SSRF egress guard. Default false = REFUSE outbound IMAP/webhook connects to
+# loopback/private/link-local addresses (the safe production posture). Set true
+# for local dev or a self-host that watches a LAN mail server or posts to a
+# loopback webhook sink (e.g. examples/webhook_sink.rs on 127.0.0.1).
+# allow_private_targets = true
 
 [api]
 # Listen address of the HTTP control API.
@@ -54,12 +59,12 @@ listen = "127.0.0.1:3000"
 # client_id = "…"
 
 # Payment provider. Unset (default) = the keyless STUB provider (checkout
-# returns a placeholder URL and the webhook fulfils on trust) — fine for local
-# dev. Configure [billing.stripe] to take real money. Hosted Checkout needs
-# ONLY the secret key server-side — no publishable key. In production inject
-# the secrets via systemd LoadCredential, not this file (see
-# docs/DEPLOY_HARDENING.md). Create the three Prices in the Stripe dashboard;
-# the price lives THERE, not here.
+# returns a placeholder URL and the webhook activates on trust) — fine for local
+# dev. Configure [billing.stripe] to take real money. Each MAILBOX is
+# subscribed independently (per-mailbox subscription); hosted Checkout needs
+# ONLY the secret key server-side — no publishable key. In production inject the
+# secrets via systemd LoadCredential, not this file (see docs/DEPLOY_HARDENING.md).
+# Create the recurring Prices in the Stripe dashboard; the price lives THERE.
 # [billing.stripe]
 # secret_key = "sk_test_…"          # sandbox key; sk_live_… in production
 # webhook_secret = "whsec_…"        # from `stripe listen` or the dashboard endpoint
@@ -67,7 +72,6 @@ listen = "127.0.0.1:3000"
 # `public_url`) with a ?checkout=success/cancel marker. Set them to override:
 # success_url = "https://app.carillon.example.org/?checkout=success"
 # cancel_url  = "https://app.carillon.example.org/?checkout=cancel"
-# [billing.stripe.prices]           # pack id → Stripe Price id
-# week    = "price_…"
-# quarter = "price_…"
-# year    = "price_…"
+# [billing.stripe.prices]           # plan id → RECURRING Stripe Price id
+# month = "price_…"                 # e.g. €1/month
+# year  = "price_…"                 # e.g. €10/year (2 months free — the discount)

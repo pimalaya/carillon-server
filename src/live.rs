@@ -66,7 +66,7 @@ pub enum LiveEvent {
         detail: Option<String>,
         at: i64,
     },
-    /// A metering / billing notice (low balance, exhausted, refilled).
+    /// An entitlement / billing notice (trial ending, watch paused).
     Notice {
         account: String,
         kind: NoticeKind,
@@ -75,26 +75,24 @@ pub enum LiveEvent {
     },
 }
 
-/// A metering / billing notice. Delivered on the SSE bus and, so a
+/// An entitlement / billing notice. Delivered on the SSE bus and, so a
 /// no-dashboard user is not silently cut off, also as a signed webhook.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoticeKind {
-    /// The account pool is running low.
-    LowBalance,
-    /// Credit ran out; the watch was paused.
-    CreditExhausted,
-    /// Auto-refill topped the pool back up.
-    AutoRefilled,
+    /// A mailbox's free trial is about to end with no subscription behind it.
+    TrialEnding,
+    /// Entitlement lapsed (trial ended, no active subscription); the watch
+    /// was paused.
+    WatchPaused,
 }
 
 impl NoticeKind {
     /// The wire string for the webhook `notice` field.
     pub fn as_str(&self) -> &'static str {
         match self {
-            NoticeKind::LowBalance => "low_balance",
-            NoticeKind::CreditExhausted => "credit_exhausted",
-            NoticeKind::AutoRefilled => "auto_refilled",
+            NoticeKind::TrialEnding => "trial_ending",
+            NoticeKind::WatchPaused => "watch_paused",
         }
     }
 }

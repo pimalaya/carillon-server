@@ -472,9 +472,13 @@ pub fn plan_authorization(
     };
 
     // Extra authorization params: the provider's own (e.g. Google's
-    // access_type/prompt). RFC 8707 `resource` would be added here too if a
-    // provider required it.
-    let extra_params: Vec<(String, String)> = provider
+    // access_type/prompt), plus an RFC 8707 `resource` indicator where a
+    // provider requires one. Fastmail bounces the authorization *pre-consent*
+    // with `invalid_target` unless `resource` is present; discovery doesn't
+    // surface it yet, so supply the known value (as ortie does). Fastmail binds
+    // the token from the authorization request, so it need not be repeated on
+    // the token exchange (io-oauth's token params carry none anyway).
+    let mut extra_params: Vec<(String, String)> = provider
         .map(|provider| {
             provider
                 .auth_params
@@ -483,6 +487,11 @@ pub fn plan_authorization(
                 .collect()
         })
         .unwrap_or_default();
+
+    let resource = required_resource(&host);
+    if let Some(resource) = &resource {
+        extra_params.push(("resource".to_string(), resource.clone()));
+    }
 
     let auth = build_authorization(
         &endpoints,
@@ -497,14 +506,66 @@ pub fn plan_authorization(
         token_endpoint: endpoints.token.to_string(),
         client_id: client.id().to_string(),
         client_secret: client.secret().map(str::to_string),
-        resource: None,
+        resource,
         scope,
     })
+}
+
+/// The RFC 8707 `resource` indicator a provider is known to require but
+/// discovery does not yet surface. Fastmail rejects the authorization with
+/// `invalid_target` without it; one resource covers all its protocols
+/// (IMAP/SMTP/JMAP), so the JMAP session URL is used for the mail flow too.
+fn required_resource(host: &str) -> Option<String> {
+    host.ends_with("fastmail.com")
+        .then(|| "https://api.fastmail.com/jmap/session".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fastmail_requires_a_resource() {
+        assert_eq!(
+            required_resource("api.fastmail.com").as_deref(),
+            Some("https://api.fastmail.com/jmap/session"),
+        );
+        assert_eq!(
+            required_resource("betty.fastmail.com").as_deref(),
+            Some("https://api.fastmail.com/jmap/session")
+        );
+        assert_eq!(required_resource("imap.gmail.com"), None);
+        assert_eq!(required_resource("outlook.office365.com"), None);
+    }
+
+    #[test]
+    fn authorization_url_carries_the_resource() {
+        let endpoints = OauthEndpoints {
+            authorization: "https://api.fastmail.com/oauth/authorize".parse().unwrap(),
+            token: "https://api.fastmail.com/oauth/refresh".parse().unwrap(),
+            registration: None,
+            scopes_supported: Vec::new(),
+        };
+        let extras = vec![(
+            "resource".to_string(),
+            "https://api.fastmail.com/jmap/session".to_string(),
+        )];
+        let request = build_authorization(
+            &endpoints,
+            "client-abc",
+            "http://127.0.0.1:3000/oauth/callback",
+            Some("urn:ietf:params:oauth:scope:mail offline_access"),
+            &extras,
+        );
+        // The resource lands on the wire, URL-encoded.
+        assert!(
+            request
+                .url
+                .contains("resource=https%3A%2F%2Fapi.fastmail.com%2Fjmap%2Fsession"),
+            "auth URL missing the RFC 8707 resource: {}",
+            request.url,
+        );
+    }
 
     /// Live check: Fastmail exposes RFC 8414 metadata with a registration
     /// endpoint, and RFC 7591 dynamic registration returns a usable

@@ -298,20 +298,25 @@ paths:
       responses:
         "200": { description: Revoked (or already gone). }
 
-  /billing/packs:
+  /billing/plans:
     get:
       tags: [billing]
-      summary: The credit-pack catalogue (watch-time; price is the provider's)
+      summary: The subscription plans on offer (month/year)
       security: []
       responses:
         "200":
-          description: Packs.
+          description: >
+            `{ provider, plans: [{ id, cadence_secs }] }`. The price is set in
+            the provider and shown on its hosted checkout page.
           content:
             application/json: {}
   /billing/checkout:
     post:
       tags: [billing]
-      summary: Start a purchase for the link's account
+      summary: Start a subscription to a plan for one of the link's mailboxes
+      description: >
+        Subscriptions are per-mailbox. `mailbox_key` must be a mailbox the
+        caller has proven control of via `/auth` (else `403`).
       security: [{ capabilityLink: [] }]
       requestBody:
         required: true
@@ -319,34 +324,61 @@ paths:
           application/json:
             schema:
               type: object
-              required: [pack]
-              properties: { pack: { type: string } }
+              required: [plan, mailbox_key]
+              properties:
+                plan: { type: string, enum: [month, year] }
+                mailbox_key: { type: string }
       responses:
         "200":
           description: >
             A pending session and the provider checkout URL (Stripe hosted
-            Checkout). Send the buyer to `checkout_url`.
+            Checkout, `mode=subscription`). Send the buyer to `checkout_url`.
           content:
             application/json: {}
-        "400": { description: Unknown pack, or the provider rejected checkout. }
+        "400": { description: Unknown plan, or the provider rejected checkout. }
+        "403": { description: The mailbox has not been authenticated by this account. }
+  /billing/portal:
+    post:
+      tags: [billing]
+      summary: A self-service billing-portal session for one mailbox's subscription
+      security: [{ capabilityLink: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mailbox_key]
+              properties:
+                mailbox_key: { type: string }
+      responses:
+        "200":
+          description: >
+            `{ portal_url }` — Stripe billing-portal URL for that mailbox's
+            subscription. Send the customer there to update their card or cancel.
+          content:
+            application/json: {}
+        "400": { description: That mailbox has no subscription (no Stripe customer to manage). }
   /billing/webhook:
     post:
       tags: [billing]
-      summary: Provider payment-confirmed callback (verify signature, fulfil once)
+      summary: Provider subscription callback (verify signature, apply event)
       security: []
       description: |
         The provider's raw event. For Stripe, the `Stripe-Signature` header
         HMAC is verified over the **raw body** (within a 5-minute skew) before
-        anything is trusted; a paid `checkout.session.completed` fulfils the
-        referenced session exactly once (idempotent against Stripe's retries)
-        and credits the pool. The stub provider trusts a `{session_id}` body.
+        anything is trusted. A paid `checkout.session.completed` activates the
+        subscription for the referenced session (idempotent against retries);
+        a `customer.subscription.updated`/`deleted` event updates its status and
+        period end. The stub provider trusts a `{session_id}` (activate) or
+        `{subscription_id, status}` (update) body.
       requestBody:
         required: true
         description: The provider's raw event body (do not re-serialize).
         content:
           application/json: {}
       responses:
-        "200": { description: Fulfilled or ignored (idempotent). }
+        "200": { description: Applied or ignored (idempotent). }
         "400": { description: Signature verification failed. }
 
   /watches:
@@ -474,7 +506,7 @@ paths:
   /accounts:
     get:
       tags: [accounts]
-      summary: List billing accounts with their two counters
+      summary: List billing accounts with their subscription state
       responses:
         "200":
           description: Every account.
@@ -486,7 +518,7 @@ paths:
   /accounts/{id}:
     get:
       tags: [accounts]
-      summary: One account's balance (trials + paid pool)
+      summary: One account's subscription state and per-mailbox trials
       parameters: [{ $ref: "#/components/parameters/AccountId" }]
       responses:
         "200":
@@ -495,37 +527,6 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/AccountView" }
         "404": { description: No such account. }
-  /accounts/{id}/credit:
-    post:
-      tags: [accounts]
-      summary: Top up the paid pool
-      description: The sole thing money touches; billing calls this after a payment.
-      parameters: [{ $ref: "#/components/parameters/AccountId" }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/CreditRequest" }
-      responses:
-        "200":
-          description: Updated account view.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/AccountView" }
-        "400": { description: Non-positive amount. }
-  /accounts/{id}/auto-refill:
-    post:
-      tags: [accounts]
-      summary: Configure auto-refill
-      parameters: [{ $ref: "#/components/parameters/AccountId" }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/AutoRefillRequest" }
-      responses:
-        "200": { description: Configured. }
-        "400": { description: Missing amount when enabling. }
 
   /events:
     get:
@@ -711,36 +712,28 @@ components:
         at: { type: integer }
     AccountView:
       type: object
+      description: >
+        Per-mailbox billing view. Subscriptions are per-mailbox, so each entry
+        carries its own subscription + free-trial state.
       properties:
         id: { type: string }
-        paid_secs: { type: number }
-        paid_expires: { type: [integer, "null"] }
-        pool_expired: { type: boolean }
-        auto_refill: { type: boolean }
-        auto_refill_threshold: { type: number }
-        auto_refill_amount: { type: number }
-        total_available_secs: { type: number }
+        entitled: { type: boolean, description: Whether any mailbox may currently watch. }
         mailboxes:
           type: array
           items:
             type: object
             properties:
-              watch_id: { type: string }
+              watch_id: { type: [string, "null"] }
               mailbox_key: { type: string }
-              trial_secs: { type: number }
-    CreditRequest:
-      type: object
-      required: [secs]
-      properties:
-        secs: { type: number, description: Watch-seconds to add to the pool. }
-        ttl_secs: { type: [integer, "null"], description: Pool lifetime; default ~12 months. }
-    AutoRefillRequest:
-      type: object
-      required: [enabled]
-      properties:
-        enabled: { type: boolean }
-        threshold_secs: { type: number }
-        amount_secs: { type: number }
+              trial_active: { type: boolean }
+              trial_expires: { type: [integer, "null"] }
+              subscribed: { type: boolean, description: This mailbox's own subscription is active (incl. dunning grace). }
+              status:
+                type: string
+                description: active / trialing / past_due / canceled from Stripe, `trial` when only the free trial is open, else `none`.
+              plan: { type: [string, "null"], description: Plan id this mailbox is subscribed on (month/year). }
+              current_period_end: { type: [integer, "null"], description: Unix time this mailbox's paid period ends. }
+              can_manage: { type: boolean, description: A Stripe customer exists, so a billing-portal session can be opened. }
     AuthRequest:
       type: object
       required: [imap_host, login, password]

@@ -188,14 +188,18 @@ impl Supervisor {
 
     fn spawn_watcher(&self, watch: &Watch) -> anyhow::Result<WatcherHandle> {
         // Entitlement at the server boundary: never hold a standing IDLE
-        // connection for an account with no watch-time left.
+        // connection for an account with no active trial or subscription.
         let mailbox_key = metering::mailbox_key(&watch.login, &watch.imap_host);
-        if !metering::has_credit(&self.store, &watch.account_id, &mailbox_key) {
+        if !metering::is_entitled(&self.store, &watch.account_id, &mailbox_key) {
             let _ = self.live.send(Routed::new(
                 &watch.account_id,
-                LiveEvent::status(&watch.id, WatchState::Error, Some("no credit".into())),
+                LiveEvent::status(
+                    &watch.id,
+                    WatchState::Error,
+                    Some("subscription required".into()),
+                ),
             ));
-            anyhow::bail!("no watch-time credit for account {}", watch.account_id);
+            anyhow::bail!("account {} is not entitled to watch", watch.account_id);
         }
 
         // Resolve the credential kind. A password is decrypted once; an OAuth

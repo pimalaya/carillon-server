@@ -1,9 +1,13 @@
 # Carillon — Billing (Stripe) setup & sandbox testing
 
-Carillon sells **watch-time** as prepaid packs (`week`, `quarter`, `year`). The
-price lives in **Stripe** (a Price object), never in the code — a pack maps only
-to watch-seconds. Payment is stateless on our side: Stripe owns the customer and
-receipt; we persist only what a paid session grants.
+Carillon sells a **per-mailbox subscription** — each mailbox is subscribed (and
+cancelled) independently. It ships in two cadences — **`month`** and **`year`** —
+and the buyer picks one per mailbox. The price lives in **Stripe** (a recurring
+Price object), never in the code; the year's discount is just its Price. Payment
+is stateless on our side: Stripe owns the customer and receipt; we persist only
+the subscription *state* Stripe reports (status + period end). A new mailbox gets
+a one-time **free-trial window** (7 days by default) so it can be tried before
+subscribing.
 
 Provider is chosen by config: no `[billing.stripe]` → the keyless **stub**
 (dev); `[billing.stripe]` present → the real **Stripe** adapter.
@@ -33,11 +37,15 @@ Stripe Elements/embedded checkout in the dashboard — not now.
 
 1. Create a Stripe account — it starts in **Test mode**. Keep the "Test mode"
    toggle **on** for all of the below (test keys/prices are separate from live).
-2. **Products → Prices**: create three products, one Price each (e.g. €X
-   one-off). Copy each **Price id** (`price_…`).
+2. **Products → Prices**: create **two products**, each with a **recurring**
+   Price in your currency: e.g. "Carillon — monthly" at €1 billed **monthly**,
+   and "Carillon — yearly" at €10 billed **yearly**. Copy each **Price id**
+   (`price_…`).
 3. **Developers → API keys**: copy the **Secret key** (`sk_test_…`).
+4. **Settings → Billing → Customer portal**: activate the portal (once) so the
+   Manage / Cancel button works.
 
-Put them in `carillon.toml`:
+Put them in `carillon.toml` (the price keys must be `month` and `year`):
 
 ```toml
 [billing.stripe]
@@ -45,22 +53,14 @@ secret_key = "sk_test_…"
 webhook_secret = "whsec_…"                 # from step below
 
 [billing.stripe.prices]
-week    = "price_…"
-quarter = "price_…"
-year    = "price_…"
+month = "price_…"                          # €1/month  (recurring)
+year  = "price_…"                          # €10/year  (recurring — the discount)
 ```
 
 `success_url` / `cancel_url` are **optional** — where Stripe returns the browser
-after payment. Left unset they default to your `dashboard_url` (or `public_url`)
+after checkout. Left unset they default to your `dashboard_url` (or `public_url`)
 with a `?checkout=success` / `?checkout=cancel` marker, which is fine for local
-testing. Set them explicitly to override:
-
-```toml
-[billing.stripe]
-# …
-success_url = "https://app.example.org/?checkout=success"
-cancel_url  = "https://app.example.org/?checkout=cancel"
-```
+testing.
 
 ---
 
@@ -78,7 +78,8 @@ test events to your local server, correctly signed. No public URL needed.
 
 **Deployed server — dashboard endpoint:**
 Developers → Webhooks → *Add endpoint* → URL
-`https://your-server/billing/webhook`, event **`checkout.session.completed`**.
+`https://your-server/billing/webhook`, events **`checkout.session.completed`**,
+**`customer.subscription.updated`** and **`customer.subscription.deleted`**.
 Copy that endpoint's signing secret (`whsec_…`).
 
 ---
@@ -93,22 +94,30 @@ Copy that endpoint's signing secret (`whsec_…`).
    curl -X POST http://localhost:3000/billing/checkout \
      -H "Authorization: Bearer <capability-link>" \
      -H "content-type: application/json" \
-     -d '{"pack":"week"}'
+     -d '{"plan":"year","mailbox_key":"you@example.com"}'
    ```
 
-   → returns `{"provider":"stripe","checkout_url":"https://checkout.stripe.com/…", …}`.
-4. Open `checkout_url`, pay with a **test card**: `4242 4242 4242 4242`, any
-   future expiry, any CVC/ZIP.
+   (`mailbox_key` is a mailbox you authenticated via `/auth`; it appears in
+   `GET /me` under `balance.mailboxes[].mailbox_key`.) →
+   `{"provider":"stripe","checkout_url":"https://checkout.stripe.com/…", …}`.
+4. Open `checkout_url`, subscribe with a **test card**: `4242 4242 4242 4242`,
+   any future expiry, any CVC/ZIP.
 5. Stripe fires `checkout.session.completed` → `/billing/webhook` → signature
-   verified → session fulfilled once → pool credited. Server logs
-   `checkout fulfilled`.
-6. Verify: `GET /me` → `balance.paid_secs` went up by the pack's seconds.
+   verified → subscription bound to that mailbox and activated. Server logs
+   `subscription activated`.
+6. Verify: `GET /me` → the mailbox's entry in `balance.mailboxes` has
+   `subscribed: true`, `status: "active"`, and a `current_period_end`.
+7. In the Stripe **customer portal** (via the dashboard's Manage button, or the
+   portal URL from `POST /billing/portal`), cancel the subscription →
+   `customer.subscription.updated`/`deleted` → `/billing/webhook` → status flips
+   to `canceled`; the entitlement sweep pauses the account's watches when the
+   period (plus a short grace) ends.
 
 ### Notes
-- `stripe trigger checkout.session.completed` alone won't credit anything — a
+- `stripe trigger checkout.session.completed` alone won't activate anything — a
   triggered event has no `client_reference_id`, so it's (correctly) **ignored**.
-  Real fulfilment needs an actual checkout so our session id round-trips.
-- Fulfilment is **idempotent**: Stripe retries the webhook; the second one is
+  Real activation needs an actual checkout so our session id round-trips.
+- Activation is **idempotent**: Stripe retries the webhook; the second one is
   ignored (the session is already fulfilled).
 - A forged/expired/wrong-secret signature is rejected with **400** (unit-tested
   in `billing.rs`).

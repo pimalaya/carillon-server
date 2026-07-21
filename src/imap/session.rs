@@ -26,6 +26,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tracing::debug;
 
+use crate::guard;
 use crate::imap::pump;
 
 /// We fetch only UID and FLAGS, never bodies, so the parser buffer
@@ -82,7 +83,13 @@ async fn open(
     connector: &TlsConnector,
     account: &ImapAccount,
 ) -> Result<(TlsStream<TcpStream>, Fragmentizer)> {
-    let tcp = TcpStream::connect((account.host.as_str(), account.port))
+    // Resolve + SSRF-check first, then connect to that exact address (so what
+    // we validated is what we connect to — rebinding-safe). TLS still uses the
+    // hostname for SNI + certificate verification below.
+    let addr = guard::resolve_allowed(&account.host, account.port)
+        .await
+        .with_context(|| format!("Cannot connect to {}:{}", account.host, account.port))?;
+    let tcp = TcpStream::connect(addr)
         .await
         .with_context(|| format!("Cannot connect to {}:{}", account.host, account.port))?;
     tcp.set_nodelay(true).ok();

@@ -25,6 +25,7 @@ mod crypto;
 mod delivery;
 mod discover;
 mod event;
+mod guard;
 mod imap;
 mod live;
 mod metering;
@@ -120,6 +121,9 @@ fn load_config(explicit: Option<&str>) -> Result<Config> {
 
 /// Runs the daemon: watchers, delivery worker and control API.
 async fn serve(config: Config) -> Result<()> {
+    // Egress policy first: every outbound connect (IMAP + webhooks) consults it.
+    guard::set_allow_private_targets(config.server.allow_private_targets);
+
     let store = Arc::new(Store::open(&config.server.db_path()).context("Cannot open store")?);
     let crypto =
         Arc::new(Crypto::load_or_create(&config.server.age_key_path()).context("Cannot load key")?);
@@ -153,7 +157,7 @@ async fn serve(config: Config) -> Result<()> {
         live_tx.clone(),
     ));
 
-    // Metering loop: continuous watch-time debit + entitlement.
+    // Entitlement sweep: pause watches whose trial/subscription has lapsed.
     tokio::spawn(metering::run(
         store.clone(),
         live_tx.clone(),

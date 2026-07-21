@@ -35,15 +35,19 @@ originate connections to caller-supplied destinations:
 | `/oauth/start`,`/oauth/callback` | outbound token exchange | SSRF (fixed hosts) |
 
 Mitigations:
-- **[gap] Block internal targets** in the IMAP connect path (`session::open`)
-  and the webhook path: resolve the host, and refuse if any resolved IP is
-  loopback, private (RFC1918), link-local, ULA, or the cloud metadata address
-  `169.254.169.254`. Do the check **after** DNS resolution and connect to the
-  *validated* IP to defeat DNS-rebinding.
-- **[gap] Reconsider `http://` loopback in `validate_notify_url`** for the
-  hosted deploy. It exists for local sinks/self-host; on the SaaS box it means
-  `/webhook/test` can POST to `http://127.0.0.1:<port>`. Gate it behind a config
-  flag (`allow_loopback_sinks`, default **off** in production).
+- **[LANDED] Block internal targets** — `src/guard.rs` classifies destination
+  IPs (loopback, RFC1918, IPv6 ULA, link-local incl. `169.254.169.254`,
+  unspecified, CGNAT, v4-mapped) and `resolve_allowed()` resolves a host to one
+  **validated address** that `session::open` then connects to directly
+  (rebinding-safe). `guard::check_url_host()` gates the webhook path
+  (`create_watch` + `/webhook/test`). Off by default; `[server]
+  allow_private_targets = true` opts in for self-host/dev. Unit-tested.
+- **[LANDED] `http://` loopback** now falls under the same flag: with
+  `allow_private_targets = false` (production default) a loopback webhook target
+  is refused even though `validate_notify_url` permits the `http` scheme.
+- **[gap] `/discover` + OAuth token exchange** still originate outbound requests
+  inside `io-pim-discovery` / `io-oauth` (derived, not fully arbitrary hosts);
+  guarding those needs a custom resolver in those libs — follow-up.
 - **Egress firewall** (belt-and-suspenders): allow outbound only to :993, :443,
   :80, DNS; deny the metadata IP and RFC1918 at the host/security-group level.
 - Keep the existing per-`(IP,login)` / per-IP rate limiters; add a **global**

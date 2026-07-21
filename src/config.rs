@@ -73,9 +73,9 @@ pub struct BillingConfig {
 /// Stripe configuration. `secret_key` and `webhook_secret` are **secrets** —
 /// in production inject them via systemd `LoadCredential` / a secrets manager
 /// rather than a world-readable file (see `docs/DEPLOY_HARDENING.md`). The
-/// price *lives in Stripe*: `prices` maps each pack id to a Stripe Price id
-/// created in the dashboard. Only the **secret** key is needed — hosted
-/// Checkout needs no publishable key server-side.
+/// price *lives in Stripe*: `prices` maps each plan id to a **recurring**
+/// Stripe Price id created in the dashboard. Only the **secret** key is needed
+/// — hosted Checkout needs no publishable key server-side.
 #[derive(Clone, Debug, Deserialize)]
 pub struct StripeConfig {
     /// Secret API key (`sk_test_…` in the sandbox, `sk_live_…` in production).
@@ -90,7 +90,7 @@ pub struct StripeConfig {
     /// defaults to the dashboard URL with a `?checkout=cancel` marker.
     #[serde(default)]
     pub cancel_url: Option<String>,
-    /// Pack id (`week`, `quarter`, `year`) → Stripe Price id (`price_…`).
+    /// Plan id (`month`, `year`, …) → recurring Stripe Price id (`price_…`).
     #[serde(default)]
     pub prices: BTreeMap<String, String>,
 }
@@ -122,6 +122,12 @@ pub struct ServerConfig {
     /// in addition to explicit API-triggered reconciles.
     #[serde(default = "default_reconcile_secs")]
     pub reconcile_interval_secs: u64,
+    /// Permit outbound connections (IMAP + webhooks) to loopback / private /
+    /// link-local addresses. Default `false` (the SSRF-safe posture). Set
+    /// `true` for local dev or a self-host that watches a LAN mail server or
+    /// posts to a loopback sink.
+    #[serde(default)]
+    pub allow_private_targets: bool,
 }
 
 impl Default for ServerConfig {
@@ -131,6 +137,7 @@ impl Default for ServerConfig {
             age_key_file: default_age_key(),
             max_concurrent_handshakes: default_max_handshakes(),
             reconcile_interval_secs: default_reconcile_secs(),
+            allow_private_targets: false,
         }
     }
 }

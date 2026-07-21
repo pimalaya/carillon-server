@@ -69,6 +69,15 @@ scope-limits the blast radius (read-only scopes; see §7).
 
 ## 3. Business model — prepaid, metered like pay-as-you-go
 
+> **⚠️ SUPERSEDED 2026-07-21 by §3a — a single subscription.** The watch-time
+> credits / two-counter (trial pool + paid pool) model below shipped and worked,
+> but was **too complex for the value it protected**: the cost is sub-cent per
+> mailbox/month and a watch is on-or-off, so precise time-metering bought nothing
+> while the balance/runway/pool/drain UX cost conversions. §3a replaces it with a
+> single subscription; the reasoning below is kept as the record of *why* credits
+> were tried and dropped. The **spine still holds**: prepaid (Stripe bills the
+> period up front — no arrears), gate the standing resource, testing stays free.
+
 The choice between prepaid credits and postpaid pay-as-you-go dissolves:
 **prepaid credits, debited continuously, *are* pay-as-you-go** — with postpaid's
 one flaw removed.
@@ -124,6 +133,45 @@ mailbox you have successfully authenticated to** — proof-of-control is free
 because you can't watch what you can't log into. (Same mailbox-control proof the
 plan reserved for passwordless recovery — one mechanism, two jobs.) Normalise
 aggressively (lowercase, strip plus-addressing, canonical provider domain).
+
+## 3a. Business model — a single subscription (2026-07-21, supersedes §3)
+
+Credits shipped, then lost to their own complexity. The pivot:
+
+- **A per-mailbox subscription.** Each mailbox is subscribed (and cancelled)
+  independently at `€1/month` (or `€10/year`, two months free) as a recurring
+  Stripe Price; the buyer picks the cadence per mailbox, the price lives in
+  Stripe. Chosen over one account-wide subscription (2026-07-21) because the
+  price is genuinely per-mailbox and users want to pay for the mailboxes they
+  care about, seeing each one's status distinctly. While a mailbox's
+  subscription is `active` (incl. `trialing`/`past_due` during dunning, up to the
+  period end + a short grace), its watches may run; when it lapses, the sweep
+  pauses them. (Trade-off accepted: each €1 charge carries Stripe's fixed fee
+  independently — a quantity-on-one-subscription model would amortise it, but the
+  independent-control UX won.)
+- **Entitlement is a boolean, not a balance.** `entitled = trial_active(mailbox)
+  ∨ subscription_active(account, mailbox)`. No per-second debit, no pool, no
+  runway — a light periodic **sweep** re-checks entitlement and pauses lapsed
+  watches (the same "no silent outage" notices, now `trial_ending` /
+  `watch_paused`).
+- **Why this is not worse than credits.** The only thing credits added was
+  time-granular metering, worth ~nothing when the cost is sub-cent and a watch is
+  on-or-off. A Stripe subscription **keeps the prepaid property** (the period is
+  billed up front — still no arrears, §3's decisive constraint), and is the
+  *native* model on the App Store / Play too (RevenueCat unifies all three), so
+  it also un-blocks the mobile rails credits were chosen to protect.
+- **Free trial, still un-farmable.** The per-mailbox trial survives as a
+  one-time **wall-clock window** (7 days, granted once per normalised mailbox
+  key — the §3 anti-abuse linchpin is unchanged: you only get a trial for a
+  mailbox you authenticated to). It replaces the drainable trial *pool*.
+- **Payment still stateless on our side.** Checkout binds the Stripe
+  subscription to *the account you're logged into via the link*; we persist only
+  the subscription state Stripe reports (status + period end + customer id for
+  the portal) — no balance, no PII. Cancel/upgrade go through Stripe's
+  billing portal (`/billing/portal`), not our own screens.
+
+Dropped with credits: the paid pool, auto-refill, `credit`/`auto-refill`
+endpoints, the two-counter metering loop, and the balance/runway/drain UI.
 
 ## 4. Webhook security — what we provide vs what they enforce
 
