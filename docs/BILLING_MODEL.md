@@ -72,16 +72,21 @@ high **sanity cap** as an infra DoS guard, not a tier.
   pre-assigned to a service — services *pull* from the shared pool.
 - **No refund. No expiry.** Once bought, a credit sits in the pool forever until
   spent. Its only exit is consumption by a service.
-- **Consumed on activation.** You click to spend 1 credit → that service watches
-  (IDLE push) for one month → it stops → we notify you. Activation **stacks**
-  onto any time still remaining.
+- **Consumed on activation.** You spend one or more credits at once (you choose
+  the quantity, all-or-nothing) → the service watches (IDLE push) for that many
+  months → it stops → we notify you. Activation **stacks** onto any time still
+  remaining.
 - **Manual by default.** Nothing auto-renews. A stopped service stays configured;
-  one click (and one credit) restarts it.
+  spending a credit restarts it (which also turns auto-renew on — see below).
 - **Opt-in auto-renew** (per service): at expiry, pull the next credit from the
   pool instead of stopping. **Card-free and subscription-free** — it only ever
-  spends credits already in the pool.
-- **No pause/resume billing.** The credit bought the month; there is no mid-month
-  meter to pause (the month is wall-clock).
+  spends credits already in the pool. In the SaaS UI, auto-renew is the single
+  lifecycle switch: on = keep renewing, off = ride out the paid month then stop.
+- **Pause/resume is not a billing control.** A separate *active* toggle can stop
+  webhook deliveries even mid-month (e.g. endpoint maintenance), but the paid
+  clock keeps running — the credit bought the month either way (it is wall-clock,
+  not a mid-month meter). Self-host (unmetered) uses the same toggle to freely
+  start/stop, with no credit clock.
 
 *Half-month note:* a service watched for two weeks costs the same as a full
 month. Accepted: no proration. Because the spend is a deliberate, discrete
@@ -121,12 +126,18 @@ There is **one watch mechanism** (IDLE). "Free" is just a **granted credit**, no
 a second code path:
 
 - **1 free credit per Carillon account**, gated on having **≥1 validated PIM
-  account**. Granted at the account level — *not* per PIM account, or one account
-  could mint free credits by registering aliases.
+  account** — *not* per PIM account, or one account could mint free credits by
+  registering aliases.
+- **AND ≤1 free credit per PIM account globally** (keyed by `mailbox_key`): the
+  **first Carillon account to validate a given PIM account claims** its one free
+  credit; a second account that later adds the *same* mailbox earns nothing for
+  it (and is told so). This is what lets two Carillon accounts watch the same
+  mailbox without becoming a free-credit farm. Enforced atomically in the
+  `free_credit_claim` table (see `POST /auth` → `free_credit`).
 - **Abuse barrier:** to farm another free credit you need a **new real inbox**
-  (magic-link is delivered there) **and** a **new authenticatable PIM account**.
-  Magic-link + PIM-auth-validation *are* the sybil control — no fraud engine
-  needed for a 3 € value.
+  (magic-link is delivered there) **and** a **new, not-yet-claimed authenticatable
+  PIM account**. Magic-link + PIM-auth-validation + the per-mailbox claim *are*
+  the sybil control — no fraud engine needed for a 1 € value.
 - Expiry of a free-credit month is a **hard stop**, same as any paid month.
 
 This is distinct from **free testing** (§ onboarding in `DECISIONS.md`): the

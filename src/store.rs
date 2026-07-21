@@ -125,6 +125,17 @@ CREATE TABLE IF NOT EXISTS account (
 
 CREATE INDEX IF NOT EXISTS account_email ON account (email);
 
+-- Sybil barrier for the free credit (§ BILLING_MODEL): the one welcome credit
+-- for a given PIM account (its normalised mailbox key) is claimable ONCE
+-- globally — by the first Carillon account to validate it. A second account may
+-- still watch the same mailbox, but earns no free credit for it. Keyed by
+-- mailbox_key so it can't be farmed by re-adding the same mailbox everywhere.
+CREATE TABLE IF NOT EXISTS free_credit_claim (
+  mailbox_key TEXT PRIMARY KEY,
+  account_id  TEXT NOT NULL,
+  claimed_at  INTEGER NOT NULL
+);
+
 -- Pending magic-link sign-ins: a short-lived, single-use token e-mailed to an
 -- address to prove control of it (the human identity flow). Only the SHA-256
 -- hash is stored; consumed on verify, aged out by created_at.
@@ -211,6 +222,16 @@ pub struct Watch {
     /// Whether the watch is enabled (the user's pause toggle, independent of
     /// billing).
     pub active: bool,
+}
+
+/// Outcome of [`Store::claim_free_credit`]: the welcome credit was granted, the
+/// account had already used its one credit, or this mailbox's credit was already
+/// claimed by another Carillon account (the sybil barrier fired).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreeCreditOutcome {
+    Granted,
+    AlreadyCredited,
+    AlreadyClaimed,
 }
 
 impl Watch {
@@ -503,16 +524,22 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The `(id, login, imap_host, mailbox)` of every watch — the cheap input to
-    /// the service dedup guard. A service is unique by `(login, service-type,
-    /// target)`; for an IMAP watch the target is the mailbox (folder), so one
-    /// login can run several services (INBOX, Archive, …). The `(login, host)`
-    /// normalisation into a mailbox key lives in `metering`. No decrypt, no full
-    /// row.
-    pub fn watch_identities(&self) -> Result<Vec<(String, String, String, String)>> {
+    /// The `(id, login, imap_host, mailbox)` of every watch **owned by one
+    /// account** — the cheap input to the service dedup guard, which is scoped
+    /// per Carillon account: the same account can't run the same service twice,
+    /// but two different accounts may watch the same mailbox. A service is unique
+    /// by `(login, service-type, target)`; for an IMAP watch the target is the
+    /// mailbox (folder), so one login can run several services (INBOX, Archive,
+    /// …). The `(login, host)` normalisation into a mailbox key lives in
+    /// `metering`. No decrypt, no full row.
+    pub fn account_service_identities(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<(String, String, String, String)>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT id, login, imap_host, mailbox FROM watch")?;
-        let rows = stmt.query_map([], |row| {
+        let mut stmt =
+            conn.prepare("SELECT id, login, imap_host, mailbox FROM watch WHERE account_id = ?1")?;
+        let rows = stmt.query_map([account_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -639,7 +666,9 @@ impl Store {
 
     /// Grants the one free credit (§ BILLING_MODEL) to an account exactly once,
     /// on its first validated PIM account. Idempotent (guarded by
-    /// `free_credited`); returns whether the grant fired this call.
+    /// `free_credited`); returns whether the grant fired this call. Used by the
+    /// self-host / admin-import paths, which have no sybil concern; the SaaS
+    /// `/auth` + OAuth paths use [`Store::claim_free_credit`] instead.
     pub fn grant_free_credit(&self, account_id: &str, amount: i64) -> Result<bool> {
         let n = self.lock().execute(
             "UPDATE account SET credits = credits + ?2, free_credited = 1
@@ -647,6 +676,57 @@ impl Store {
             params![account_id, amount],
         )?;
         Ok(n > 0)
+    }
+
+    /// Grants the one free credit under the sybil barrier: the account earns it
+    /// only if it hasn't already been credited AND this PIM account's
+    /// `mailbox_key` hasn't been claimed by anyone yet. Atomic (a transaction, so
+    /// two concurrent first-adds of the same mailbox can't both win). The
+    /// distinct outcomes let the caller tell the user *why* (e.g. "already
+    /// claimed by another account").
+    pub fn claim_free_credit(
+        &self,
+        account_id: &str,
+        mailbox_key: &str,
+        amount: i64,
+    ) -> Result<FreeCreditOutcome> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let credited: i64 = tx
+            .query_row(
+                "SELECT free_credited FROM account WHERE id = ?1",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if credited != 0 {
+            tx.commit()?;
+            return Ok(FreeCreditOutcome::AlreadyCredited);
+        }
+        let claimed = tx
+            .query_row(
+                "SELECT 1 FROM free_credit_claim WHERE mailbox_key = ?1",
+                [mailbox_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if claimed {
+            tx.commit()?;
+            return Ok(FreeCreditOutcome::AlreadyClaimed);
+        }
+        tx.execute(
+            "INSERT INTO free_credit_claim (mailbox_key, account_id, claimed_at)
+             VALUES (?1, ?2, ?3)",
+            params![mailbox_key, account_id, now_secs()],
+        )?;
+        tx.execute(
+            "UPDATE account SET credits = credits + ?2, free_credited = 1 WHERE id = ?1",
+            params![account_id, amount],
+        )?;
+        tx.commit()?;
+        Ok(FreeCreditOutcome::Granted)
     }
 
     /// The account bearing a magic-link email, if one exists.
@@ -715,6 +795,20 @@ impl Store {
             [account_id],
         )?;
         Ok(n > 0)
+    }
+
+    /// Spends `n` credits at once, atomically and all-or-nothing (only when the
+    /// balance covers them). Returns whether the debit happened. `n <= 0` is a
+    /// no-op that fails.
+    pub fn debit_credits(&self, account_id: &str, n: i64) -> Result<bool> {
+        if n <= 0 {
+            return Ok(false);
+        }
+        let rows = self.lock().execute(
+            "UPDATE account SET credits = credits - ?2 WHERE id = ?1 AND credits >= ?2",
+            params![account_id, n],
+        )?;
+        Ok(rows > 0)
     }
 
     // --- Magic-link sign-in ---
@@ -1170,6 +1264,41 @@ mod tests {
         assert!(store.grant_free_credit("acc", 1).unwrap()); // fires
         assert!(!store.grant_free_credit("acc", 1).unwrap()); // idempotent
         assert_eq!(store.get_account("acc").unwrap().unwrap().credits, 1);
+    }
+
+    #[test]
+    fn free_credit_is_sybil_barred_per_mailbox() {
+        let store = temp_store();
+        store.ensure_account("a", Some("a@x.test")).unwrap();
+        store.ensure_account("b", Some("b@x.test")).unwrap();
+
+        // First account to validate a mailbox earns its one credit.
+        assert_eq!(
+            store.claim_free_credit("a", "key1", 1).unwrap(),
+            FreeCreditOutcome::Granted
+        );
+        assert_eq!(store.get_account("a").unwrap().unwrap().credits, 1);
+
+        // A *different* account adding the SAME mailbox earns nothing (barred).
+        assert_eq!(
+            store.claim_free_credit("b", "key1", 1).unwrap(),
+            FreeCreditOutcome::AlreadyClaimed
+        );
+        assert_eq!(store.get_account("b").unwrap().unwrap().credits, 0);
+
+        // …but it still earns its one credit from a fresh, unclaimed mailbox.
+        assert_eq!(
+            store.claim_free_credit("b", "key2", 1).unwrap(),
+            FreeCreditOutcome::Granted
+        );
+        assert_eq!(store.get_account("b").unwrap().unwrap().credits, 1);
+
+        // An account that already has its credit never gets a second.
+        assert_eq!(
+            store.claim_free_credit("a", "key3", 1).unwrap(),
+            FreeCreditOutcome::AlreadyCredited
+        );
+        assert_eq!(store.get_account("a").unwrap().unwrap().credits, 1);
     }
 
     #[test]

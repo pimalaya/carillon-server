@@ -361,19 +361,32 @@ paths:
   /watches/{id}/activate:
     post:
       tags: [billing]
-      summary: Spend one credit to start (or extend) a service's watching
+      summary: Spend credits to start (or extend) a service's watching
       security: [{ capabilityLink: [] }]
       parameters: [{ $ref: "#/components/parameters/WatchId" }]
       description: |
-        Draws one credit from the pool to give the service (watch) a month of
-        watching (§ BILLING_MODEL); stacks onto any time still remaining. It
-        starts on the next reconcile.
+        Draws `credits` credits from the pool (default 1) to give the service
+        (watch) that many months of watching (§ BILLING_MODEL); the time stacks
+        onto any still remaining. All-or-nothing — if the pool can't cover the
+        amount nothing is spent. It starts on the next reconcile.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                credits:
+                  type: integer
+                  minimum: 1
+                  default: 1
+                  description: Credits to spend = months of watching to add.
       responses:
         "200":
-          description: "`{ id, watching_until, credits }`."
+          description: "`{ id, watching_until, credits }` (credits = pool remaining)."
           content:
             application/json: {}
-        "402": { description: No credits — buy a pack first. }
+        "402": { description: The pool can't cover it — buy a pack first. }
         "404": { description: The caller does not own that service. }
   /watches/{id}/auto-renew:
     post:
@@ -459,11 +472,13 @@ paths:
       description: |
         Notify URL must be `https://` (loopback `http://` is allowed for
         local sinks). Declaring a service is free; on the metered SaaS it only
-        starts once activated (`POST /watches/{id}/activate`, one credit). A
-        service is unique by `(login, service-type, target folder)`: a PIM
-        account may run several services (different folders), but re-adding the
-        exact same one is refused with `409`. A scoped account may watch up to
-        the fair-use cap; beyond it, `402`.
+        starts once activated (`POST /watches/{id}/activate`). Dedup is
+        **per Carillon account**: a service is unique by
+        `(account, login, service-type, target folder)` — a PIM account may run
+        several services (different folders), and *different* Carillon accounts
+        may watch the same mailbox, but re-adding the exact same one under one
+        account is refused with `409`. A scoped account may watch up to the
+        fair-use cap; beyond it, `402`.
       requestBody:
         required: true
         content:
@@ -490,7 +505,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "409":
-          description: This mailbox is already being watched.
+          description: >
+            This account already runs the same service (same folder). A
+            different account may still watch the same mailbox.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -668,11 +685,6 @@ components:
         missing:
           type: array
           items: { type: string }
-        already_watched:
-          type: boolean
-          description: >
-            Advisory — this mailbox already has a watch. Onboarding surfaces
-            it; creating the watch is a hard 409.
         error: { type: [string, "null"] }
     MailboxesRequest:
       type: object
@@ -817,3 +829,11 @@ components:
         watchable: { type: boolean }
         idle: { type: boolean }
         qresync: { type: boolean }
+        free_credit:
+          type: string
+          enum: [granted, already_credited, already_claimed]
+          description: >
+            Welcome-credit outcome for this PIM account: `granted`, the account
+            had `already_credited` used its one credit, or this mailbox's credit
+            was `already_claimed` by another Carillon account (per-mailbox_key
+            sybil barrier). Also on the OAuth callback payload.

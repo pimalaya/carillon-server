@@ -44,7 +44,7 @@ use crate::live::LiveBus;
 use crate::metering;
 use crate::oauth;
 use crate::ratelimit::RateLimiter;
-use crate::store::{OauthCredential, OauthSession, Store, Watch};
+use crate::store::{FreeCreditOutcome, OauthCredential, OauthSession, Store, Watch};
 use crate::supervisor::{self, SupervisorCmd};
 use crate::util::now_secs;
 use url::Url;
@@ -481,11 +481,6 @@ async fn oauth_callback(
     };
 
     let mailbox_key = metering::mailbox_key(&oauth_session.login, &oauth_session.imap_host);
-    // Advisory dedup hint for the wizard (create still enforces the 409).
-    let already_watched =
-        service_already_watched(&state, &mailbox_key, &oauth_session.mailbox, None)
-            .await
-            .unwrap_or(false);
     let expires = Some(now_secs() + CAPABILITY_TTL.as_secs() as i64);
     // Keep the mailbox context for the success payload before the session moves.
     let login = oauth_session.login.clone();
@@ -494,54 +489,61 @@ async fn oauth_callback(
     let mailbox = oauth_session.mailbox.clone();
 
     let store = state.store.clone();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
-        // Join the presented account, else recover the mailbox's account, else
-        // create a fresh one — the same identity flow as `/auth`.
-        let (account_id, link) = match oauth_session.account_id.clone() {
-            Some(id) => {
-                let link = random_secret();
-                store.issue_capability(&id, &link, expires)?;
-                (id, link)
-            }
-            None => match store.account_of_mailbox(&mailbox_key)? {
+    let result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(String, String, FreeCreditOutcome)> {
+            // Join the presented account, else recover the mailbox's account, else
+            // create a fresh one — the same identity flow as `/auth`.
+            let (account_id, link) = match oauth_session.account_id.clone() {
                 Some(id) => {
                     let link = random_secret();
                     store.issue_capability(&id, &link, expires)?;
                     (id, link)
                 }
-                None => {
-                    let id = random_secret();
-                    store.ensure_account(&id, None)?;
-                    let link = random_secret();
-                    store.issue_capability(&id, &link, expires)?;
-                    (id, link)
-                }
-            },
-        };
-        store.add_membership(
-            &account_id,
-            &mailbox_key,
-            &oauth_session.login,
-            &oauth_session.imap_host,
-        )?;
-        // First validated PIM account under this account earns the free credit.
-        store.grant_free_credit(&account_id, metering::FREE_CREDITS_ON_SIGNUP)?;
-        store.upsert_oauth_credential(&OauthCredential {
-            account_id: account_id.clone(),
-            mailbox_key,
-            enc_refresh_token,
-            token_endpoint: oauth_session.token_endpoint,
-            client_id: oauth_session.client_id,
-            enc_client_secret: oauth_session.enc_client_secret,
-            resource: oauth_session.resource,
-            scope: oauth_session.scope,
-        })?;
-        Ok((account_id, link))
-    })
+                None => match store.account_of_mailbox(&mailbox_key)? {
+                    Some(id) => {
+                        let link = random_secret();
+                        store.issue_capability(&id, &link, expires)?;
+                        (id, link)
+                    }
+                    None => {
+                        let id = random_secret();
+                        store.ensure_account(&id, None)?;
+                        let link = random_secret();
+                        store.issue_capability(&id, &link, expires)?;
+                        (id, link)
+                    }
+                },
+            };
+            store.add_membership(
+                &account_id,
+                &mailbox_key,
+                &oauth_session.login,
+                &oauth_session.imap_host,
+            )?;
+            // First Carillon account to validate this PIM account earns its one free
+            // credit (sybil-barred by mailbox_key; see claim_free_credit).
+            let free_credit = store.claim_free_credit(
+                &account_id,
+                &mailbox_key,
+                metering::FREE_CREDITS_ON_SIGNUP,
+            )?;
+            store.upsert_oauth_credential(&OauthCredential {
+                account_id: account_id.clone(),
+                mailbox_key,
+                enc_refresh_token,
+                token_endpoint: oauth_session.token_endpoint,
+                client_id: oauth_session.client_id,
+                enc_client_secret: oauth_session.enc_client_secret,
+                resource: oauth_session.resource,
+                scope: oauth_session.scope,
+            })?;
+            Ok((account_id, link, free_credit))
+        },
+    )
     .await;
 
     match result {
-        Ok(Ok((account_id, link))) => {
+        Ok(Ok((account_id, link, free_credit))) => {
             info!(account = %account_id, "oauth login");
             oauth_popup(
                 &state.dashboard_origin,
@@ -553,7 +555,7 @@ async fn oauth_callback(
                     "watchable": watchable,
                     "missing": missing,
                     "qresync": qresync,
-                    "already_watched": already_watched,
+                    "free_credit": free_credit_label(free_credit),
                     "login": login,
                     "imap_host": imap_host,
                     "imap_port": imap_port,
@@ -613,9 +615,6 @@ struct TestVerdict {
     qresync: bool,
     condstore: bool,
     missing: Vec<&'static str>,
-    /// Advisory: this mailbox already has a watch. Onboarding surfaces it so
-    /// the wizard can stop before activation (create is a hard `409`).
-    already_watched: bool,
     error: Option<String>,
 }
 
@@ -650,11 +649,6 @@ async fn test_connect(
     };
 
     let probe = session::probe(&state.connector, &account).await;
-    // Advisory dedup hint (never blocks the probe itself); create enforces it.
-    let mailbox_key = metering::mailbox_key(&account.login, &account.host);
-    let already_watched = service_already_watched(&state, &mailbox_key, &account.mailbox, None)
-        .await
-        .unwrap_or(false);
     let verdict = TestVerdict {
         ok: probe.watchable(),
         reachable: probe.reachable,
@@ -667,7 +661,6 @@ async fn test_connect(
         } else {
             Vec::new()
         },
-        already_watched,
         error: probe.error,
     };
 
@@ -814,20 +807,29 @@ async fn test_webhook(
     .into_response()
 }
 
-/// Whether some existing watch (other than `exclude_id`) is already the **same
-/// service**: same PIM account (normalised `login`+`host`) *and* same target
-/// mailbox (folder). A service is unique by `(login, service-type, target)`; for
-/// an IMAP watch the service-type is fixed, so this is `(mailbox_key, mailbox)`.
-/// One login may run several services (different folders); re-adding the exact
-/// same one is refused rather than silently doubled.
+/// Whether the **same account** already runs the same service (other than
+/// `exclude_id`): same PIM account (normalised `login`+`host`) *and* same target
+/// mailbox (folder). Scoped per Carillon account — a given account can't add the
+/// same service twice, but two different accounts may watch the same mailbox
+/// (each pays from its own pool). A service is unique by
+/// `(account, login, service-type, target)`; for an IMAP watch the service-type
+/// is fixed, so within an account this is `(mailbox_key, mailbox)`. `account_id`
+/// is `None` where there is no account context (e.g. the unauthenticated
+/// `/test` probe), which is never a conflict.
 async fn service_already_watched(
     state: &AppState,
+    account_id: Option<&str>,
     mailbox_key: &str,
     mailbox: &str,
     exclude_id: Option<&str>,
 ) -> Result<bool, AppError> {
+    let Some(account_id) = account_id.map(str::to_owned) else {
+        return Ok(false);
+    };
     let store = state.store.clone();
-    let identities = tokio::task::spawn_blocking(move || store.watch_identities()).await??;
+    let identities =
+        tokio::task::spawn_blocking(move || store.account_service_identities(&account_id))
+            .await??;
     let exclude = exclude_id.map(str::to_owned);
     Ok(identities.iter().any(|(id, login, host, folder)| {
         Some(id.as_str()) != exclude.as_deref()
@@ -921,16 +923,6 @@ async fn create_watch(
 
     let mailbox_key = metering::mailbox_key(&request.login, &request.imap_host);
 
-    // Dedup guard: refuse to add the *same service* twice — same PIM account and
-    // same target folder. A different folder on the same login is a distinct
-    // service and is allowed. An upsert of the *same* watch id is still allowed
-    // (edit-in-place); a new id for an existing service is not.
-    if service_already_watched(&state, &mailbox_key, &request.mailbox, Some(&request.id)).await? {
-        return Ok(conflict(
-            "this service already exists (same mailbox and folder)",
-        ));
-    }
-
     // Resolve the billing account and enforce ownership. A scoped caller
     // watches under *its own* account (the body's account_id is ignored),
     // and only a mailbox it has proven control of via `/auth` — you cannot
@@ -954,6 +946,25 @@ async fn create_watch(
             .clone()
             .unwrap_or_else(|| request.id.clone()),
     };
+
+    // Dedup guard, scoped to the resolved account: refuse to add the *same
+    // service* twice within one account — same PIM account and same target
+    // folder. A different folder is a distinct service; a *different account*
+    // watching the same mailbox is allowed. An upsert of the same watch id is
+    // still allowed (edit-in-place); a new id for an existing service is not.
+    if service_already_watched(
+        &state,
+        Some(&account_id),
+        &mailbox_key,
+        &request.mailbox,
+        Some(&request.id),
+    )
+    .await?
+    {
+        return Ok(conflict(
+            "this service already exists (same mailbox and folder)",
+        ));
+    }
 
     // Fair-use cap: a scoped account may watch up to `max_watches` distinct
     // mailboxes; beyond that it needs a volume plan (the ops/import path is
@@ -1598,8 +1609,8 @@ async fn auth(
     let store = state.store.clone();
     let login = request.login.clone();
     let host = request.imap_host.clone();
-    let result =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<(String, &'static str, String)> {
+    let result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(String, &'static str, String, FreeCreditOutcome)> {
             let mailbox_key = metering::mailbox_key(&login, &host);
             let expires = Some(now_secs() + CAPABILITY_TTL.as_secs() as i64);
 
@@ -1631,14 +1642,20 @@ async fn auth(
 
             store.add_membership(&account_id, &mailbox_key, &login, &host)?;
             store.upsert_password_credential(&account_id, &mailbox_key, &enc_password)?;
-            // First validated PIM account under this account earns the free credit.
-            store.grant_free_credit(&account_id, metering::FREE_CREDITS_ON_SIGNUP)?;
-            Ok((account_id, action, link))
-        })
-        .await;
+            // First Carillon account to validate this PIM account earns its one
+            // free credit (sybil-barred by mailbox_key; see claim_free_credit).
+            let free_credit = store.claim_free_credit(
+                &account_id,
+                &mailbox_key,
+                metering::FREE_CREDITS_ON_SIGNUP,
+            )?;
+            Ok((account_id, action, link, free_credit))
+        },
+    )
+    .await;
 
     match result {
-        Ok(Ok((account_id, action, link))) => {
+        Ok(Ok((account_id, action, link, free_credit))) => {
             info!(account = %account_id, action, "auth");
             Json(json!({
                 "account_id": account_id,
@@ -1647,10 +1664,21 @@ async fn auth(
                 "watchable": probe.watchable(),
                 "idle": probe.idle,
                 "qresync": probe.qresync,
+                "free_credit": free_credit_label(free_credit),
             }))
             .into_response()
         }
         _ => AppError(anyhow::anyhow!("auth failed")).into_response(),
+    }
+}
+
+/// Wire label for a [`FreeCreditOutcome`] — surfaced so the client can tell the
+/// user their welcome credit landed, or was already claimed by another account.
+fn free_credit_label(outcome: FreeCreditOutcome) -> &'static str {
+    match outcome {
+        FreeCreditOutcome::Granted => "granted",
+        FreeCreditOutcome::AlreadyCredited => "already_credited",
+        FreeCreditOutcome::AlreadyClaimed => "already_claimed",
     }
 }
 
@@ -1860,13 +1888,27 @@ async fn signout(State(state): State<AppState>, headers: HeaderMap) -> Response 
     Json(json!({ "status": "ok", "revoked": revoked })).into_response()
 }
 
-/// `POST /watches/{id}/activate` — spend one credit to give a service a month
-/// of watching (§ BILLING_MODEL); it stacks onto any time still remaining.
-/// `402` when the pool is empty, `404` when the caller does not own the service.
+/// Body of `POST /watches/{id}/activate`: how many credits to spend at once.
+#[derive(Deserialize)]
+struct ActivateRequest {
+    /// Credits to spend = months of watching to add. Defaults to 1.
+    #[serde(default = "default_activate_credits")]
+    credits: i64,
+}
+
+fn default_activate_credits() -> i64 {
+    1
+}
+
+/// `POST /watches/{id}/activate` — spend `credits` credits (default 1) to give a
+/// service that many months of watching (§ BILLING_MODEL); the time stacks onto
+/// any still remaining. `402` when the pool can't cover it (all-or-nothing),
+/// `404` when the caller does not own the service.
 async fn activate_watch(
     State(state): State<AppState>,
     caller: Caller,
     Path(id): Path<String>,
+    Json(request): Json<ActivateRequest>,
 ) -> Result<Response, AppError> {
     if let Some(reject) = authorize_watch(&state, &caller, &id).await? {
         return Ok(reject);
@@ -1878,6 +1920,7 @@ async fn activate_watch(
         Activated { until: i64, credits: i64 },
     }
 
+    let n = request.credits.max(1);
     let month = metering::month_secs();
     let store = state.store.clone();
     let watch_id = id.clone();
@@ -1885,7 +1928,8 @@ async fn activate_watch(
         let Some(watch) = store.get_watch(&watch_id)? else {
             return Ok(Outcome::Gone);
         };
-        if !store.debit_credit(&watch.account_id)? {
+        // All-or-nothing: never spend a partial amount the pool can't cover.
+        if !store.debit_credits(&watch.account_id, n)? {
             return Ok(Outcome::NoCredits);
         }
         // Stack onto any time still remaining, else start from now.
@@ -1894,7 +1938,7 @@ async fn activate_watch(
             .watching_until
             .filter(|until| *until > now)
             .unwrap_or(now);
-        let until = base + month;
+        let until = base + n * month;
         store.set_watch_watching_until(&watch_id, until)?;
         let credits = store
             .get_account(&watch.account_id)?
