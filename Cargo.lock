@@ -305,9 +305,11 @@ dependencies = [
  "base64",
  "hex",
  "hmac 0.13.0",
+ "io-http",
  "io-imap",
  "io-oauth",
  "io-pim-discovery",
+ "io-webdav",
  "pimalaya-stream",
  "rand 0.10.2",
  "reqwest",
@@ -1513,6 +1515,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-webdav"
+version = "0.1.0"
+dependencies = [
+ "io-http",
+ "log",
+ "quick-xml",
+ "serde",
+ "thiserror 2.0.19",
+ "url",
+]
+
+[[package]]
 name = "io_tee"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2054,6 +2068,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

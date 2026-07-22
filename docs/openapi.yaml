@@ -176,10 +176,12 @@ paths:
       security: []
       description: |
         Connects, authenticates, inspects capabilities and logs out —
-        never selecting a mailbox or spending a credit. `ok` is the green
-        light for a watch: reachable **and** authenticated **and** IDLE
-        **and** QRESYNC — not merely authenticated. Rate-limited per
-        `(client IP, login)`.
+        never selecting a mailbox or spending a credit. For IMAP, `ok` is
+        the green light for a watch: reachable **and** authenticated **and**
+        IDLE (QRESYNC is a bonus) — not merely authenticated. For CardDAV
+        (`source_kind=carddav`), it `PROPFIND`s the `carddav_url` collection
+        and `ok` means reachable **and** authenticated **and** a reported
+        sync-token. Rate-limited per `(client IP, login)`.
       requestBody:
         required: true
         content:
@@ -666,22 +668,51 @@ components:
         error: { type: string }
     TestRequest:
       type: object
-      required: [imap_host, login, password]
+      required: [imap_host, login]
       properties:
-        imap_host: { type: string }
+        source_kind:
+          type: string
+          enum: [imap, carddav]
+          default: imap
+          description: >
+            Protocol to probe. `imap` (default) probes an IMAP mailbox;
+            `carddav` probes the `carddav_url` collection instead.
+        imap_host:
+          type: string
+          description: >
+            IMAP host, or — for a CardDAV probe — the PIM-account host that
+            keys the stored credential (the collection lives in `carddav_url`).
         imap_port: { type: integer, default: 993 }
         login: { type: string }
-        password: { type: string }
+        password:
+          type: string
+          description: >
+            The credential. May be empty for a CardDAV probe that reuses the
+            PIM account's stored credential (then a capability link is required).
         mailbox: { type: string, default: INBOX }
+        carddav_url:
+          type: string
+          format: uri
+          description: "CardDAV collection URL (required when source_kind=carddav)."
     TestVerdict:
       type: object
       properties:
-        ok: { type: boolean, description: reachable && authenticated && idle && qresync }
+        ok:
+          type: boolean
+          description: >
+            The green light. IMAP: reachable && authenticated && idle.
+            CardDAV: reachable && authenticated && sync.
         reachable: { type: boolean }
         authenticated: { type: boolean }
-        idle: { type: boolean }
-        qresync: { type: boolean }
-        condstore: { type: boolean }
+        idle: { type: boolean, description: "IMAP only; false for CardDAV." }
+        qresync: { type: boolean, description: "IMAP only; false for CardDAV." }
+        condstore: { type: boolean, description: "IMAP only; false for CardDAV." }
+        sync:
+          type: boolean
+          description: >
+            CardDAV only: the collection reports a change token (RFC 6578
+            sync-token or a CalendarServer ctag), so it can be polled. False
+            for IMAP.
         missing:
           type: array
           items: { type: string }
@@ -753,27 +784,49 @@ components:
         issuer: { type: string, description: "oauth_issuer: the issuer URL" }
     CreateWatch:
       type: object
-      required: [id, imap_host, login, password, notify_url, hmac_secret]
+      required: [id, imap_host, login, notify_url, hmac_secret]
       properties:
         id: { type: string }
+        source_kind:
+          type: string
+          enum: [imap, carddav]
+          default: imap
+          description: >
+            `imap` (default) watches a mailbox over held IDLE. `carddav`
+            polls the `carddav_url` addressbook; `imap_host`/`login` then
+            carry the PIM-account identity so the mailbox key and stored
+            credential are shared with the account's IMAP membership.
         imap_host: { type: string }
         imap_port: { type: integer, default: 993 }
         login: { type: string }
-        password: { type: string }
-        mailbox: { type: string, default: INBOX }
+        password:
+          type: string
+          description: >
+            Omit to reuse the PIM account's stored credential (password from
+            `/auth`, or OAuth). Provide it to store a password on the watch.
+        mailbox:
+          type: string
+          default: INBOX
+          description: "IMAP folder, or a display name for a CardDAV addressbook."
         notify_url: { type: string, format: uri }
         hmac_secret: { type: string }
         active: { type: boolean, default: true }
+        carddav_url:
+          type: string
+          format: uri
+          description: "CardDAV collection URL (required when source_kind=carddav)."
     WatchView:
       type: object
       properties:
         id: { type: string }
+        source_kind: { type: string, enum: [imap, carddav] }
         imap_host: { type: string }
         imap_port: { type: integer }
         login: { type: string }
         mailbox: { type: string }
         notify_url: { type: string }
         active: { type: boolean }
+        carddav_url: { type: string, description: "CardDAV collection URL; absent for IMAP." }
     RotateRequest:
       type: object
       properties:
@@ -784,7 +837,12 @@ components:
       properties:
         account: { type: string }
         event: { type: string, enum: [new, flags_added, flags_removed, removed] }
-        uid: { type: integer }
+        uid:
+          type: integer
+          description: >
+            Affected IMAP UID. `0` for a CardDAV delivery, which identifies
+            the changed contact by an opaque href reference in the webhook
+            payload's `resource` field instead (flag events never occur).
         ok: { type: boolean }
         status: { type: [integer, "null"] }
         error: { type: [string, "null"] }

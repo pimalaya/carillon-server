@@ -34,6 +34,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
 use crate::billing::{self, Billing};
+use crate::carddav::session::{CardDavAccount, CardDavAuth};
 use crate::crypto::Crypto;
 use crate::delivery::{self, validate_notify_url};
 use crate::discover;
@@ -591,21 +592,31 @@ fn oauth_popup(dashboard_origin: &str, payload: serde_json::Value) -> Response {
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
 }
 
-/// Body of `POST /test`: credentials to probe, read-only.
+/// Body of `POST /test`: credentials to probe, read-only. `source_kind`
+/// selects the protocol (`imap` default, or `carddav` — which probes the
+/// `carddav_url` collection instead of an IMAP mailbox).
 #[derive(Deserialize)]
 struct TestRequest {
+    #[serde(default = "default_source_kind")]
+    source_kind: String,
     imap_host: String,
     #[serde(default = "default_port")]
     imap_port: u16,
     login: String,
+    #[serde(default)]
     password: String,
     #[serde(default = "default_mailbox")]
     mailbox: String,
+    /// CardDAV collection URL to probe (required when `source_kind=carddav`).
+    #[serde(default)]
+    carddav_url: Option<String>,
 }
 
-/// Structured verdict returned by `POST /test`. `ok` is the plan's
-/// green light: reachable + authenticated + IDLE + QRESYNC — never just
-/// auth, because a server can authenticate fine and still fail the watch.
+/// Structured verdict returned by `POST /test`. `ok` is the plan's green
+/// light. For IMAP that is reachable + authenticated + IDLE (QRESYNC is a
+/// bonus); for CardDAV it is reachable + authenticated + a reported
+/// `sync-token`. The unused capability flags are simply `false` for the
+/// other protocol.
 #[derive(Serialize)]
 struct TestVerdict {
     ok: bool,
@@ -614,6 +625,9 @@ struct TestVerdict {
     idle: bool,
     qresync: bool,
     condstore: bool,
+    /// CardDAV: the collection reports a change token (RFC 6578 sync-token
+    /// or a CalendarServer ctag), so it can be watched by polling.
+    sync: bool,
     missing: Vec<&'static str>,
     error: Option<String>,
 }
@@ -626,6 +640,7 @@ struct TestVerdict {
 async fn test_connect(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<TestRequest>,
 ) -> Response {
     let key = format!("{}|{}", peer.ip(), request.login);
@@ -638,6 +653,62 @@ async fn test_connect(
             Json(json!({ "error": "too many attempts", "retry_after": seconds })),
         )
             .into_response();
+    }
+
+    // CardDAV: probe the addressbook collection instead of an IMAP mailbox,
+    // reusing the PIM account's stored credential when no password is given
+    // (the 'Add service' flow holds a capability link, not the raw password).
+    if request.source_kind == "carddav" {
+        let Some(url) = request.carddav_url.clone() else {
+            return bad_request("carddav_url is required for a CardDAV test");
+        };
+        let auth = if !request.password.is_empty() {
+            CardDavAuth::Password(request.password.clone())
+        } else {
+            let Some(token) = bearer(&headers) else {
+                return unauthorized();
+            };
+            let account_id = match state.store.resolve_capability(&token) {
+                Ok(Some(id)) => id,
+                _ => return unauthorized(),
+            };
+            let mailbox_key = metering::mailbox_key(&request.login, &request.imap_host);
+            match state
+                .store
+                .get_password_credential(&account_id, &mailbox_key)
+            {
+                Ok(Some(enc)) => match state.crypto.decrypt(&enc) {
+                    Ok(password) => CardDavAuth::Password(password),
+                    Err(err) => return AppError(err).into_response(),
+                },
+                Ok(None) => return bad_request("no stored credential for this PIM account"),
+                Err(err) => return AppError(err).into_response(),
+            }
+        };
+
+        let account = CardDavAccount {
+            url,
+            login: request.login,
+            auth,
+        };
+        let probe = crate::carddav::session::probe(&state.connector, &account).await;
+        let verdict = TestVerdict {
+            ok: probe.watchable(),
+            reachable: probe.reachable,
+            authenticated: probe.authenticated,
+            idle: false,
+            qresync: false,
+            condstore: false,
+            sync: probe.sync,
+            missing: if probe.reachable && probe.authenticated && !probe.sync {
+                vec!["sync-collection"]
+            } else {
+                Vec::new()
+            },
+            error: probe.error,
+        };
+        info!(login = %account.login, ok = verdict.ok, "carddav test probe");
+        return Json(verdict).into_response();
     }
 
     let account = ImapAccount {
@@ -656,6 +727,7 @@ async fn test_connect(
         idle: probe.idle,
         qresync: probe.qresync,
         condstore: probe.condstore,
+        sync: false,
         missing: if probe.authenticated {
             probe.missing()
         } else {
@@ -842,24 +914,31 @@ async fn service_already_watched(
 #[derive(Serialize)]
 struct WatchView {
     id: String,
+    /// Source protocol (`imap` or `carddav`), so a client can label the row.
+    source_kind: String,
     imap_host: String,
     imap_port: u16,
     login: String,
     mailbox: String,
     notify_url: String,
     active: bool,
+    /// CardDAV collection URL (`None`/absent for IMAP).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    carddav_url: Option<String>,
 }
 
 impl From<Watch> for WatchView {
     fn from(watch: Watch) -> Self {
         Self {
             id: watch.id,
+            source_kind: watch.source_kind,
             imap_host: watch.imap_host,
             imap_port: watch.imap_port,
             login: watch.login,
             mailbox: watch.mailbox,
             notify_url: watch.notify_url,
             active: watch.active,
+            carddav_url: watch.carddav_url,
         }
     }
 }
@@ -884,6 +963,12 @@ async fn list_watches(
 #[derive(Deserialize)]
 struct CreateWatch {
     id: String,
+    /// Source protocol: `imap` (default) or `carddav`. For `carddav`,
+    /// `imap_host`/`login` carry the PIM-account identity (so the mailbox key
+    /// and stored credential are shared with the account's IMAP membership),
+    /// and `carddav_url` is the collection actually polled.
+    #[serde(default = "default_source_kind")]
+    source_kind: String,
     imap_host: String,
     #[serde(default = "default_port")]
     imap_port: u16,
@@ -901,6 +986,9 @@ struct CreateWatch {
     account_id: Option<String>,
     #[serde(default = "default_true")]
     active: bool,
+    /// CardDAV collection URL (required when `source_kind=carddav`).
+    #[serde(default)]
+    carddav_url: Option<String>,
 }
 
 async fn create_watch(
@@ -922,6 +1010,22 @@ async fn create_watch(
     }
 
     let mailbox_key = metering::mailbox_key(&request.login, &request.imap_host);
+
+    // CardDAV: the collection URL is required + https, and is the service's
+    // dedup target (two addressbooks on one account are distinct services). An
+    // IMAP service dedups on its mailbox (folder) instead.
+    if request.source_kind == "carddav" {
+        match request.carddav_url.as_deref().map(Url::parse) {
+            Some(Ok(url)) if url.scheme() == "https" => {}
+            Some(Ok(_)) => return Ok(bad_request("carddav_url must be https://")),
+            Some(Err(err)) => return Ok(bad_request(&format!("invalid carddav_url: {err}"))),
+            None => return Ok(bad_request("carddav_url is required for a CardDAV service")),
+        }
+    }
+    let dedup_target = request
+        .carddav_url
+        .clone()
+        .unwrap_or_else(|| request.mailbox.clone());
 
     // Resolve the billing account and enforce ownership. A scoped caller
     // watches under *its own* account (the body's account_id is ignored),
@@ -956,13 +1060,13 @@ async fn create_watch(
         &state,
         Some(&account_id),
         &mailbox_key,
-        &request.mailbox,
+        &dedup_target,
         Some(&request.id),
     )
     .await?
     {
         return Ok(conflict(
-            "this service already exists (same mailbox and folder)",
+            "this service already exists (same account and target)",
         ));
     }
 
@@ -1037,6 +1141,12 @@ async fn create_watch(
         watching_until: None,
         auto_renew: false,
         active: request.active,
+        source_kind: request.source_kind,
+        carddav_url: request.carddav_url,
+        // Runtime poll state: established on the first poll; the default poll
+        // interval applies (no per-service override from the API yet).
+        carddav_sync_token: None,
+        carddav_poll_secs: None,
     };
 
     let id = watch.id.clone();
@@ -2168,6 +2278,10 @@ fn default_port() -> u16 {
 
 fn default_mailbox() -> String {
     String::from("INBOX")
+}
+
+fn default_source_kind() -> String {
+    String::from("imap")
 }
 
 fn default_true() -> bool {

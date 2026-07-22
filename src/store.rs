@@ -39,7 +39,19 @@ CREATE TABLE IF NOT EXISTS watch (
   -- pool at expiry instead of stopping.
   watching_until INTEGER,
   auto_renew   INTEGER NOT NULL DEFAULT 0,
-  active       INTEGER NOT NULL DEFAULT 1
+  active       INTEGER NOT NULL DEFAULT 1,
+  -- Source protocol: 'imap' (a held IDLE connection, the default) or
+  -- 'carddav' (a polled addressbook). CardDAV columns are null for IMAP.
+  source_kind  TEXT NOT NULL DEFAULT 'imap',
+  -- CardDAV: the full collection URL the poller connects to (imap_host/login
+  -- still carry the PIM-account identity, so the mailbox key and stored
+  -- credential are shared with the account's IMAP membership).
+  carddav_url  TEXT,
+  -- CardDAV: the last RFC 6578 sync-token checkpoint (runtime state, kept
+  -- across edits, reset on re-baseline). Null until the first poll.
+  carddav_sync_token TEXT,
+  -- CardDAV: poll interval override in seconds; null uses the server default.
+  carddav_poll_secs INTEGER
 );
 
 -- Pending OAuth authorization flows: the short-lived state carried between
@@ -222,6 +234,14 @@ pub struct Watch {
     /// Whether the watch is enabled (the user's pause toggle, independent of
     /// billing).
     pub active: bool,
+    /// Source protocol: `imap` (held IDLE) or `carddav` (polled addressbook).
+    pub source_kind: String,
+    /// CardDAV collection URL the poller connects to (`None` for IMAP).
+    pub carddav_url: Option<String>,
+    /// CardDAV last sync-token checkpoint (`None` until the first poll).
+    pub carddav_sync_token: Option<String>,
+    /// CardDAV poll-interval override in seconds (`None` = server default).
+    pub carddav_poll_secs: Option<i64>,
 }
 
 /// Outcome of [`Store::claim_free_credit`]: the welcome credit was granted, the
@@ -252,6 +272,10 @@ impl Watch {
             watching_until: row.get("watching_until")?,
             auto_renew: row.get::<_, i64>("auto_renew")? != 0,
             active: row.get::<_, i64>("active")? != 0,
+            source_kind: row.get("source_kind")?,
+            carddav_url: row.get("carddav_url")?,
+            carddav_sync_token: row.get("carddav_sync_token")?,
+            carddav_poll_secs: row.get("carddav_poll_secs")?,
         })
     }
 
@@ -446,17 +470,21 @@ impl Store {
     /// [`Store::rotate_secret`]; an upsert resets it (a redefine of the
     /// watch drops any in-flight overlap).
     pub fn upsert_watch(&self, watch: &Watch) -> Result<()> {
+        // `carddav_sync_token` is deliberately not written here: it is runtime
+        // checkpoint state (like `watching_until`), preserved across an
+        // edit-in-place and set only by `set_carddav_sync_token`.
         self.lock().execute(
             "INSERT INTO watch
                (id, imap_host, imap_port, login, enc_password, mailbox, notify_url,
                 hmac_secret, hmac_secret_prev, hmac_secret_prev_expires, account_id,
-                auth_kind, active)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                auth_kind, active, source_kind, carddav_url, carddav_poll_secs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(id) DO UPDATE SET
                imap_host=?2, imap_port=?3, login=?4, enc_password=?5,
                mailbox=?6, notify_url=?7, hmac_secret=?8,
                hmac_secret_prev=?9, hmac_secret_prev_expires=?10,
-               account_id=?11, auth_kind=?12, active=?13",
+               account_id=?11, auth_kind=?12, active=?13,
+               source_kind=?14, carddav_url=?15, carddav_poll_secs=?16",
             params![
                 watch.id,
                 watch.imap_host,
@@ -471,6 +499,9 @@ impl Store {
                 watch.account_id,
                 watch.auth_kind,
                 watch.active as i64,
+                watch.source_kind,
+                watch.carddav_url,
+                watch.carddav_poll_secs,
             ],
         )?;
         Ok(())
@@ -524,21 +555,24 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The `(id, login, imap_host, mailbox)` of every watch **owned by one
+    /// The `(id, login, imap_host, target)` of every watch **owned by one
     /// account** — the cheap input to the service dedup guard, which is scoped
     /// per Carillon account: the same account can't run the same service twice,
     /// but two different accounts may watch the same mailbox. A service is unique
-    /// by `(login, service-type, target)`; for an IMAP watch the target is the
-    /// mailbox (folder), so one login can run several services (INBOX, Archive,
-    /// …). The `(login, host)` normalisation into a mailbox key lives in
-    /// `metering`. No decrypt, no full row.
+    /// by `(login, target)`; the `target` is the CardDAV collection URL for a
+    /// CardDAV watch, else the mailbox (folder) for an IMAP watch — so one login
+    /// can run several services (INBOX, Archive, an addressbook, …). The
+    /// `(login, host)` normalisation into a mailbox key lives in `metering`. No
+    /// decrypt, no full row.
     pub fn account_service_identities(
         &self,
         account_id: &str,
     ) -> Result<Vec<(String, String, String, String)>> {
         let conn = self.lock();
-        let mut stmt =
-            conn.prepare("SELECT id, login, imap_host, mailbox FROM watch WHERE account_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, login, imap_host, COALESCE(carddav_url, mailbox)
+             FROM watch WHERE account_id = ?1",
+        )?;
         let rows = stmt.query_map([account_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?;
@@ -853,6 +887,17 @@ impl Store {
         let n = self.lock().execute(
             "UPDATE watch SET watching_until = ?2 WHERE id = ?1",
             params![watch_id, until],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Checkpoints a CardDAV service's RFC 6578 sync-token after a poll
+    /// (`None` resets it, forcing a fresh baseline on the next poll). Returns
+    /// whether the watch matched.
+    pub fn set_carddav_sync_token(&self, watch_id: &str, token: Option<&str>) -> Result<bool> {
+        let n = self.lock().execute(
+            "UPDATE watch SET carddav_sync_token = ?2 WHERE id = ?1",
+            params![watch_id, token],
         )?;
         Ok(n > 0)
     }
@@ -1216,6 +1261,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("watch", "watching_until", "INTEGER"),
         ("watch", "auto_renew", "INTEGER NOT NULL DEFAULT 0"),
         ("checkout_session", "quantity", "INTEGER NOT NULL DEFAULT 0"),
+        // CardDAV source support: a second service kind alongside IMAP.
+        ("watch", "source_kind", "TEXT NOT NULL DEFAULT 'imap'"),
+        ("watch", "carddav_url", "TEXT"),
+        ("watch", "carddav_sync_token", "TEXT"),
+        ("watch", "carddav_poll_secs", "INTEGER"),
     ] {
         if !column_exists(conn, table, column)? {
             conn.execute(
@@ -1333,6 +1383,10 @@ mod tests {
             watching_until: None,
             auto_renew: false,
             active: true,
+            source_kind: "imap".into(),
+            carddav_url: None,
+            carddav_sync_token: None,
+            carddav_poll_secs: None,
         }
     }
 
@@ -1373,6 +1427,67 @@ mod tests {
         let w = store.get_watch("w1").unwrap().unwrap();
         assert_eq!(w.watching_until, Some(9_000));
         assert_eq!(w.notify_url, "https://x/new");
+    }
+
+    #[test]
+    fn carddav_service_round_trips_and_checkpoints() {
+        let store = temp_store();
+        store.ensure_account("acc", None).unwrap();
+        let mut w = watch("cd1", "acc");
+        w.source_kind = "carddav".into();
+        w.carddav_url = Some("https://dav.x/addressbooks/u/Default/".into());
+        w.mailbox = "Personal".into();
+        store.upsert_watch(&w).unwrap();
+
+        let got = store.get_watch("cd1").unwrap().unwrap();
+        assert_eq!(got.source_kind, "carddav");
+        assert_eq!(
+            got.carddav_url.as_deref(),
+            Some("https://dav.x/addressbooks/u/Default/")
+        );
+        assert_eq!(got.carddav_sync_token, None);
+
+        // The sync-token checkpoint survives an edit-in-place (like activation).
+        assert!(
+            store
+                .set_carddav_sync_token("cd1", Some("sync-42"))
+                .unwrap()
+        );
+        let mut edited = w.clone();
+        edited.notify_url = "https://x/new".into();
+        store.upsert_watch(&edited).unwrap();
+        assert_eq!(
+            store
+                .get_watch("cd1")
+                .unwrap()
+                .unwrap()
+                .carddav_sync_token
+                .as_deref(),
+            Some("sync-42")
+        );
+
+        // Resetting to None forces a fresh baseline on the next poll.
+        assert!(store.set_carddav_sync_token("cd1", None).unwrap());
+        assert_eq!(
+            store.get_watch("cd1").unwrap().unwrap().carddav_sync_token,
+            None
+        );
+    }
+
+    #[test]
+    fn dedup_target_is_the_carddav_url_for_carddav() {
+        let store = temp_store();
+        store.ensure_account("acc", None).unwrap();
+        let mut w = watch("cd", "acc");
+        w.source_kind = "carddav".into();
+        w.carddav_url = Some("https://dav.x/u/Default/".into());
+        w.mailbox = "Personal".into();
+        store.upsert_watch(&w).unwrap();
+
+        let ids = store.account_service_identities("acc").unwrap();
+        // The dedup target is the collection URL, not the display mailbox — so
+        // two addressbooks on one account are distinct services.
+        assert_eq!(ids[0].3, "https://dav.x/u/Default/");
     }
 
     #[test]

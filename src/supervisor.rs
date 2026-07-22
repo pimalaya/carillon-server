@@ -26,6 +26,8 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use crate::carddav::pump as carddav_pump;
+use crate::carddav::session::{CardDavAccount, CardDavAuth};
 use crate::crypto::Crypto;
 use crate::event::ChangeEvent;
 use crate::imap::pump;
@@ -84,6 +86,9 @@ pub struct Supervisor {
     /// Whether watching is credit-metered (SaaS, Stripe). When false (self-host
     /// / stub billing) the entitlement gate is bypassed — self-host is not billed.
     metered: bool,
+    /// Default poll interval (seconds) for CardDAV services that do not
+    /// override it. IMAP services ignore it (they hold IDLE, not poll).
+    carddav_poll_secs: u64,
 }
 
 impl Supervisor {
@@ -99,6 +104,7 @@ impl Supervisor {
         max_handshakes: usize,
         live: LiveBus,
         metered: bool,
+        carddav_poll_secs: u64,
     ) -> Self {
         Self {
             store,
@@ -109,6 +115,7 @@ impl Supervisor {
             handles: HashMap::new(),
             live,
             metered,
+            carddav_poll_secs: carddav_poll_secs.max(5),
         }
     }
 
@@ -224,13 +231,6 @@ impl Supervisor {
             };
             Credential::Password(self.crypto.decrypt(&enc)?)
         };
-        let account = ImapAccount {
-            host: watch.imap_host.clone(),
-            port: watch.imap_port,
-            login: watch.login.clone(),
-            auth: ImapAuth::Password(String::new()),
-            mailbox: watch.mailbox.clone(),
-        };
 
         let id = watch.id.clone();
         let account_id = watch.account_id.clone();
@@ -246,22 +246,66 @@ impl Supervisor {
         let store = self.store.clone();
         let crypto = self.crypto.clone();
 
-        let task = tokio::spawn(async move {
-            watch_loop(WatchLoop {
-                id,
-                account_id: loop_account,
-                account,
-                credential,
-                connector,
-                events,
-                handshake_sem,
-                shutdown: shutdown_flag,
-                live,
-                store,
-                crypto,
+        // A CardDAV service is polled (no held IDLE); everything else is IMAP.
+        let task = if watch.source_kind == "carddav" {
+            let url = watch
+                .carddav_url
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("carddav watch has no collection URL"))?;
+            let poll = watch
+                .carddav_poll_secs
+                .map(|s| s.max(5) as u64)
+                .unwrap_or(self.carddav_poll_secs);
+            let login = watch.login.clone();
+            let imap_host = watch.imap_host.clone();
+            let imap_port = watch.imap_port;
+            let initial_token = watch.carddav_sync_token.clone();
+            tokio::spawn(async move {
+                carddav_watch_loop(CardDavLoop {
+                    id,
+                    account_id: loop_account,
+                    url,
+                    login,
+                    imap_host,
+                    imap_port,
+                    initial_token,
+                    poll_secs: poll,
+                    credential,
+                    connector,
+                    events,
+                    handshake_sem,
+                    shutdown: shutdown_flag,
+                    live,
+                    store,
+                    crypto,
+                })
+                .await;
             })
-            .await;
-        });
+        } else {
+            let account = ImapAccount {
+                host: watch.imap_host.clone(),
+                port: watch.imap_port,
+                login: watch.login.clone(),
+                auth: ImapAuth::Password(String::new()),
+                mailbox: watch.mailbox.clone(),
+            };
+            tokio::spawn(async move {
+                watch_loop(WatchLoop {
+                    id,
+                    account_id: loop_account,
+                    account,
+                    credential,
+                    connector,
+                    events,
+                    handshake_sem,
+                    shutdown: shutdown_flag,
+                    live,
+                    store,
+                    crypto,
+                })
+                .await;
+            })
+        };
 
         Ok(WatcherHandle {
             shutdown,
@@ -293,12 +337,17 @@ fn stop(handle: WatcherHandle) {
 /// changing a webhook must not drop the IMAP connection.
 fn fingerprint(watch: &Watch) -> u64 {
     let mut hasher = DefaultHasher::new();
+    watch.source_kind.hash(&mut hasher);
     watch.imap_host.hash(&mut hasher);
     watch.imap_port.hash(&mut hasher);
     watch.login.hash(&mut hasher);
     watch.enc_password.hash(&mut hasher);
     watch.auth_kind.hash(&mut hasher);
     watch.mailbox.hash(&mut hasher);
+    // CardDAV connection params: a re-point or poll-rate change restarts the
+    // poller (the sync-token is runtime state, deliberately not fingerprinted).
+    watch.carddav_url.hash(&mut hasher);
+    watch.carddav_poll_secs.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -474,6 +523,163 @@ async fn watch_loop(ctx: WatchLoop) {
     }
 
     debug!(watch = %id, "watch loop exited");
+}
+
+/// Everything one CardDAV poller task needs.
+struct CardDavLoop {
+    id: String,
+    /// The billing account (for tagging live status events).
+    account_id: String,
+    /// The collection URL to poll.
+    url: String,
+    /// PIM-account login (HTTP Basic username / OAuth identity).
+    login: String,
+    /// PIM-account host + port: the identity the stored credential and any
+    /// OAuth token are keyed by (the CardDAV host lives in `url`, not here).
+    imap_host: String,
+    imap_port: u16,
+    /// Last checkpoint token loaded from the store (`None` = never synced).
+    initial_token: Option<String>,
+    /// Poll interval in seconds.
+    poll_secs: u64,
+    credential: Credential,
+    connector: TlsConnector,
+    events: mpsc::Sender<ChangeEvent>,
+    handshake_sem: Arc<Semaphore>,
+    shutdown: Arc<AtomicBool>,
+    live: LiveBus,
+    store: Arc<Store>,
+    crypto: Arc<Crypto>,
+}
+
+/// One CardDAV service's poll loop: resolve the credential, run a
+/// `sync-collection` round, checkpoint the returned token, sleep, repeat.
+/// Transport failures back off exactly like the IMAP reconnect loop. Stopped
+/// by aborting the task; the shutdown flag lets a between-polls wait exit
+/// promptly.
+async fn carddav_watch_loop(ctx: CardDavLoop) {
+    let CardDavLoop {
+        id,
+        account_id,
+        url,
+        login,
+        imap_host,
+        imap_port,
+        initial_token,
+        poll_secs,
+        credential,
+        connector,
+        events,
+        handshake_sem,
+        shutdown,
+        live,
+        store,
+        crypto,
+    } = ctx;
+
+    let status =
+        |state, detail| Routed::new(account_id.clone(), LiveEvent::status(&id, state, detail));
+    let interval = Duration::from_secs(poll_secs);
+    let mut token = initial_token;
+    let mut backoff = INITIAL_BACKOFF;
+    let mut announced = false;
+
+    while !shutdown.load(Ordering::SeqCst) {
+        // Resolve this round's credential. A password is constant; OAuth mints a
+        // fresh bearer token, keyed by the PIM identity (not the CardDAV host).
+        let auth = match &credential {
+            Credential::Password(password) => CardDavAuth::Password(password.clone()),
+            Credential::Oauth => {
+                let identity = ImapAccount {
+                    host: imap_host.clone(),
+                    port: imap_port,
+                    login: login.clone(),
+                    auth: ImapAuth::Password(String::new()),
+                    mailbox: String::new(),
+                };
+                match resolve_oauth_access(&store, &crypto, &account_id, &identity).await {
+                    Ok(token) => CardDavAuth::Bearer(token),
+                    Err(err) => {
+                        warn!(watch = %id, error = %err, "carddav oauth token refresh failed");
+                        let _ =
+                            live.send(status(WatchState::Error, Some(format!("oauth: {err:#}"))));
+                        announced = false;
+                        if shutdown.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let _ = live.send(status(WatchState::Reconnecting, None));
+                        sleep(backoff + jitter(backoff)).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        continue;
+                    }
+                }
+            }
+        };
+        let account = CardDavAccount {
+            url: url.clone(),
+            login: login.clone(),
+            auth,
+        };
+
+        match carddav_pump::poll_once(
+            &connector,
+            &account,
+            &id,
+            token.clone(),
+            &events,
+            &handshake_sem,
+        )
+        .await
+        {
+            Ok(new_token) => {
+                if !announced {
+                    info!(watch = %id, url = %url, "watching (carddav)");
+                    let _ = live.send(status(WatchState::Watching, None));
+                    announced = true;
+                }
+                backoff = INITIAL_BACKOFF;
+                if new_token != token {
+                    token = new_token.clone();
+                    let store = store.clone();
+                    let (wid, checkpoint) = (id.clone(), new_token.clone());
+                    let _ = tokio::task::spawn_blocking(move || {
+                        store.set_carddav_sync_token(&wid, checkpoint.as_deref())
+                    })
+                    .await;
+                }
+                sleep_interruptible(interval, &shutdown).await;
+            }
+            Err(err) => {
+                warn!(watch = %id, error = %err, "carddav poll failed");
+                let _ = live.send(status(WatchState::Error, Some(format!("{err:#}"))));
+                announced = false;
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let _ = live.send(status(WatchState::Reconnecting, None));
+                sleep(backoff + jitter(backoff)).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+
+    debug!(watch = %id, "carddav watch loop exited");
+}
+
+/// Sleeps for `dur`, returning within ~a second once shutdown is requested so
+/// a stopped poller does not linger a whole interval before its task is torn
+/// down.
+async fn sleep_interruptible(dur: Duration, shutdown: &Arc<AtomicBool>) {
+    let step = Duration::from_secs(1);
+    let mut left = dur;
+    while left > Duration::ZERO {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let chunk = left.min(step);
+        sleep(chunk).await;
+        left = left.saturating_sub(chunk);
+    }
 }
 
 fn jitter(base: Duration) -> Duration {

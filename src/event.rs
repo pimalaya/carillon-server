@@ -58,8 +58,24 @@ pub struct ChangeEvent {
     pub account: String,
     /// What changed.
     pub event: ChangeKind,
-    /// The affected message UID.
+    /// The affected message UID (IMAP). Omitted for sources that identify a
+    /// change by an opaque reference instead (CardDAV — see [`resource`]).
+    ///
+    /// [`resource`]: ChangeEvent::resource
+    #[serde(skip_serializing_if = "is_zero")]
     pub uid: u32,
+    /// The changed resource's opaque reference — a CardDAV member href's last
+    /// path segment. Content-free (a resource id, never card contents), the
+    /// exact analogue of an IMAP UID. `None` for IMAP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+}
+
+/// Whether a UID is zero — the sentinel for "not applicable" (a CardDAV
+/// event), so the `uid` field is dropped from that payload. IMAP UIDs are
+/// always ≥ 1, so an IMAP payload always carries it.
+fn is_zero(uid: &u32) -> bool {
+    *uid == 0
 }
 
 impl ChangeEvent {
@@ -75,22 +91,35 @@ impl ChangeEvent {
             }
             ImapMailboxWatchEvent::EnvelopeRemoved { uid } => (ChangeKind::Removed, uid.get()),
         };
-        Self::build(account.into(), kind, uid)
+        Self::build(account.into(), kind, uid, None)
     }
 
     /// A `new`-mail event for a UID, used by the IDLE-only watcher (which,
     /// lacking QRESYNC/CONDSTORE, tracks new messages only).
     pub fn new_mail(account: impl Into<String>, uid: u32) -> Self {
-        Self::build(account.into(), ChangeKind::New, uid)
+        Self::build(account.into(), ChangeKind::New, uid, None)
     }
 
-    fn build(account: String, event: ChangeKind, uid: u32) -> Self {
+    /// Folds a CardDAV addressbook change into the canonical shape. There is
+    /// no UID; the changed member is identified by its opaque `resource`
+    /// reference (its href's last segment). Only `new` (created/updated) and
+    /// `removed` occur — WebDAV has no flag concept.
+    pub fn carddav(
+        account: impl Into<String>,
+        event: ChangeKind,
+        resource: impl Into<String>,
+    ) -> Self {
+        Self::build(account.into(), event, 0, Some(resource.into()))
+    }
+
+    fn build(account: String, event: ChangeKind, uid: u32, resource: Option<String>) -> Self {
         Self {
             id: new_id(),
             ts: now_secs(),
             account,
             event,
             uid,
+            resource,
         }
     }
 }

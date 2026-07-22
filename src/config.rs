@@ -160,6 +160,11 @@ pub struct ServerConfig {
     /// reselling, not a product tier — the flat plan is "unlimited" below it.
     #[serde(default = "default_max_watches")]
     pub max_watches_per_account: usize,
+    /// Default poll interval (seconds) for CardDAV addressbook services, which
+    /// have no push and are polled for sync-token changes. A per-service
+    /// override may lower it; IMAP services ignore it (they hold IDLE).
+    #[serde(default = "default_carddav_poll_secs")]
+    pub carddav_poll_interval_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -171,6 +176,7 @@ impl Default for ServerConfig {
             reconcile_interval_secs: default_reconcile_secs(),
             allow_private_targets: false,
             max_watches_per_account: default_max_watches(),
+            carddav_poll_interval_secs: default_carddav_poll_secs(),
         }
     }
 }
@@ -350,6 +356,10 @@ fn default_reconcile_secs() -> u64 {
 
 fn default_max_watches() -> usize {
     25
+}
+
+fn default_carddav_poll_secs() -> u64 {
+    300
 }
 
 fn default_listen() -> String {

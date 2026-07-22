@@ -12,7 +12,15 @@ axum = "0.8"
 base64 = "0.22"
 hex = "0.4"
 hmac = "0.13"
+# HTTP auth primitives (Basic / Bearer) for the CardDAV client; the WebDAV
+# coroutines below carry them. Default features off — we drive the coroutines
+# over our own tokio-rustls stream, never io-http's blocking client.
+io-http = { version = "0.3", default-features = false }
 io-imap = { version = "0.2", default-features = false }
+# CardDAV addressbook watching (RFC 6578 sync-collection over the io-webdav
+# I/O-free coroutines). Path dependency onto the local crate; default features
+# off so no blocking client / pimalaya-stream is pulled in.
+io-webdav = { path = "../io-webdav", default-features = false }
 # Onboarding discovery (email/server -> IMAP config + auth methods). The
 # `rustls-ring` feature pulls in its blocking std client (`stream` ->
 # `client`); the mechanism features are IMAP-relevant only (autoconfig /

@@ -20,6 +20,7 @@
 
 mod api;
 mod billing;
+mod carddav;
 mod config;
 mod crypto;
 mod delivery;
@@ -186,6 +187,7 @@ async fn serve(config: Config) -> Result<()> {
         config.server.max_concurrent_handshakes,
         live_tx.clone(),
         metered,
+        config.server.carddav_poll_interval_secs,
     );
     let reconcile_interval = Duration::from_secs(config.server.reconcile_interval_secs.max(5));
     tokio::spawn(supervisor.run(command_rx, reconcile_interval));
@@ -318,6 +320,11 @@ fn import(config: &Config, path: &Path) -> Result<()> {
             watching_until: None,
             auto_renew: false,
             active: account.active,
+            // Import is IMAP-only today; CardDAV services are added via the API.
+            source_kind: String::from("imap"),
+            carddav_url: None,
+            carddav_sync_token: None,
+            carddav_poll_secs: None,
         };
         store.upsert_watch(&watch)?;
         store.ensure_account(id, None)?;

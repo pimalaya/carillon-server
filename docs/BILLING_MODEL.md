@@ -39,6 +39,11 @@ persist** (KMS — Carillon is a credential custodian by design) to run the watc
 **sink** is an output channel (webhook / SSE / FCM/UnifiedPush relay). Sinks are
 free fan-out per the two-axis rule (grow source protocols, never payload).
 
+**Source protocols** are the growth axis: today an IMAP mailbox (held IDLE) or a
+CardDAV addressbook (polled — WebDAV has no IDLE; see `CARDDAV.md`). Every source
+is the same billed unit — **1 credit / month** — regardless of protocol; the
+poll-vs-IDLE distinction is a cost-side detail, not a pricing one.
+
 ---
 
 ## 2. What you pay for — the service (per connection), not the account
