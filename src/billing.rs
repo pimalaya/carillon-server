@@ -35,8 +35,8 @@ type HmacSha256 = Hmac<Sha256>;
 const PACK_PRICE_KEY: &str = "pack";
 
 /// Credits per pack — the only purchase quantum (§ BILLING_MODEL: refill only
-/// in 5-credit packs).
-pub const PACK_SIZE: i64 = 5;
+/// in 4-credit packs).
+pub const PACK_SIZE: i64 = 4;
 
 /// Stripe rejects/accepts a webhook within this clock skew of its timestamp
 /// (replay-window guard), matching Stripe's own default tolerance.

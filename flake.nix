@@ -34,17 +34,27 @@
         carillon-server = inputs.self.packages.${final.stdenv.hostPlatform.system}.default;
       };
 
-      # Throwaway host for local testing WITHOUT rebuilding your OS (see
-      # docs/NIXOS.md "Testing locally"):
-      #   sudo nixos-container create carillon --flake .#container
-      # or a full VM:
-      #   nix build .#nixosConfigurations.container.config.system.build.vm
+      # Local dev/test targets (see docs/NIXOS.md "Testing locally"). Both run
+      # the module in DEV mode — no secrets, no disko, no proxy:
+      #   container: sudo nixos-container create carillon --flake .#container
+      #   vm:        nixos-rebuild build-vm --flake .#vm
+      # To rehearse the WHOLE prod host (disko + sops + Caddy), use the
+      # `watchbox` config with `nixos-anywhere --flake .#watchbox --vm-test`.
       nixosConfigurations.container = inputs.nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
         modules = [
           inputs.self.nixosModules.carillon
           { nixpkgs.overlays = [ inputs.self.overlays.default ]; }
           ./nix/container.nix
+        ];
+      };
+
+      nixosConfigurations.vm = inputs.nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          inputs.self.nixosModules.carillon
+          { nixpkgs.overlays = [ inputs.self.overlays.default ]; }
+          ./nix/vm.nix
         ];
       };
     };
