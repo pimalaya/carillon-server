@@ -6,7 +6,7 @@
 //! connections. This is the prototype's stand-in for the eventual
 //! dashboard and billing gate.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -45,7 +45,7 @@ use crate::live::LiveBus;
 use crate::metering;
 use crate::oauth;
 use crate::ratelimit::RateLimiter;
-use crate::store::{FreeCreditOutcome, OauthCredential, OauthSession, Store, Watch};
+use crate::store::{OauthCredential, OauthSession, Store, Watch};
 use crate::supervisor::{self, SupervisorCmd};
 use crate::util::now_secs;
 use url::Url;
@@ -96,6 +96,9 @@ pub struct AppState {
     pub metered: bool,
     /// Fair-use cap: max distinct mailboxes a scoped account may watch.
     pub max_watches: usize,
+    /// Default CardDAV poll interval (seconds), surfaced on `/me` so the
+    /// dashboard can show a contacts service's poll frequency.
+    pub carddav_poll_secs: u64,
     /// Optional master token granting unscoped access to every account
     /// (ops / headless self-host). `None` = no unscoped access exists;
     /// every data route is reachable only via a capability link.
@@ -123,8 +126,10 @@ pub fn router(state: AppState, ui_dir: Option<PathBuf>, cors_origin: Option<Stri
         .route("/oauth/callback", get(oauth_callback))
         .route("/test", post(test_connect))
         .route("/mailboxes", post(list_mailboxes))
+        .route("/addressbooks", post(list_addressbooks))
         .route("/webhook/test", post(test_webhook))
         .route("/auth", post(auth))
+        .route("/forget", post(forget_account))
         .route("/auth/magic/request", post(magic_request))
         .route(
             "/auth/magic/verify",
@@ -205,11 +210,16 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Body of `POST /discover`: the "put anything" identifier.
+/// Body of `POST /discover`: the "put anything" identifier + what to watch.
 #[derive(Deserialize)]
 struct DiscoverRequest {
     /// An email address, or a bare domain / server host.
     input: String,
+    /// What to watch: `email` (IMAP, the default) or `contacts` (CardDAV). The
+    /// type-first wizard picks this before discovering, so we resolve only the
+    /// relevant protocol.
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 /// `POST /discover` — resolve an email/domain/server to IMAP onboarding
@@ -239,15 +249,28 @@ async fn discover(
             .into_response();
     }
 
+    // Type-first: resolve only the requested protocol (Email→IMAP, the default;
+    // Contacts→CardDAV). Both serialize to a `choices` array shaped per kind.
+    let contacts = matches!(request.kind.as_deref(), Some("contacts") | Some("carddav"));
+    let kind_label = if contacts { "contacts" } else { "email" };
     let lookup = input.clone();
-    let choices = match tokio::task::spawn_blocking(move || discover::discover_imap(&lookup)).await
+    let choices = match tokio::task::spawn_blocking(move || {
+        if contacts {
+            serde_json::to_value(discover::discover_carddav(&lookup))
+        } else {
+            serde_json::to_value(discover::discover_imap(&lookup))
+        }
+    })
+    .await
     {
-        Ok(choices) => choices,
+        Ok(Ok(choices)) => choices,
+        Ok(Err(err)) => return AppError(anyhow::anyhow!(err)).into_response(),
         Err(err) => return AppError(anyhow::anyhow!(err)).into_response(),
     };
 
-    info!(input, count = choices.len(), "discovery");
-    Json(json!({ "input": input, "choices": choices })).into_response()
+    let count = choices.as_array().map(|choices| choices.len()).unwrap_or(0);
+    info!(input, kind = kind_label, count, "discovery");
+    Json(json!({ "input": input, "kind": kind_label, "choices": choices })).into_response()
 }
 
 /// How long a pending OAuth flow stays valid before it is pruned.
@@ -266,11 +289,19 @@ struct OauthStartRequest {
     #[serde(default)]
     scope: Option<String>,
     login: String,
+    /// For an IMAP login, the IMAP host. For a CardDAV login, the DAV host — it
+    /// keys the mailbox, matching what the poller resolves the credential by.
     imap_host: String,
     #[serde(default = "default_port")]
     imap_port: u16,
     #[serde(default = "default_mailbox")]
     mailbox: String,
+    /// What this OAuth login is for: `imap` (default) or `carddav`.
+    #[serde(default = "default_source_kind")]
+    source_kind: String,
+    /// CardDAV collection context-root URL (required when `source_kind=carddav`).
+    #[serde(default)]
+    carddav_url: Option<String>,
 }
 
 /// `POST /oauth/start` — begin an OAuth login for a mailbox. Resolves the
@@ -306,6 +337,7 @@ async fn oauth_start(
         authorization_endpoint: request.authorization_endpoint,
         token_endpoint: request.token_endpoint,
         scope: request.scope,
+        contacts: request.source_kind == "carddav",
     };
 
     let plan_redirect = redirect_uri.clone();
@@ -343,6 +375,8 @@ async fn oauth_start(
         imap_host: request.imap_host,
         imap_port: request.imap_port,
         mailbox: request.mailbox,
+        source_kind: request.source_kind,
+        carddav_url: request.carddav_url,
     };
 
     let store = state.store.clone();
@@ -452,29 +486,49 @@ async fn oauth_callback(
         );
     };
 
-    // Prove the token authenticates to IMAP (and check IDLE/QRESYNC).
-    let probe_account = ImapAccount {
-        host: oauth_session.imap_host.clone(),
-        port: oauth_session.imap_port,
-        login: oauth_session.login.clone(),
-        auth: ImapAuth::OauthBearer(tokens.access_token.clone()),
-        mailbox: oauth_session.mailbox.clone(),
+    // Prove the token authenticates. IMAP does a full probe (auth + IDLE/
+    // QRESYNC); CardDAV does a current-user-principal PROPFIND with the bearer
+    // (a DAV collection is polled, so there is no IDLE/QRESYNC to check).
+    let is_carddav = oauth_session.source_kind == "carddav";
+    let (watchable, missing, qresync) = if is_carddav {
+        let account = CardDavAccount {
+            url: oauth_session.carddav_url.clone().unwrap_or_default(),
+            login: oauth_session.login.clone(),
+            auth: CardDavAuth::Bearer(tokens.access_token.clone()),
+        };
+        let probe = crate::carddav::session::verify_auth(&state.connector, &account).await;
+        if !probe.authenticated {
+            return oauth_popup(
+                &state.dashboard_origin,
+                oauth_err(&format!(
+                    "OAuth token did not authenticate to CardDAV: {}",
+                    probe.error.unwrap_or_default()
+                )),
+            );
+        }
+        (true, Vec::<&'static str>::new(), false)
+    } else {
+        let probe_account = ImapAccount {
+            host: oauth_session.imap_host.clone(),
+            port: oauth_session.imap_port,
+            login: oauth_session.login.clone(),
+            auth: ImapAuth::OauthBearer(tokens.access_token.clone()),
+            mailbox: oauth_session.mailbox.clone(),
+        };
+        let probe = session::probe(&state.connector, &probe_account).await;
+        if !probe.authenticated {
+            return oauth_popup(
+                &state.dashboard_origin,
+                oauth_err(&format!(
+                    "OAuth token did not authenticate to IMAP: {}",
+                    probe.error.unwrap_or_default()
+                )),
+            );
+        }
+        // QRESYNC-less providers (Gmail, Yahoo, …) are still watchable, but new
+        // mail only — the UI surfaces that as a warning.
+        (probe.watchable(), probe.missing(), probe.qresync)
     };
-    let probe = session::probe(&state.connector, &probe_account).await;
-    if !probe.authenticated {
-        return oauth_popup(
-            &state.dashboard_origin,
-            oauth_err(&format!(
-                "OAuth token did not authenticate to IMAP: {}",
-                probe.error.unwrap_or_default()
-            )),
-        );
-    }
-    let watchable = probe.watchable();
-    let missing = probe.missing();
-    // QRESYNC-less providers (Gmail, Yahoo, …) are still watchable, but new
-    // mail only — the UI surfaces that as a warning.
-    let qresync = probe.qresync;
 
     let enc_refresh_token = match state.crypto.encrypt(&refresh_token) {
         Ok(enc) => enc,
@@ -490,61 +544,64 @@ async fn oauth_callback(
     let mailbox = oauth_session.mailbox.clone();
 
     let store = state.store.clone();
-    let result = tokio::task::spawn_blocking(
-        move || -> anyhow::Result<(String, String, FreeCreditOutcome)> {
-            // Join the presented account, else recover the mailbox's account, else
-            // create a fresh one — the same identity flow as `/auth`.
-            let (account_id, link) = match oauth_session.account_id.clone() {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
+        // Join the presented account, else recover the mailbox's account, else
+        // create a fresh one — the same identity flow as `/auth`.
+        let (account_id, link) = match oauth_session.account_id.clone() {
+            Some(id) => {
+                let link = random_secret();
+                store.issue_capability(&id, &link, expires)?;
+                (id, link)
+            }
+            None => match store.account_of_mailbox(&mailbox_key)? {
                 Some(id) => {
                     let link = random_secret();
                     store.issue_capability(&id, &link, expires)?;
                     (id, link)
                 }
-                None => match store.account_of_mailbox(&mailbox_key)? {
-                    Some(id) => {
-                        let link = random_secret();
-                        store.issue_capability(&id, &link, expires)?;
-                        (id, link)
-                    }
-                    None => {
-                        let id = random_secret();
-                        store.ensure_account(&id, None)?;
-                        let link = random_secret();
-                        store.issue_capability(&id, &link, expires)?;
-                        (id, link)
-                    }
-                },
-            };
-            store.add_membership(
-                &account_id,
-                &mailbox_key,
-                &oauth_session.login,
-                &oauth_session.imap_host,
-            )?;
-            // First Carillon account to validate this PIM account earns its one free
-            // credit (sybil-barred by mailbox_key; see claim_free_credit).
-            let free_credit = store.claim_free_credit(
-                &account_id,
-                &mailbox_key,
-                metering::FREE_CREDITS_ON_SIGNUP,
-            )?;
-            store.upsert_oauth_credential(&OauthCredential {
-                account_id: account_id.clone(),
-                mailbox_key,
-                enc_refresh_token,
-                token_endpoint: oauth_session.token_endpoint,
-                client_id: oauth_session.client_id,
-                enc_client_secret: oauth_session.enc_client_secret,
-                resource: oauth_session.resource,
-                scope: oauth_session.scope,
-            })?;
-            Ok((account_id, link, free_credit))
-        },
-    )
+                None => {
+                    let id = random_secret();
+                    store.ensure_account(&id, None)?;
+                    let link = random_secret();
+                    store.issue_capability(&id, &link, expires)?;
+                    (id, link)
+                }
+            },
+        };
+        // Record the membership under the login's protocol (CardDAV carries the
+        // context root as its base_url). The welcome trial is granted per-service
+        // at create_watch (§ v3), so the OAuth login itself grants nothing — it
+        // just proves + stores the credential and joins/mints the account.
+        let (protocol, base_url) = if is_carddav {
+            ("carddav", oauth_session.carddav_url.clone())
+        } else {
+            ("imap", None)
+        };
+        store.add_membership(
+            &account_id,
+            &mailbox_key,
+            protocol,
+            &oauth_session.login,
+            &oauth_session.imap_host,
+            oauth_session.imap_port,
+            base_url.as_deref(),
+        )?;
+        store.upsert_oauth_credential(&OauthCredential {
+            account_id: account_id.clone(),
+            mailbox_key,
+            enc_refresh_token,
+            token_endpoint: oauth_session.token_endpoint,
+            client_id: oauth_session.client_id,
+            enc_client_secret: oauth_session.enc_client_secret,
+            resource: oauth_session.resource,
+            scope: oauth_session.scope,
+        })?;
+        Ok((account_id, link))
+    })
     .await;
 
     match result {
-        Ok(Ok((account_id, link, free_credit))) => {
+        Ok(Ok((account_id, link))) => {
             info!(account = %account_id, "oauth login");
             oauth_popup(
                 &state.dashboard_origin,
@@ -556,7 +613,6 @@ async fn oauth_callback(
                     "watchable": watchable,
                     "missing": missing,
                     "qresync": qresync,
-                    "free_credit": free_credit_label(free_credit),
                     "login": login,
                     "imap_host": imap_host,
                     "imap_port": imap_port,
@@ -879,35 +935,132 @@ async fn test_webhook(
     .into_response()
 }
 
-/// Whether the **same account** already runs the same service (other than
-/// `exclude_id`): same PIM account (normalised `login`+`host`) *and* same target
-/// mailbox (folder). Scoped per Carillon account — a given account can't add the
-/// same service twice, but two different accounts may watch the same mailbox
-/// (each pays from its own pool). A service is unique by
-/// `(account, login, service-type, target)`; for an IMAP watch the service-type
-/// is fixed, so within an account this is `(mailbox_key, mailbox)`. `account_id`
-/// is `None` where there is no account context (e.g. the unauthenticated
-/// `/test` probe), which is never a conflict.
-async fn service_already_watched(
-    state: &AppState,
-    account_id: Option<&str>,
-    mailbox_key: &str,
-    mailbox: &str,
-    exclude_id: Option<&str>,
-) -> Result<bool, AppError> {
-    let Some(account_id) = account_id.map(str::to_owned) else {
-        return Ok(false);
+/// Body of `POST /addressbooks`: the CardDAV account to list collections on.
+/// Like `/mailboxes`, an empty `password` reuses the account's stored credential
+/// (requires a capability link scoping the caller).
+#[derive(Deserialize)]
+struct AddressbooksRequest {
+    /// CardDAV context-root URL (from discovery, or the account's stored one).
+    carddav_url: String,
+    login: String,
+    #[serde(default)]
+    password: String,
+}
+
+/// `POST /addressbooks` — the CardDAV target picker: list an account's
+/// addressbook collections (current-user-principal → home-set → collections,
+/// following redirects). Content-free (hrefs + display names only). Rate-limited
+/// per `(IP, login)`, same as `/mailboxes`. Returns `{ addressbooks: [{ name, url }] }`.
+async fn list_addressbooks(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<AddressbooksRequest>,
+) -> Response {
+    let key = format!("{}|{}", peer.ip(), request.login);
+    if let Err(retry_after) = state.test_limiter.check(&key) {
+        let seconds = retry_after.as_secs().max(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", seconds.to_string())],
+            Json(json!({ "error": "too many attempts", "retry_after": seconds })),
+        )
+            .into_response();
+    }
+
+    // Resolve the credential: an explicit password, else (empty) the account's
+    // stored one — keyed by the identity (host from the DAV URL). Empty falls
+    // back to a stored password credential, then to OAuth (mint a fresh bearer
+    // from the refresh token) — exactly as the poller and `/mailboxes` do.
+    let host = Url::parse(&request.carddav_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let auth = if !request.password.is_empty() {
+        CardDavAuth::Password(request.password.clone())
+    } else {
+        let Some(token) = bearer(&headers) else {
+            return unauthorized();
+        };
+        let account_id = match state.store.resolve_capability(&token) {
+            Ok(Some(id)) => id,
+            _ => return unauthorized(),
+        };
+        let mailbox_key = metering::mailbox_key(&request.login, &host);
+        match state
+            .store
+            .get_password_credential(&account_id, &mailbox_key)
+        {
+            Ok(Some(enc)) => match state.crypto.decrypt(&enc) {
+                Ok(password) => CardDavAuth::Password(password),
+                Err(err) => return AppError(err).into_response(),
+            },
+            Ok(None) => {
+                // OAuth account: mint a bearer from the stored refresh token,
+                // keyed by the DAV identity (host from the URL).
+                let identity = ImapAccount {
+                    host: host.clone(),
+                    port: 443,
+                    login: request.login.clone(),
+                    auth: ImapAuth::Password(String::new()),
+                    mailbox: String::new(),
+                };
+                match supervisor::resolve_oauth_access(
+                    &state.store,
+                    &state.crypto,
+                    &account_id,
+                    &identity,
+                )
+                .await
+                {
+                    Ok(token) => CardDavAuth::Bearer(token),
+                    Err(err) => {
+                        return bad_request(&format!("cannot authenticate account: {err:#}"));
+                    }
+                }
+            }
+            Err(err) => return AppError(err).into_response(),
+        }
+    };
+
+    let account = CardDavAccount {
+        url: request.carddav_url,
+        login: request.login,
+        auth,
+    };
+    match crate::carddav::session::list_addressbooks(&state.connector, &account).await {
+        Ok(addressbooks) => Json(json!({ "addressbooks": addressbooks })).into_response(),
+        Err(err) => bad_request(&format!("cannot list addressbooks: {err:#}")),
+    }
+}
+
+/// Body of `POST /forget`: which PIM account to forget.
+#[derive(Deserialize)]
+struct ForgetRequest {
+    mailbox_key: String,
+    protocol: String,
+}
+
+/// `POST /forget` — forget a PIM account: remove its membership + every service
+/// under it, and drop the shared credential when no other protocol of the same
+/// identity remains (§ SERVICE_MODEL). Scoped to the caller's account.
+async fn forget_account(
+    State(state): State<AppState>,
+    caller: Caller,
+    Json(request): Json<ForgetRequest>,
+) -> Result<Response, AppError> {
+    let Some(account_id) = caller.scope() else {
+        return Ok(forbidden(
+            "a capability link is required to forget an account",
+        ));
     };
     let store = state.store.clone();
-    let identities =
-        tokio::task::spawn_blocking(move || store.account_service_identities(&account_id))
-            .await??;
-    let exclude = exclude_id.map(str::to_owned);
-    Ok(identities.iter().any(|(id, login, host, folder)| {
-        Some(id.as_str()) != exclude.as_deref()
-            && metering::mailbox_key(login, host) == mailbox_key
-            && folder == mailbox
-    }))
+    let removed = tokio::task::spawn_blocking(move || {
+        store.forget_account(&account_id, &request.mailbox_key, &request.protocol)
+    })
+    .await??;
+    state.commands.send(SupervisorCmd::Reconcile).await.ok();
+    Ok(Json(json!({ "status": "ok", "removed": removed.len() })).into_response())
 }
 
 /// Public view of a watch: never the password or HMAC secret.
@@ -919,6 +1072,10 @@ struct WatchView {
     imap_host: String,
     imap_port: u16,
     login: String,
+    /// The provider domain (registrable domain of the server host, e.g.
+    /// `fastmail.com`) — what the front end labels the service by. Falls back to
+    /// the host-derived value for rows predating the column.
+    provider: String,
     mailbox: String,
     notify_url: String,
     active: bool,
@@ -929,12 +1086,18 @@ struct WatchView {
 
 impl From<Watch> for WatchView {
     fn from(watch: Watch) -> Self {
+        let provider = if watch.provider.is_empty() {
+            metering::provider_domain(&watch.imap_host)
+        } else {
+            watch.provider
+        };
         Self {
             id: watch.id,
             source_kind: watch.source_kind,
             imap_host: watch.imap_host,
             imap_port: watch.imap_port,
             login: watch.login,
+            provider,
             mailbox: watch.mailbox,
             notify_url: watch.notify_url,
             active: watch.active,
@@ -1012,8 +1175,7 @@ async fn create_watch(
     let mailbox_key = metering::mailbox_key(&request.login, &request.imap_host);
 
     // CardDAV: the collection URL is required + https, and is the service's
-    // dedup target (two addressbooks on one account are distinct services). An
-    // IMAP service dedups on its mailbox (folder) instead.
+    // collection URL (two addressbooks on one account are distinct services).
     if request.source_kind == "carddav" {
         match request.carddav_url.as_deref().map(Url::parse) {
             Some(Ok(url)) if url.scheme() == "https" => {}
@@ -1022,26 +1184,34 @@ async fn create_watch(
             None => return Ok(bad_request("carddav_url is required for a CardDAV service")),
         }
     }
-    let dedup_target = request
-        .carddav_url
-        .clone()
-        .unwrap_or_else(|| request.mailbox.clone());
 
     // Resolve the billing account and enforce ownership. A scoped caller
-    // watches under *its own* account (the body's account_id is ignored),
-    // and only a mailbox it has proven control of via `/auth` — you cannot
-    // watch what you cannot log into (the anti-farming linchpin, § DEC 3).
-    // The unscoped admin may place the watch in any account (ops / import).
+    // watches under *its own* account (the body's account_id is ignored). The
+    // credential now lives on the service (§ SERVICE_MODEL v3): a create that
+    // carries a password is self-proving — the wizard just validated it (POST
+    // /test + the target listing) and it is stored on the watch, so no prior
+    // membership is required. Only the credential-reuse path (empty password → a
+    // stored OAuth credential, proven at /oauth/callback) still requires a
+    // recorded membership: you cannot reuse a credential you never proved. The
+    // unscoped admin may place the watch in any account (ops / import).
     let account_id = match caller.scope() {
         Some(account_id) => {
-            let store = state.store.clone();
-            let (owner, key) = (account_id.clone(), mailbox_key.clone());
-            let proven =
-                tokio::task::spawn_blocking(move || store.mailbox_belongs(&owner, &key)).await??;
-            if !proven {
-                return Ok(forbidden(
-                    "authenticate this mailbox first (POST /auth) before watching it",
-                ));
+            if request.password.is_empty() {
+                let store = state.store.clone();
+                let (owner, key, proto) = (
+                    account_id.clone(),
+                    mailbox_key.clone(),
+                    request.source_kind.clone(),
+                );
+                let proven = tokio::task::spawn_blocking(move || {
+                    store.mailbox_belongs(&owner, &key, &proto)
+                })
+                .await??;
+                if !proven {
+                    return Ok(forbidden(
+                        "provide the mailbox password, or sign in with OAuth first",
+                    ));
+                }
             }
             account_id
         }
@@ -1051,24 +1221,11 @@ async fn create_watch(
             .unwrap_or_else(|| request.id.clone()),
     };
 
-    // Dedup guard, scoped to the resolved account: refuse to add the *same
-    // service* twice within one account — same PIM account and same target
-    // folder. A different folder is a distinct service; a *different account*
-    // watching the same mailbox is allowed. An upsert of the same watch id is
-    // still allowed (edit-in-place); a new id for an existing service is not.
-    if service_already_watched(
-        &state,
-        Some(&account_id),
-        &mailbox_key,
-        &dedup_target,
-        Some(&request.id),
-    )
-    .await?
-    {
-        return Ok(conflict(
-            "this service already exists (same account and target)",
-        ));
-    }
+    // No same-target dedup: a user may knowingly add the same folder /
+    // addressbook twice (e.g. two webhook endpoints for it) and simply pay for
+    // each — a second identical service is a deliberate choice, not an error. An
+    // upsert of the same watch id still edits in place. (Only the fair-use cap
+    // below bounds the number of distinct mailboxes.)
 
     // Fair-use cap: a scoped account may watch up to `max_watches` distinct
     // mailboxes; beyond that it needs a volume plan (the ops/import path is
@@ -1090,10 +1247,11 @@ async fn create_watch(
         }
     }
 
-    // Credential kind. An explicit password is stored on the watch (self-host /
-    // import). Otherwise the service reuses the credential already on the PIM
-    // account (§ BILLING_MODEL): a stored password (from `/auth`) or an OAuth
-    // credential (from `/oauth/callback`); the supervisor resolves it per connect.
+    // Credential kind (§ SERVICE_MODEL v3: the credential lives on the service).
+    // An explicit password is stored on the watch. An empty password reuses a
+    // stored OAuth credential for this `(account, mailbox)` (proven at
+    // `/oauth/callback`) — the only shared credential left; the supervisor
+    // resolves it per connect.
     let (auth_kind, enc_password) = if !request.password.is_empty() {
         (
             "password".to_string(),
@@ -1102,26 +1260,22 @@ async fn create_watch(
     } else {
         let store = state.store.clone();
         let (owner, key) = (account_id.clone(), mailbox_key.clone());
-        let kind = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<&'static str>> {
-            if store.get_password_credential(&owner, &key)?.is_some() {
-                Ok(Some("password"))
-            } else if store.get_oauth_credential(&owner, &key)?.is_some() {
-                Ok(Some("oauth"))
-            } else {
-                Ok(None)
-            }
+        let has_oauth = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            Ok(store.get_oauth_credential(&owner, &key)?.is_some())
         })
         .await??;
-        match kind {
-            Some(kind) => (kind.to_string(), String::new()),
-            None => {
-                return Ok(bad_request(
-                    "no credential for this PIM account — add the account (POST /auth or OAuth) first",
-                ));
-            }
+        if has_oauth {
+            ("oauth".to_string(), String::new())
+        } else {
+            return Ok(bad_request(
+                "no credential for this service — provide a password, or sign in with OAuth first",
+            ));
         }
     };
 
+    // The provider domain (registrable domain of the server host) is stamped on
+    // the watch and reused for the trial gate + the create response.
+    let provider = metering::provider_domain(&request.imap_host);
     let watch = Watch {
         id: request.id,
         imap_host: request.imap_host,
@@ -1134,6 +1288,7 @@ async fn create_watch(
         hmac_secret_prev: None,
         hmac_secret_prev_expires: None,
         account_id: account_id.clone(),
+        provider: provider.clone(),
         auth_kind,
         // Not activated yet: on the metered SaaS the service starts only after
         // `POST /watches/{id}/activate` spends a credit (upsert leaves these,
@@ -1151,19 +1306,36 @@ async fn create_watch(
 
     let id = watch.id.clone();
     let store = state.store.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let claim_account = account_id.clone();
+    // Free-trial head start (§ SERVICE_MODEL v3): the account's FIRST service on a
+    // provider auto-watches free for a week — no credit spent, no separate
+    // 'activate' step. Gated per (account, provider domain): the provider is the
+    // registrable domain of the server host, so an account's mail (imap.…) and
+    // contacts (carddav.…) hosts share one provider and only the first earns it.
+    // It is time-on-THIS-service, not a fungible credit, so it can't be farmed.
+    // `watching_until` is runtime state upsert_watch doesn't write, set it after.
+    let claim_provider = provider.clone();
+    let free_trial = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         store.upsert_watch(&watch)?;
-        store.ensure_account(&account_id, None)?;
-        store.grant_free_credit(&account_id, metering::FREE_CREDITS_ON_SIGNUP)?;
-        Ok(())
+        store.ensure_account(&claim_account, None)?;
+        let granted = store.claim_free_trial(&claim_account, &claim_provider)?;
+        if granted {
+            store.set_watch_watching_until(&watch.id, now_secs() + metering::free_trial_secs())?;
+        }
+        Ok(granted)
     })
     .await??;
-    info!(watch = %id, "watch created");
+    info!(watch = %id, free_trial, provider = %provider, "watch created");
 
     state.commands.send(SupervisorCmd::Reconcile).await.ok();
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "status": "ok", "id": id })),
+        Json(json!({
+            "status": "ok",
+            "id": id,
+            "free_trial": free_trial,
+            "provider": provider,
+        })),
     )
         .into_response())
 }
@@ -1438,6 +1610,8 @@ async fn events(
 struct MailboxView {
     /// The PIM account key (normalised login) this slot belongs to.
     mailbox_key: String,
+    /// Source protocol of this PIM account (`imap` / `carddav`).
+    protocol: String,
     /// The service (watch) on this PIM account, or null (proven, no service yet).
     watch_id: Option<String>,
     /// The watched target — the IMAP mailbox (folder) — that distinguishes
@@ -1524,16 +1698,19 @@ fn account_view(store: &Store, id: &str, now: i64) -> anyhow::Result<AccountView
     });
 
     // One slot per service (watch), carrying its activation state — a PIM account
-    // may have several. Then any PIM account with no service yet (a slot the user
-    // can add a service to).
-    let mut with_service: BTreeMap<String, ()> = BTreeMap::new();
+    // may have several. Then any PIM account (identity+protocol) with no service
+    // yet (a slot the user can add a service to). Keyed per (mailbox_key,
+    // protocol) so, e.g., an Email account with a service and a Contacts account
+    // without one both surface.
+    let mut with_service: BTreeSet<(String, String)> = BTreeSet::new();
     let mut mailboxes: Vec<MailboxView> = store
         .watches_by_account(id)?
         .into_iter()
         .map(|watch| {
             let mailbox_key = metering::mailbox_key(&watch.login, &watch.imap_host);
-            with_service.insert(mailbox_key.clone(), ());
+            with_service.insert((mailbox_key.clone(), watch.source_kind.clone()));
             MailboxView {
+                protocol: watch.source_kind,
                 watch_id: Some(watch.id),
                 mailbox: Some(watch.mailbox),
                 watching_until: watch.watching_until,
@@ -1544,8 +1721,9 @@ fn account_view(store: &Store, id: &str, now: i64) -> anyhow::Result<AccountView
         })
         .collect();
     for member in store.memberships(id)? {
-        if !with_service.contains_key(&member.mailbox_key) {
+        if !with_service.contains(&(member.mailbox_key.clone(), member.protocol.clone())) {
             mailboxes.push(MailboxView {
+                protocol: member.protocol,
                 watch_id: None,
                 mailbox: None,
                 watching_until: None,
@@ -1657,9 +1835,15 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-/// Body of `POST /auth`: prove control of a mailbox.
+/// Body of `POST /auth`: prove control of a PIM account (identity + protocol).
 #[derive(Deserialize)]
 struct AuthRequest {
+    /// `imap` (default) or `carddav`. The credential is validated the right way
+    /// (IMAP LOGIN vs CardDAV PROPFIND) and the proven `(identity, protocol)`
+    /// becomes a PIM account.
+    #[serde(default = "default_source_kind")]
+    protocol: String,
+    #[serde(default)]
     imap_host: String,
     #[serde(default = "default_port")]
     imap_port: u16,
@@ -1667,13 +1851,17 @@ struct AuthRequest {
     password: String,
     #[serde(default = "default_mailbox")]
     mailbox: String,
+    /// CardDAV context-root URL (required when `protocol=carddav`).
+    #[serde(default)]
+    carddav_url: Option<String>,
 }
 
-/// `POST /auth` — the login-less identity flow. Authenticating proves
-/// control of a mailbox; the first auth creates an account and mints its
-/// capability link, a re-auth to a member mailbox recovers (re-mints) the
-/// account's link, and an auth carrying a valid link adds the mailbox to
-/// that account. Rate-limited per `(IP, login)` — the one oracle surface.
+/// `POST /auth` — the login-less identity flow. Authenticating proves control of
+/// a PIM account (identity + protocol); the first auth creates a Carillon
+/// account and mints its capability link, a re-auth to a member identity
+/// recovers (re-mints) the link, and an auth carrying a valid link adds the PIM
+/// account to it. The credential is stored per identity (shared across an
+/// identity's protocols). Rate-limited per `(IP, login)`.
 async fn auth(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1692,24 +1880,64 @@ async fn auth(
             .into_response();
     }
 
-    let account = ImapAccount {
-        host: request.imap_host.clone(),
-        port: request.imap_port,
-        login: request.login.clone(),
-        auth: ImapAuth::Password(request.password.clone()),
-        mailbox: request.mailbox,
+    // Validate the credential the right way and derive the membership's server
+    // info (host/port/base_url) per protocol.
+    let is_carddav = request.protocol == "carddav";
+    let (authenticated, error, watchable, idle, qresync, host, port, base_url) = if is_carddav {
+        let Some(url) = request.carddav_url.clone() else {
+            return bad_request("carddav_url is required for a contacts account");
+        };
+        let account = CardDavAccount {
+            url: url.clone(),
+            login: request.login.clone(),
+            auth: CardDavAuth::Password(request.password.clone()),
+        };
+        let probe = crate::carddav::session::verify_auth(&state.connector, &account).await;
+        let host = Url::parse(&url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_default();
+        (
+            probe.authenticated,
+            probe.error.clone(),
+            probe.reachable && probe.authenticated,
+            false,
+            false,
+            host,
+            443u16,
+            Some(url),
+        )
+    } else {
+        let account = ImapAccount {
+            host: request.imap_host.clone(),
+            port: request.imap_port,
+            login: request.login.clone(),
+            auth: ImapAuth::Password(request.password.clone()),
+            mailbox: request.mailbox.clone(),
+        };
+        let probe = session::probe(&state.connector, &account).await;
+        (
+            probe.authenticated,
+            probe.error.clone(),
+            probe.watchable(),
+            probe.idle,
+            probe.qresync,
+            request.imap_host.clone(),
+            request.imap_port,
+            None,
+        )
     };
-    let probe = session::probe(&state.connector, &account).await;
-    if !probe.authenticated {
+
+    if !authenticated {
         return (
             StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "authentication failed", "detail": probe.error })),
+            Json(json!({ "error": "authentication failed", "detail": error })),
         )
             .into_response();
     }
 
-    // The proven password becomes the PIM account's credential (§ BILLING_MODEL:
-    // the credential lives on the PIM account) — reused when adding services.
+    // The proven password becomes the identity's credential (§ SERVICE_MODEL:
+    // shared across its protocols) — reused when adding services.
     let enc_password = match state.crypto.encrypt(&request.password) {
         Ok(enc) => enc,
         Err(err) => return AppError(err).into_response(),
@@ -1718,14 +1946,16 @@ async fn auth(
     let existing = bearer(&headers);
     let store = state.store.clone();
     let login = request.login.clone();
-    let host = request.imap_host.clone();
-    let result = tokio::task::spawn_blocking(
-        move || -> anyhow::Result<(String, &'static str, String, FreeCreditOutcome)> {
-            let mailbox_key = metering::mailbox_key(&login, &host);
+    let protocol = request.protocol.clone();
+    let membership_host = host;
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(String, &'static str, String)> {
+            let mailbox_key = metering::mailbox_key(&login, &membership_host);
             let expires = Some(now_secs() + CAPABILITY_TTL.as_secs() as i64);
 
             // Join the account the presented link controls, else recover the
-            // account this mailbox already belongs to, else create a new one.
+            // account this identity already belongs to, else create a new one.
+            // Recovery is protocol-blind (any protocol proves the identity).
             let joined = match &existing {
                 Some(token) => store
                     .resolve_capability(token)?
@@ -1750,45 +1980,38 @@ async fn auth(
                 },
             };
 
-            store.add_membership(&account_id, &mailbox_key, &login, &host)?;
-            store.upsert_password_credential(&account_id, &mailbox_key, &enc_password)?;
-            // First Carillon account to validate this PIM account earns its one
-            // free credit (sybil-barred by mailbox_key; see claim_free_credit).
-            let free_credit = store.claim_free_credit(
+            store.add_membership(
                 &account_id,
                 &mailbox_key,
-                metering::FREE_CREDITS_ON_SIGNUP,
+                &protocol,
+                &login,
+                &membership_host,
+                port,
+                base_url.as_deref(),
             )?;
-            Ok((account_id, action, link, free_credit))
-        },
-    )
-    .await;
+            store.upsert_password_credential(&account_id, &mailbox_key, &enc_password)?;
+            // No welcome credit here (§ SERVICE_MODEL v3): the free head start is
+            // a per-service trial granted at create_watch, not a fungible credit —
+            // so this endpoint can't be farmed for spendable credits.
+            Ok((account_id, action, link))
+        })
+        .await;
 
     match result {
-        Ok(Ok((account_id, action, link, free_credit))) => {
-            info!(account = %account_id, action, "auth");
+        Ok(Ok((account_id, action, link))) => {
+            info!(account = %account_id, action, protocol = %request.protocol, "auth");
             Json(json!({
                 "account_id": account_id,
                 "action": action,
                 "link": link,
-                "watchable": probe.watchable(),
-                "idle": probe.idle,
-                "qresync": probe.qresync,
-                "free_credit": free_credit_label(free_credit),
+                "protocol": request.protocol,
+                "watchable": watchable,
+                "idle": idle,
+                "qresync": qresync,
             }))
             .into_response()
         }
         _ => AppError(anyhow::anyhow!("auth failed")).into_response(),
-    }
-}
-
-/// Wire label for a [`FreeCreditOutcome`] — surfaced so the client can tell the
-/// user their welcome credit landed, or was already claimed by another account.
-fn free_credit_label(outcome: FreeCreditOutcome) -> &'static str {
-    match outcome {
-        FreeCreditOutcome::Granted => "granted",
-        FreeCreditOutcome::AlreadyCredited => "already_credited",
-        FreeCreditOutcome::AlreadyClaimed => "already_claimed",
     }
 }
 
@@ -1961,12 +2184,22 @@ async fn me(
 ) -> Result<Response, AppError> {
     let store = state.store.clone();
     let metered = state.metered;
+    let carddav_poll_secs = state.carddav_poll_secs;
     let body = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         let balance = account_view(&store, &account_id, now_secs())?;
         let mailboxes: Vec<_> = store
             .memberships(&account_id)?
             .into_iter()
-            .map(|m| json!({ "mailbox_key": m.mailbox_key, "login": m.login, "imap_host": m.imap_host }))
+            .map(|m| {
+                json!({
+                    "mailbox_key": m.mailbox_key,
+                    "protocol": m.protocol,
+                    "login": m.login,
+                    "imap_host": m.imap_host,
+                    "imap_port": m.imap_port,
+                    "base_url": m.base_url,
+                })
+            })
             .collect();
         let watches: Vec<WatchView> = store
             .watches_by_account(&account_id)?
@@ -1979,6 +2212,7 @@ async fn me(
             "watches": watches,
             "balance": balance,
             "metered": metered,
+            "carddav_poll_secs": carddav_poll_secs,
         }))
     })
     .await??;
@@ -2215,10 +2449,6 @@ fn bad_request(message: &str) -> Response {
 
 fn forbidden(message: &str) -> Response {
     (StatusCode::FORBIDDEN, Json(json!({ "error": message }))).into_response()
-}
-
-fn conflict(message: &str) -> Response {
-    (StatusCode::CONFLICT, Json(json!({ "error": message }))).into_response()
 }
 
 /// `402` — the pool is empty; buy a pack of credits before activating a service.

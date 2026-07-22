@@ -28,6 +28,11 @@ CREATE TABLE IF NOT EXISTS watch (
   hmac_secret_prev         TEXT,
   hmac_secret_prev_expires INTEGER,
   account_id   TEXT NOT NULL DEFAULT '',
+  -- The provider domain this service is grouped + trial-gated under: the
+  -- registrable domain of the server host (e.g. `fastmail.com` for both an
+  -- account's imap. and carddav. hosts). Stamped at create; the front end uses
+  -- it for every provider label. Empty on rows predating the column.
+  provider     TEXT NOT NULL DEFAULT '',
   last_metered INTEGER,
   -- 'password' (enc_password) or 'oauth' (the oauth_credential for the
   -- watch's (account_id, mailbox_key)).
@@ -72,6 +77,11 @@ CREATE TABLE IF NOT EXISTS oauth_session (
   imap_host      TEXT NOT NULL,
   imap_port      INTEGER NOT NULL,
   mailbox        TEXT NOT NULL,
+  -- Source protocol this OAuth login is for: 'imap' (default) or 'carddav'. For
+  -- carddav, `imap_host` carries the DAV host (so the mailbox key matches what
+  -- the poller resolves) and `carddav_url` the collection context root.
+  source_kind    TEXT NOT NULL DEFAULT 'imap',
+  carddav_url    TEXT,
   created_at     INTEGER NOT NULL
 );
 
@@ -167,17 +177,24 @@ CREATE TABLE IF NOT EXISTS capability (
   expires_at INTEGER
 );
 
--- Mailbox membership = a **PIM account** (§ BILLING_MODEL): a credential the
--- user has proven control of (by authenticating), grouped under one Carillon
--- account. It is the ownership/credential unit; billing is per **service**
--- (watch) under it, not per membership.
+-- A **PIM account** (§ SERVICE_MODEL): a proven `(identity, protocol, server)`
+-- connection under one Carillon account, keyed by `(account_id, mailbox_key,
+-- protocol)`. The **credential** is keyed to the identity (mailbox_key) and
+-- SHARED across an identity's protocols (one Fastmail app-password serves IMAP +
+-- CardDAV) — see password_credential / oauth_credential. Billing is per
+-- **service** (watch) under it, not per membership. For CardDAV, `imap_host` is
+-- the DAV host and `base_url` the RFC 6764 context root (used to list
+-- addressbooks); for IMAP, `base_url` is null.
 CREATE TABLE IF NOT EXISTS account_mailbox (
   account_id  TEXT NOT NULL,
   mailbox_key TEXT NOT NULL,
+  protocol    TEXT NOT NULL DEFAULT 'imap',
   login       TEXT NOT NULL,
   imap_host   TEXT NOT NULL,
+  imap_port   INTEGER NOT NULL DEFAULT 993,
+  base_url    TEXT,
   added_at    INTEGER NOT NULL,
-  PRIMARY KEY (account_id, mailbox_key)
+  PRIMARY KEY (account_id, mailbox_key, protocol)
 );
 
 -- Pending checkout sessions: payment is stateless on our side — we keep only
@@ -223,6 +240,10 @@ pub struct Watch {
     /// the watch id (one watch, one account) until grouped under a shared
     /// account (M7).
     pub account_id: String,
+    /// The provider domain this service is grouped + trial-gated under (the
+    /// registrable domain of the server host, e.g. `fastmail.com`). Stamped at
+    /// create; empty on rows predating the column.
+    pub provider: String,
     /// `password` (uses `enc_password`) or `oauth` (authenticates via the
     /// `oauth_credential` for this watch's `(account_id, mailbox_key)`).
     pub auth_kind: String,
@@ -244,16 +265,6 @@ pub struct Watch {
     pub carddav_poll_secs: Option<i64>,
 }
 
-/// Outcome of [`Store::claim_free_credit`]: the welcome credit was granted, the
-/// account had already used its one credit, or this mailbox's credit was already
-/// claimed by another Carillon account (the sybil barrier fired).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FreeCreditOutcome {
-    Granted,
-    AlreadyCredited,
-    AlreadyClaimed,
-}
-
 impl Watch {
     fn from_row(row: &Row) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -268,6 +279,7 @@ impl Watch {
             hmac_secret_prev: row.get("hmac_secret_prev")?,
             hmac_secret_prev_expires: row.get("hmac_secret_prev_expires")?,
             account_id: row.get("account_id")?,
+            provider: row.get("provider")?,
             auth_kind: row.get("auth_kind")?,
             watching_until: row.get("watching_until")?,
             auto_renew: row.get::<_, i64>("auto_renew")? != 0,
@@ -370,25 +382,34 @@ impl AccountRow {
     }
 }
 
-/// A PIM account (mailbox membership): a credential an account has proven
-/// control of. Ownership/credential unit; services (watches) under it are the
-/// billed unit.
+/// A PIM account (§ SERVICE_MODEL): a proven `(identity, protocol, server)`
+/// connection. Ownership/credential unit; services (watches) under it are the
+/// billed unit. The credential is identity-keyed and shared across protocols.
 #[derive(Clone, Debug)]
 pub struct MembershipRow {
-    /// Normalised mailbox key.
+    /// Normalised mailbox key (the identity).
     pub mailbox_key: String,
+    /// Source protocol: `imap` or `carddav`.
+    pub protocol: String,
     /// Login used to prove control.
     pub login: String,
-    /// IMAP host.
+    /// IMAP host, or (for CardDAV) the DAV host.
     pub imap_host: String,
+    /// Server port (993 for IMAP; 443 for CardDAV).
+    pub imap_port: u16,
+    /// CardDAV context-root URL used to list addressbooks (`None` for IMAP).
+    pub base_url: Option<String>,
 }
 
 impl MembershipRow {
     fn from_row(row: &Row) -> rusqlite::Result<Self> {
         Ok(Self {
             mailbox_key: row.get("mailbox_key")?,
+            protocol: row.get("protocol")?,
             login: row.get("login")?,
             imap_host: row.get("imap_host")?,
+            imap_port: row.get("imap_port")?,
+            base_url: row.get("base_url")?,
         })
     }
 }
@@ -415,11 +436,17 @@ pub struct OauthSession {
     pub scope: Option<String>,
     /// The capability-link account to join, if the flow carried one.
     pub account_id: Option<String>,
-    /// Mailbox context, so the callback can build the credential + watch.
+    /// Mailbox context, so the callback can build the credential + watch. For a
+    /// CardDAV login, `imap_host` is the DAV host (keying the mailbox) and
+    /// `mailbox` is unused; `carddav_url` carries the collection context root.
     pub login: String,
     pub imap_host: String,
     pub imap_port: u16,
     pub mailbox: String,
+    /// Source protocol: `imap` (default) or `carddav`.
+    pub source_kind: String,
+    /// CardDAV context-root URL (`Some` only when `source_kind` is `carddav`).
+    pub carddav_url: Option<String>,
 }
 
 /// The stored OAuth credential for a proven mailbox: an age-encrypted refresh
@@ -477,14 +504,14 @@ impl Store {
             "INSERT INTO watch
                (id, imap_host, imap_port, login, enc_password, mailbox, notify_url,
                 hmac_secret, hmac_secret_prev, hmac_secret_prev_expires, account_id,
-                auth_kind, active, source_kind, carddav_url, carddav_poll_secs)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                auth_kind, active, source_kind, carddav_url, carddav_poll_secs, provider)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(id) DO UPDATE SET
                imap_host=?2, imap_port=?3, login=?4, enc_password=?5,
                mailbox=?6, notify_url=?7, hmac_secret=?8,
                hmac_secret_prev=?9, hmac_secret_prev_expires=?10,
                account_id=?11, auth_kind=?12, active=?13,
-               source_kind=?14, carddav_url=?15, carddav_poll_secs=?16",
+               source_kind=?14, carddav_url=?15, carddav_poll_secs=?16, provider=?17",
             params![
                 watch.id,
                 watch.imap_host,
@@ -502,6 +529,7 @@ impl Store {
                 watch.source_kind,
                 watch.carddav_url,
                 watch.carddav_poll_secs,
+                watch.provider,
             ],
         )?;
         Ok(())
@@ -552,30 +580,6 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn.prepare("SELECT * FROM watch WHERE account_id = ?1 ORDER BY id")?;
         let rows = stmt.query_map([account_id], Watch::from_row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    /// The `(id, login, imap_host, target)` of every watch **owned by one
-    /// account** — the cheap input to the service dedup guard, which is scoped
-    /// per Carillon account: the same account can't run the same service twice,
-    /// but two different accounts may watch the same mailbox. A service is unique
-    /// by `(login, target)`; the `target` is the CardDAV collection URL for a
-    /// CardDAV watch, else the mailbox (folder) for an IMAP watch — so one login
-    /// can run several services (INBOX, Archive, an addressbook, …). The
-    /// `(login, host)` normalisation into a mailbox key lives in `metering`. No
-    /// decrypt, no full row.
-    pub fn account_service_identities(
-        &self,
-        account_id: &str,
-    ) -> Result<Vec<(String, String, String, String)>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, login, imap_host, COALESCE(carddav_url, mailbox)
-             FROM watch WHERE account_id = ?1",
-        )?;
-        let rows = stmt.query_map([account_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -712,55 +716,38 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Grants the one free credit under the sybil barrier: the account earns it
-    /// only if it hasn't already been credited AND this PIM account's
-    /// `mailbox_key` hasn't been claimed by anyone yet. Atomic (a transaction, so
-    /// two concurrent first-adds of the same mailbox can't both win). The
-    /// distinct outcomes let the caller tell the user *why* (e.g. "already
-    /// claimed by another account").
-    pub fn claim_free_credit(
-        &self,
-        account_id: &str,
-        mailbox_key: &str,
-        amount: i64,
-    ) -> Result<FreeCreditOutcome> {
+    /// Claims the one-time welcome **trial** for a `(Carillon account, provider
+    /// domain)` (§ SERVICE_MODEL v3). The account's FIRST service on a provider
+    /// (its `metering::provider_domain`, e.g. `fastmail.com` for both its IMAP
+    /// and CardDAV hosts) earns a free head start of watch-time on that service;
+    /// the caller sets the new watch's `watching_until` when this returns `true`.
+    /// Recorded per account+provider (the `free_credit_claim` ledger, reused with
+    /// a composite key), so a second service on the same provider — or a
+    /// delete+recreate — does not renew it. The trial is time-on-the-service, not
+    /// a fungible credit, so per-account (not global) gating is safe. Atomic.
+    pub fn claim_free_trial(&self, account_id: &str, provider_domain: &str) -> Result<bool> {
+        let key = format!("{account_id}|{provider_domain}");
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        let credited: i64 = tx
-            .query_row(
-                "SELECT free_credited FROM account WHERE id = ?1",
-                [account_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        if credited != 0 {
-            tx.commit()?;
-            return Ok(FreeCreditOutcome::AlreadyCredited);
-        }
         let claimed = tx
             .query_row(
                 "SELECT 1 FROM free_credit_claim WHERE mailbox_key = ?1",
-                [mailbox_key],
+                [&key],
                 |_| Ok(()),
             )
             .optional()?
             .is_some();
         if claimed {
             tx.commit()?;
-            return Ok(FreeCreditOutcome::AlreadyClaimed);
+            return Ok(false);
         }
         tx.execute(
             "INSERT INTO free_credit_claim (mailbox_key, account_id, claimed_at)
              VALUES (?1, ?2, ?3)",
-            params![mailbox_key, account_id, now_secs()],
-        )?;
-        tx.execute(
-            "UPDATE account SET credits = credits + ?2, free_credited = 1 WHERE id = ?1",
-            params![account_id, amount],
+            params![key, account_id, now_secs()],
         )?;
         tx.commit()?;
-        Ok(FreeCreditOutcome::Granted)
+        Ok(true)
     }
 
     /// The account bearing a magic-link email, if one exists.
@@ -958,19 +945,36 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Records that an account controls a mailbox (idempotent).
+    /// Records that an account controls a `(mailbox_key, protocol)` endpoint (a
+    /// PIM account). Re-auth updates the server info (host/port/base_url) in
+    /// place; `added_at` (declaration order) is preserved.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_membership(
         &self,
         account_id: &str,
         mailbox_key: &str,
+        protocol: &str,
         login: &str,
         imap_host: &str,
+        imap_port: u16,
+        base_url: Option<&str>,
     ) -> Result<()> {
         self.lock().execute(
-            "INSERT OR IGNORE INTO account_mailbox
-               (account_id, mailbox_key, login, imap_host, added_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![account_id, mailbox_key, login, imap_host, now_secs()],
+            "INSERT INTO account_mailbox
+               (account_id, mailbox_key, protocol, login, imap_host, imap_port, base_url, added_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(account_id, mailbox_key, protocol) DO UPDATE SET
+               login=?4, imap_host=?5, imap_port=?6, base_url=?7",
+            params![
+                account_id,
+                mailbox_key,
+                protocol,
+                login,
+                imap_host,
+                imap_port,
+                base_url,
+                now_secs()
+            ],
         )?;
         Ok(())
     }
@@ -990,32 +994,100 @@ impl Store {
         Ok(account)
     }
 
-    /// Whether an account has proven control of a mailbox (its
-    /// membership exists). The create-watch gate: a scoped caller may only
-    /// watch a mailbox it authenticated to via `/auth`, which is what
-    /// recorded the membership — you cannot watch what you cannot log into.
-    pub fn mailbox_belongs(&self, account_id: &str, mailbox_key: &str) -> Result<bool> {
+    /// Whether an account has proven control of a `(mailbox_key, protocol)`
+    /// endpoint. The create-watch gate: a scoped caller may only watch a PIM
+    /// account it authenticated (which recorded the membership) — you cannot
+    /// watch what you cannot log into.
+    pub fn mailbox_belongs(
+        &self,
+        account_id: &str,
+        mailbox_key: &str,
+        protocol: &str,
+    ) -> Result<bool> {
         let conn = self.lock();
         let exists: Option<i64> = conn
             .query_row(
-                "SELECT 1 FROM account_mailbox WHERE account_id = ?1 AND mailbox_key = ?2",
-                params![account_id, mailbox_key],
+                "SELECT 1 FROM account_mailbox
+                 WHERE account_id = ?1 AND mailbox_key = ?2 AND protocol = ?3",
+                params![account_id, mailbox_key, protocol],
                 |row| row.get(0),
             )
             .optional()?;
         Ok(exists.is_some())
     }
 
-    /// The PIM accounts (mailboxes) a Carillon account controls, in declaration
-    /// order.
+    /// The PIM accounts a Carillon account controls, in declaration order.
     pub fn memberships(&self, account_id: &str) -> Result<Vec<MembershipRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT mailbox_key, login, imap_host
+            "SELECT mailbox_key, protocol, login, imap_host, imap_port, base_url
              FROM account_mailbox WHERE account_id = ?1 ORDER BY added_at",
         )?;
         let rows = stmt.query_map([account_id], MembershipRow::from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Forgets a PIM account: removes the `(mailbox_key, protocol)` membership
+    /// and every service (watch) under it, then drops the **shared** credential
+    /// only when no other membership of the same identity remains (another
+    /// protocol may still be using it). Returns the ids of the deleted watches
+    /// (so the supervisor can be reconciled). All in one transaction.
+    pub fn forget_account(
+        &self,
+        account_id: &str,
+        mailbox_key: &str,
+        protocol: &str,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+
+        // Services under this PIM account: same account + protocol, whose
+        // (login, host) normalises to this mailbox_key.
+        let watch_ids: Vec<(String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, login, imap_host FROM watch
+                 WHERE account_id = ?1 AND source_kind = ?2",
+            )?;
+            let rows = stmt.query_map(params![account_id, protocol], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let deleted: Vec<String> = watch_ids
+            .into_iter()
+            .filter(|(_, login, host)| crate::metering::mailbox_key(login, host) == mailbox_key)
+            .map(|(id, _, _)| id)
+            .collect();
+        for id in &deleted {
+            tx.execute("DELETE FROM watch WHERE id = ?1", [id])?;
+        }
+
+        tx.execute(
+            "DELETE FROM account_mailbox
+             WHERE account_id = ?1 AND mailbox_key = ?2 AND protocol = ?3",
+            params![account_id, mailbox_key, protocol],
+        )?;
+
+        // Shared credential: drop it only if no protocol of this identity
+        // remains under the account.
+        let remaining: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM account_mailbox WHERE account_id = ?1 AND mailbox_key = ?2",
+            params![account_id, mailbox_key],
+            |row| row.get(0),
+        )?;
+        if remaining == 0 {
+            tx.execute(
+                "DELETE FROM password_credential WHERE account_id = ?1 AND mailbox_key = ?2",
+                params![account_id, mailbox_key],
+            )?;
+            tx.execute(
+                "DELETE FROM oauth_credential WHERE account_id = ?1 AND mailbox_key = ?2",
+                params![account_id, mailbox_key],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(deleted)
     }
 
     /// Records a pending checkout session: the account and the number of
@@ -1060,8 +1132,8 @@ impl Store {
             "INSERT INTO oauth_session
                (state, verifier, redirect_uri, token_endpoint, client_id,
                 enc_client_secret, resource, scope, account_id, login,
-                imap_host, imap_port, mailbox, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                imap_host, imap_port, mailbox, source_kind, carddav_url, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 session.state,
                 session.verifier,
@@ -1076,6 +1148,8 @@ impl Store {
                 session.imap_host,
                 session.imap_port,
                 session.mailbox,
+                session.source_kind,
+                session.carddav_url,
                 now_secs(),
             ],
         )?;
@@ -1098,7 +1172,7 @@ impl Store {
             .query_row(
                 "SELECT state, verifier, redirect_uri, token_endpoint, client_id,
                         enc_client_secret, resource, scope, account_id, login,
-                        imap_host, imap_port, mailbox
+                        imap_host, imap_port, mailbox, source_kind, carddav_url
                  FROM oauth_session WHERE state = ?1",
                 [state],
                 |row| {
@@ -1116,6 +1190,8 @@ impl Store {
                         imap_host: row.get(10)?,
                         imap_port: row.get(11)?,
                         mailbox: row.get(12)?,
+                        source_kind: row.get(13)?,
+                        carddav_url: row.get(14)?,
                     })
                 },
             )
@@ -1246,10 +1322,37 @@ fn token_hash(token: &str) -> String {
 /// database. `CREATE TABLE IF NOT EXISTS` never alters an existing
 /// table, so older stores need their new columns backfilled here.
 fn migrate(conn: &Connection) -> Result<()> {
+    // account_mailbox gained a protocol axis (§ SERVICE_MODEL): its primary key
+    // is now (account_id, mailbox_key, protocol). SQLite cannot ALTER a primary
+    // key, so rebuild the table when the `protocol` column is absent (an old
+    // store), backfilling every existing membership as an IMAP one.
+    if !column_exists(conn, "account_mailbox", "protocol")? {
+        conn.execute_batch(
+            "CREATE TABLE account_mailbox_new (
+               account_id  TEXT NOT NULL,
+               mailbox_key TEXT NOT NULL,
+               protocol    TEXT NOT NULL DEFAULT 'imap',
+               login       TEXT NOT NULL,
+               imap_host   TEXT NOT NULL,
+               imap_port   INTEGER NOT NULL DEFAULT 993,
+               base_url    TEXT,
+               added_at    INTEGER NOT NULL,
+               PRIMARY KEY (account_id, mailbox_key, protocol)
+             );
+             INSERT INTO account_mailbox_new
+               (account_id, mailbox_key, protocol, login, imap_host, imap_port, base_url, added_at)
+               SELECT account_id, mailbox_key, 'imap', login, imap_host, 993, NULL, added_at
+               FROM account_mailbox;
+             DROP TABLE account_mailbox;
+             ALTER TABLE account_mailbox_new RENAME TO account_mailbox;",
+        )?;
+    }
+
     for (table, column, decl) in [
         ("watch", "hmac_secret_prev", "TEXT"),
         ("watch", "hmac_secret_prev_expires", "INTEGER"),
         ("watch", "account_id", "TEXT NOT NULL DEFAULT ''"),
+        ("watch", "provider", "TEXT NOT NULL DEFAULT ''"),
         ("watch", "last_metered", "INTEGER"),
         ("watch", "auth_kind", "TEXT NOT NULL DEFAULT 'password'"),
         // Credit-pool accounts (§ BILLING_MODEL). Any older subscription / trial
@@ -1266,6 +1369,14 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("watch", "carddav_url", "TEXT"),
         ("watch", "carddav_sync_token", "TEXT"),
         ("watch", "carddav_poll_secs", "INTEGER"),
+        // CardDAV OAuth logins carry their protocol + collection through the
+        // pending-flow row.
+        (
+            "oauth_session",
+            "source_kind",
+            "TEXT NOT NULL DEFAULT 'imap'",
+        ),
+        ("oauth_session", "carddav_url", "TEXT"),
     ] {
         if !column_exists(conn, table, column)? {
             conn.execute(
@@ -1317,38 +1428,24 @@ mod tests {
     }
 
     #[test]
-    fn free_credit_is_sybil_barred_per_mailbox() {
+    fn free_trial_claimed_once_per_account_provider() {
         let store = temp_store();
         store.ensure_account("a", Some("a@x.test")).unwrap();
         store.ensure_account("b", Some("b@x.test")).unwrap();
 
-        // First account to validate a mailbox earns its one credit.
-        assert_eq!(
-            store.claim_free_credit("a", "key1", 1).unwrap(),
-            FreeCreditOutcome::Granted
-        );
-        assert_eq!(store.get_account("a").unwrap().unwrap().credits, 1);
+        // First service on a provider earns the trial for that account.
+        assert!(store.claim_free_trial("a", "fastmail.com").unwrap());
 
-        // A *different* account adding the SAME mailbox earns nothing (barred).
-        assert_eq!(
-            store.claim_free_credit("b", "key1", 1).unwrap(),
-            FreeCreditOutcome::AlreadyClaimed
-        );
-        assert_eq!(store.get_account("b").unwrap().unwrap().credits, 0);
+        // A second service on the SAME provider (e.g. contacts after mail, or a
+        // delete+recreate) earns nothing — no renewal.
+        assert!(!store.claim_free_trial("a", "fastmail.com").unwrap());
 
-        // …but it still earns its one credit from a fresh, unclaimed mailbox.
-        assert_eq!(
-            store.claim_free_credit("b", "key2", 1).unwrap(),
-            FreeCreditOutcome::Granted
-        );
-        assert_eq!(store.get_account("b").unwrap().unwrap().credits, 1);
+        // …but the same account still earns a trial on a *different* provider.
+        assert!(store.claim_free_trial("a", "gmail.com").unwrap());
 
-        // An account that already has its credit never gets a second.
-        assert_eq!(
-            store.claim_free_credit("a", "key3", 1).unwrap(),
-            FreeCreditOutcome::AlreadyCredited
-        );
-        assert_eq!(store.get_account("a").unwrap().unwrap().credits, 1);
+        // Gating is per Carillon account (time-on-service is non-fungible), so a
+        // different account earns its own trial on the same provider.
+        assert!(store.claim_free_trial("b", "fastmail.com").unwrap());
     }
 
     #[test]
@@ -1379,6 +1476,7 @@ mod tests {
             hmac_secret_prev: None,
             hmac_secret_prev_expires: None,
             account_id: account_id.into(),
+            provider: "x".into(),
             auth_kind: "password".into(),
             watching_until: None,
             auto_renew: false,
@@ -1475,19 +1573,49 @@ mod tests {
     }
 
     #[test]
-    fn dedup_target_is_the_carddav_url_for_carddav() {
+    fn pim_accounts_are_per_protocol_and_share_a_credential() {
         let store = temp_store();
         store.ensure_account("acc", None).unwrap();
-        let mut w = watch("cd", "acc");
-        w.source_kind = "carddav".into();
-        w.carddav_url = Some("https://dav.x/u/Default/".into());
-        w.mailbox = "Personal".into();
-        store.upsert_watch(&w).unwrap();
+        store
+            .add_membership("acc", "u@x", "imap", "u@x", "imap.x", 993, None)
+            .unwrap();
+        store
+            .add_membership(
+                "acc",
+                "u@x",
+                "carddav",
+                "u@x",
+                "dav.x",
+                443,
+                Some("https://dav.x/"),
+            )
+            .unwrap();
+        store
+            .upsert_password_credential("acc", "u@x", "enc")
+            .unwrap();
 
-        let ids = store.account_service_identities("acc").unwrap();
-        // The dedup target is the collection URL, not the display mailbox — so
-        // two addressbooks on one account are distinct services.
-        assert_eq!(ids[0].3, "https://dav.x/u/Default/");
+        // One identity, two protocol-accounts.
+        assert_eq!(store.memberships("acc").unwrap().len(), 2);
+        assert!(store.mailbox_belongs("acc", "u@x", "imap").unwrap());
+        assert!(store.mailbox_belongs("acc", "u@x", "carddav").unwrap());
+        assert!(!store.mailbox_belongs("acc", "u@x", "jmap").unwrap());
+
+        // Forget CardDAV: its membership goes, the shared credential stays (IMAP
+        // still uses it).
+        store.forget_account("acc", "u@x", "carddav").unwrap();
+        assert!(!store.mailbox_belongs("acc", "u@x", "carddav").unwrap());
+        assert!(store.mailbox_belongs("acc", "u@x", "imap").unwrap());
+        assert_eq!(
+            store
+                .get_password_credential("acc", "u@x")
+                .unwrap()
+                .as_deref(),
+            Some("enc")
+        );
+
+        // Forget the last protocol: the shared credential is dropped.
+        store.forget_account("acc", "u@x", "imap").unwrap();
+        assert_eq!(store.get_password_credential("acc", "u@x").unwrap(), None);
     }
 
     #[test]

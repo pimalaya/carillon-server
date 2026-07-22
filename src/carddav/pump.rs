@@ -60,9 +60,11 @@ pub async fn poll_once(
 
         if !baseline {
             for change in &delta.changed {
+                // A poll can't tell a created contact from an edited one (both are
+                // just a changed etag), so report the honest "changed".
                 let event = ChangeEvent::carddav(
                     watch_id,
-                    ChangeKind::New,
+                    ChangeKind::Changed,
                     session::resource_id(&change.href),
                 );
                 if events.send(event).await.is_err() {

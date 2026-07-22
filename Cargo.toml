@@ -12,24 +12,11 @@ axum = "0.8"
 base64 = "0.22"
 hex = "0.4"
 hmac = "0.13"
-# HTTP auth primitives (Basic / Bearer) for the CardDAV client; the WebDAV
-# coroutines below carry them. Default features off — we drive the coroutines
-# over our own tokio-rustls stream, never io-http's blocking client.
 io-http = { version = "0.3", default-features = false }
 io-imap = { version = "0.2", default-features = false }
-# CardDAV addressbook watching (RFC 6578 sync-collection over the io-webdav
-# I/O-free coroutines). Path dependency onto the local crate; default features
-# off so no blocking client / pimalaya-stream is pulled in.
-io-webdav = { path = "../io-webdav", default-features = false }
-# Onboarding discovery (email/server -> IMAP config + auth methods). The
-# `rustls-ring` feature pulls in its blocking std client (`stream` ->
-# `client`); the mechanism features are IMAP-relevant only (autoconfig /
-# provider rules, PACC, SRV) — JMAP/DAV/OAuth-issuer resolution are added
-# with those features later.
-io-pim-discovery = { version = "0.3", default-features = false, features = ["rustls-ring", "autoconfig", "pacc", "rfc6186", "rfc8414"] }
-# OAuth for watch credentials: RFC 7591 dynamic registration + auth-code+PKCE
-# + refresh, over the blocking std client (rustls-ring implies `client`).
 io-oauth = { version = "0.2", default-features = false, features = ["rustls-ring"] }
+io-pim-discovery = { version = "0.3", default-features = false, features = ["rustls-ring", "autoconfig", "pacc", "rfc6186", "rfc6764", "rfc8414"] }
+io-webdav = { version = "0.1", default-features = false }
 pimalaya-stream = { version = "0.1", default-features = false, features = ["std"] }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
@@ -46,10 +33,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tokio-rustls = "0.26"
 tokio-stream = { version = "0.1", features = ["sync"] }
 toml = "1.1"
-tower-http = { version = "0.6", features = ["cors", "fs"] }
+tower-http = { version = "0.7", features = ["cors", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
 [patch.crates-io]
 io-imap.git = "https://github.com/pimalaya/io-imap"
+io-webdav.git = "https://github.com/pimalaya/io-webdav"

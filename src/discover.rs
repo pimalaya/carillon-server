@@ -84,6 +84,72 @@ enum AuthCategory {
     Token,
 }
 
+/// One CardDAV onboarding choice: a discovered addressbook **server** (RFC 6764
+/// context root) plus how to authenticate. Unlike IMAP there is no host/port —
+/// CardDAV is HTTP, so the endpoint is a URL the wizard confirms, then lists its
+/// addressbooks under.
+#[derive(Debug, Serialize)]
+pub struct CardDavChoice {
+    /// CardDAV context-root URL (RFC 6764), e.g. `https://carddav.host/`.
+    pub url: String,
+    /// How to authenticate (password is the DAV default; a provider that
+    /// advertises OAuth on the endpoint surfaces it here).
+    pub auth: AuthMethodView,
+}
+
+/// Discovers CardDAV onboarding choices for `input` — an email address or a
+/// bare domain/server — via RFC 6764 (`_carddavs._tcp` SRV + `.well-known`).
+/// Never fails loudly (empty list ⇒ manual entry). Blocking; call inside
+/// `spawn_blocking`.
+pub fn discover_carddav(input: &str) -> Vec<CardDavChoice> {
+    let input = input.trim();
+    let email = if input.contains('@') {
+        input.to_string()
+    } else {
+        format!("user@{input}")
+    };
+
+    let client = DiscoveryComposeClientStd::new(resolver(), tls());
+    let configs = match client.compose_all(&email, BTreeSet::from([DiscoveryService::Carddav])) {
+        Ok(configs) => configs,
+        Err(err) => {
+            warn!(input, error = %err, "carddav discovery failed");
+            return Vec::new();
+        }
+    };
+
+    // One or two choices per distinct context-root URL, mirroring the IMAP path:
+    // Password is always offered (Basic auth / app passwords work on essentially
+    // every CardDAV server, and it is the default), plus an OAuth choice when the
+    // endpoint advertises one. Emitting BOTH (not OAuth-preferred) is what lets a
+    // Fastmail user pick their app password. (NB: OAuth-over-CardDAV is surfaced
+    // here but not yet wired end-to-end — the wizard offers the password path.)
+    let mut seen = BTreeSet::new();
+    let mut choices = Vec::new();
+    for config in configs {
+        if config.service != DiscoveryService::Carddav {
+            continue;
+        }
+        let DiscoveryEndpoint::Http(url) = config.endpoint else {
+            continue;
+        };
+        if !seen.insert(url.clone()) {
+            continue;
+        }
+        choices.push(CardDavChoice {
+            url: url.clone(),
+            auth: AuthMethodView::Password,
+        });
+        if let Some(method) = best_oauth(&config.auth) {
+            choices.push(CardDavChoice {
+                url,
+                auth: auth_view(method.clone()),
+            });
+        }
+    }
+    choices
+}
+
 /// Discovers IMAP onboarding choices for `input` — an email address, or a bare
 /// domain/server. Never fails loudly: an unresolvable input yields an empty
 /// list and the wizard falls back to manual entry. Blocking; call inside

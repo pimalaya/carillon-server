@@ -46,6 +46,21 @@ const DEFAULT_TICK_SECS: u64 = 60;
 /// account (accounts are only ever created by proving a mailbox).
 pub const FREE_CREDITS_ON_SIGNUP: i64 = 1;
 
+/// The free-trial head start (§ SERVICE_MODEL v3): a newly-created service auto-
+/// watches this long for free — no credit spent — granted once per mailbox. This
+/// replaced the fungible welcome credit: time-on-the-service can't be farmed (a
+/// leaked/farmed trial only watches a mailbox the farmer controls), and there is
+/// no "activate" step in onboarding. Roughly a quarter of a watch-month.
+const DEFAULT_FREE_TRIAL_SECS: i64 = 7 * 86_400;
+
+/// The free-trial length in seconds, overridable via `CARILLON_FREE_TRIAL_SECS`
+/// (mainly to exercise trial expiry in tests without waiting a week).
+pub fn free_trial_secs() -> i64 {
+    env_i64("CARILLON_FREE_TRIAL_SECS")
+        .unwrap_or(DEFAULT_FREE_TRIAL_SECS)
+        .max(1)
+}
+
 /// One watch-month in seconds (what one credit buys), env-overridable.
 pub fn month_secs() -> i64 {
     env_i64("CARILLON_MONTH_SECS")
@@ -92,6 +107,22 @@ pub fn mailbox_key(login: &str, imap_host: &str) -> String {
     // Strip plus-addressing (`user+tag` -> `user`).
     let local = local.split('+').next().unwrap_or(&local).to_string();
     format!("{local}@{domain}")
+}
+
+/// The **provider domain** a service is grouped and trial-gated by: the
+/// registrable domain (the last two dot-labels — a pragmatic eTLD+1) of the
+/// server host. So an account's IMAP host (`imap.fastmail.com`) and CardDAV host
+/// (`carddav.fastmail.com`) both collapse to one provider, `fastmail.com`, and a
+/// custom mail domain that resolves to a provider's servers (e.g.
+/// `pimalaya@fastmail.org` → `imap.fastmail.com`) is grouped under that provider.
+/// The one free trial (§ SERVICE_MODEL v3) is per `(Carillon account, provider)`.
+pub fn provider_domain(host: &str) -> String {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
+    match labels.as_slice() {
+        [.., second, last] => format!("{second}.{last}"),
+        _ => host,
+    }
 }
 
 /// Whether a service is currently watching-paid: `watching_until` in the future.
@@ -356,6 +387,18 @@ mod tests {
         assert!(pim_entitled(Some(now + 10), now));
         assert!(!pim_entitled(Some(now - 10), now));
         assert!(!pim_entitled(None, now));
+    }
+
+    #[test]
+    fn provider_domain_is_the_registrable_domain() {
+        // An account's mail and contacts hosts collapse to one provider.
+        assert_eq!(provider_domain("imap.fastmail.com"), "fastmail.com");
+        assert_eq!(provider_domain("carddav.fastmail.com"), "fastmail.com");
+        assert_eq!(provider_domain("IMAP.GMail.com"), "gmail.com");
+        // Already a bare registrable domain, a trailing dot, and a bare host.
+        assert_eq!(provider_domain("fastmail.com"), "fastmail.com");
+        assert_eq!(provider_domain("carddav.fastmail.com."), "fastmail.com");
+        assert_eq!(provider_domain("localhost"), "localhost");
     }
 
     #[test]

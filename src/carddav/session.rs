@@ -16,11 +16,17 @@ use anyhow::{Context, Result, bail};
 use io_http::rfc6750::bearer::HttpAuthBearer;
 use io_http::rfc7617::basic::HttpAuthBasic;
 use io_webdav::coroutine::{WebdavCoroutine, WebdavCoroutineState, WebdavYield};
+use io_webdav::rfc4918::coroutine::WebdavRedirectYield;
+use io_webdav::rfc4918::follow_redirects::FollowRedirectsError;
 use io_webdav::rfc4918::propfind::Propfind;
 use io_webdav::rfc4918::send::SendError;
 use io_webdav::rfc4918::{GETCTAG, GETETAG, SYNC_TOKEN, WebdavAuth};
+use io_webdav::rfc5397::current_user_principal::CurrentUserPrincipal;
+use io_webdav::rfc6352::addressbook::home_set::AddressbookHomeSet;
+use io_webdav::rfc6352::addressbook::list::ListAddressbooks;
 use io_webdav::rfc6578::sync_collection::{SyncCollection, SyncCollectionError, SyncDelta};
 use rustls::pki_types::ServerName;
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -32,6 +38,10 @@ use crate::guard;
 /// Per-read scratch buffer. A `sync-collection` REPORT that only fetches
 /// etags stays small; the coroutine reassembles across reads.
 const READ_BUF: usize = 16 * 1024;
+
+/// Cap on redirects followed during the principal → home-set walk, so a
+/// misbehaving server cannot loop us forever.
+const MAX_REDIRECTS: usize = 5;
 
 /// `User-Agent` sent on every WebDAV request.
 const USER_AGENT: &str = "carillon";
@@ -265,4 +275,187 @@ pub async fn sync_changes(
         ))),
         Err(err) => Err(SyncPollError::Other(err)),
     }
+}
+
+/// One addressbook collection discovered under an account's home-set — the
+/// content-free target picker for a CardDAV service (the analogue of an IMAP
+/// folder).
+#[derive(Debug, Serialize)]
+pub struct AddressbookInfo {
+    /// Human-readable display name (falls back to the collection id).
+    pub name: String,
+    /// The collection URL a service watches.
+    pub url: String,
+}
+
+/// The `(host, port)` a TLS stream must open to reach a URL.
+fn url_host_port(url: &Url) -> Result<(String, u16)> {
+    let host = url.host_str().context("URL has no host")?.to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    Ok((host, port))
+}
+
+/// RFC 6764 §5 bootstrapping. A **bare origin is not necessarily the DAV context
+/// root**: PACC and RFC 6764 both hand back e.g. `https://carddav.fastmail.com/`,
+/// yet Fastmail 404s every request outside `/dav/*`. So when the URL path is bare
+/// (`/` or empty), start the principal walk at `.well-known/carddav`; the server
+/// redirects to the real root and [`run_following`] follows it. A URL that
+/// already carries a path is used as-is (plenty of servers serve the walk from
+/// the origin directly). Mirrors cardamum's connect-time context-root probe.
+fn context_root(url: &Url) -> Url {
+    match url.path() {
+        "" | "/" => {
+            let mut well_known = url.clone();
+            well_known.set_path("/.well-known/carddav");
+            well_known
+        }
+        _ => url.clone(),
+    }
+}
+
+/// Drives a **redirect-following** WebDAV coroutine (current-user-principal /
+/// home-set): these yield [`WebdavRedirectYield::WantsRedirect`] and do *not*
+/// continue themselves — the driver must reopen a connection to the new URL and
+/// **rebuild** the coroutine there (RFC 5397 / 6764 servers routinely redirect a
+/// bare origin to the real DAV root). `make` reconstructs the coroutine for a
+/// URL. The inner `Result` is the coroutine's own (so a 401 stays inspectable);
+/// the outer is transport.
+async fn run_following<C, T>(
+    connector: &TlsConnector,
+    start: &Url,
+    make: impl Fn(&Url) -> C,
+) -> Result<Result<T, FollowRedirectsError>>
+where
+    C: WebdavCoroutine<Yield = WebdavRedirectYield, Return = Result<T, FollowRedirectsError>>,
+{
+    let mut url = start.clone();
+    for _ in 0..MAX_REDIRECTS {
+        let (host, port) = url_host_port(&url)?;
+        let mut stream = open(connector, &host, port).await?;
+        let mut coroutine = make(&url);
+        let mut buf = [0u8; READ_BUF];
+        let mut arg: Option<&[u8]> = None;
+        let mut eof = false;
+        loop {
+            match coroutine.resume(arg.take()) {
+                WebdavCoroutineState::Yielded(WebdavRedirectYield::WantsWrite(bytes)) => {
+                    stream.write_all(&bytes).await.context("write failed")?;
+                }
+                WebdavCoroutineState::Yielded(WebdavRedirectYield::WantsRead) => {
+                    if eof {
+                        bail!("connection closed by peer");
+                    }
+                    let n = stream.read(&mut buf).await.context("read failed")?;
+                    if n == 0 {
+                        eof = true;
+                    }
+                    arg = Some(&buf[..n]);
+                }
+                WebdavCoroutineState::Yielded(WebdavRedirectYield::WantsRedirect {
+                    url: next,
+                    ..
+                }) => {
+                    url = next;
+                    break; // reopen + rebuild the coroutine for the new URL
+                }
+                WebdavCoroutineState::Complete(result) => return Ok(result),
+            }
+        }
+    }
+    bail!("too many CardDAV redirects")
+}
+
+/// Verifies a CardDAV credential for the **account** (not a collection): does
+/// `current-user-principal` succeed? Used by `POST /auth` for a contacts PIM
+/// account. Never raises — stage failures land in the returned [`CardDavProbe`]
+/// (`sync` is not meaningful here and stays false).
+pub async fn verify_auth(connector: &TlsConnector, account: &CardDavAccount) -> CardDavProbe {
+    let mut probe = CardDavProbe::default();
+    let start = match Url::parse(&account.url) {
+        Ok(url) => context_root(&url),
+        Err(err) => {
+            probe.error = Some(format!("invalid CardDAV URL: {err}"));
+            return probe;
+        }
+    };
+    let auth = account.webdav_auth();
+
+    match run_following(connector, &start, |url| {
+        CurrentUserPrincipal::new(url, &auth, USER_AGENT)
+    })
+    .await
+    {
+        Ok(Ok(_principal)) => {
+            probe.reachable = true;
+            probe.authenticated = true;
+        }
+        Ok(Err(FollowRedirectsError::HttpStatus(status @ (401 | 403), _))) => {
+            probe.reachable = true;
+            probe.error = Some(format!(
+                "the CardDAV server at {} rejected these credentials (HTTP {status})",
+                account.url
+            ));
+        }
+        Ok(Err(err)) => {
+            probe.reachable = true;
+            probe.error = Some(format!("CardDAV {}: {err}", account.url));
+        }
+        Err(err) => probe.error = Some(format!("CardDAV {}: {err:#}", account.url)),
+    }
+    probe
+}
+
+/// Lists the addressbook collections an authenticated account can watch:
+/// current-user-principal → addressbook-home-set → the collections under it
+/// (RFC 5397 + RFC 6352), following redirects along the way. Content-free — only
+/// hrefs + display names, never card data. The folder-picker for a CardDAV
+/// service.
+pub async fn list_addressbooks(
+    connector: &TlsConnector,
+    account: &CardDavAccount,
+) -> Result<Vec<AddressbookInfo>> {
+    let parsed = Url::parse(&account.url)
+        .with_context(|| format!("invalid CardDAV URL: {}", account.url))?;
+    let start = context_root(&parsed);
+    let auth = account.webdav_auth();
+
+    let principal = run_following(connector, &start, |url| {
+        CurrentUserPrincipal::new(url, &auth, USER_AGENT)
+    })
+    .await?
+    .map_err(|err| anyhow::anyhow!("current-user-principal failed: {err}"))?
+    .context("server returned no current-user-principal")?;
+
+    let home = run_following(connector, &principal, |url| {
+        AddressbookHomeSet::new(url, &auth, USER_AGENT, url.path())
+    })
+    .await?
+    .map_err(|err| anyhow::anyhow!("addressbook-home-set failed: {err}"))?
+    .context("server returned no addressbook-home-set")?;
+
+    let (host, port) = url_host_port(&home)?;
+    let base_url = Url::parse(&home.origin().ascii_serialization())
+        .context("cannot derive home-set origin")?;
+    let mut stream = open(connector, &host, port).await?;
+    let list = ListAddressbooks::new(&base_url, &auth, USER_AGENT, home.path());
+    let books = drive(&mut stream, list)
+        .await?
+        .map_err(|err| anyhow::anyhow!("list addressbooks failed: {err}"))?;
+
+    // Reconstruct each collection URL from the home-set + its id (the list
+    // yields the id, not the full href).
+    let mut out = Vec::new();
+    for book in books {
+        let url = home
+            .join(&format!("{}/", book.id))
+            .unwrap_or_else(|_| home.clone());
+        out.push(AddressbookInfo {
+            name: book
+                .display_name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| book.id.clone()),
+            url: url.to_string(),
+        });
+    }
+    Ok(out)
 }

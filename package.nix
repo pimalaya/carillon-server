@@ -1,6 +1,11 @@
 {
   buildFeatures ? [ ],
   buildNoDefaultFeatures ? false,
+  # Passed by the shared pimalaya helper (default.nix). The server ships no
+  # shell completions or man pages, so these are accepted but unused.
+  buildPackages,
+  installManPages ? false,
+  installShellCompletions ? false,
   fetchFromGitHub,
   lib,
   rustPlatform,

@@ -10,7 +10,7 @@
 
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env, fs, mem,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -55,8 +55,14 @@ pub struct EmailConfig {
 /// `LoadCredential` / a secrets manager in production.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ResendConfig {
-    /// Resend API key (`re_…`).
+    /// Resend API key (`re_…`). A **secret**: set it inline, or point
+    /// [`ResendConfig::api_key_file`] at a file holding it.
+    #[serde(default)]
     pub api_key: String,
+    /// Read `api_key` from this file (trimmed) instead of inline — for systemd
+    /// `LoadCredential`, sops-nix, or any secret manager. Set exactly one.
+    #[serde(default)]
+    pub api_key_file: Option<PathBuf>,
     /// The `From:` header — a monitored address on your authenticated sending
     /// subdomain, e.g. `Carillon <no-reply@mail.carillon.pimalaya.org>`.
     pub from: String,
@@ -85,6 +91,9 @@ pub struct OauthClientConfig {
     /// PKCE clients have none).
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// Read `client_secret` from this file (trimmed) instead of inline.
+    #[serde(default)]
+    pub client_secret_file: Option<PathBuf>,
 }
 
 /// Payment provider configuration. Unset (`[billing]` absent) = the keyless
@@ -106,9 +115,19 @@ pub struct BillingConfig {
 #[derive(Clone, Debug, Deserialize)]
 pub struct StripeConfig {
     /// Secret API key (`sk_test_…` in the sandbox, `sk_live_…` in production).
+    /// A **secret**: set it inline, or via [`StripeConfig::secret_key_file`].
+    #[serde(default)]
     pub secret_key: String,
+    /// Read `secret_key` from this file (trimmed) instead of inline.
+    #[serde(default)]
+    pub secret_key_file: Option<PathBuf>,
     /// Webhook signing secret (`whsec_…`) for verifying the event signature.
+    /// A **secret**: set it inline, or via [`StripeConfig::webhook_secret_file`].
+    #[serde(default)]
     pub webhook_secret: String,
+    /// Read `webhook_secret` from this file (trimmed) instead of inline.
+    #[serde(default)]
+    pub webhook_secret_file: Option<PathBuf>,
     /// Where Stripe returns the buyer after a successful payment. Optional —
     /// defaults to the dashboard URL with a `?checkout=success` marker.
     #[serde(default)]
@@ -123,12 +142,102 @@ pub struct StripeConfig {
 }
 
 impl Config {
-    /// Reads and parses the configuration at the given path.
+    /// Reads, parses and resolves the configuration at the given path.
     pub fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Cannot read configuration at {}", path.display()))?;
-        toml::from_str(&content).context("Cannot parse configuration")
+        let mut config: Config = toml::from_str(&content).context("Cannot parse configuration")?;
+        config.resolve_secrets()?;
+        Ok(config)
     }
+
+    /// Resolves every `*_file` secret pointer into its inline field by reading
+    /// the file (trimmed). Keeps secrets out of the config file itself —
+    /// delivered instead by systemd `LoadCredential`, sops-nix or any secret
+    /// manager (see `docs/NIXOS.md`, `docs/DEPLOY_HARDENING.md`). For each
+    /// secret, set the inline value OR its `*_file`, never both.
+    fn resolve_secrets(&mut self) -> Result<()> {
+        self.api.admin_token = resolve_optional_secret(
+            "api.admin_token",
+            self.api.admin_token.take(),
+            self.api.admin_token_file.take(),
+        )?;
+
+        if let Some(stripe) = &mut self.billing.stripe {
+            stripe.secret_key = resolve_required_secret(
+                "billing.stripe.secret_key",
+                mem::take(&mut stripe.secret_key),
+                stripe.secret_key_file.take(),
+            )?;
+            stripe.webhook_secret = resolve_required_secret(
+                "billing.stripe.webhook_secret",
+                mem::take(&mut stripe.webhook_secret),
+                stripe.webhook_secret_file.take(),
+            )?;
+        }
+
+        if let Some(resend) = &mut self.email.resend {
+            resend.api_key = resolve_required_secret(
+                "email.resend.api_key",
+                mem::take(&mut resend.api_key),
+                resend.api_key_file.take(),
+            )?;
+        }
+
+        if let Some(client) = &mut self.oauth.google {
+            client.client_secret = resolve_optional_secret(
+                "oauth.google.client_secret",
+                client.client_secret.take(),
+                client.client_secret_file.take(),
+            )?;
+        }
+        if let Some(client) = &mut self.oauth.microsoft {
+            client.client_secret = resolve_optional_secret(
+                "oauth.microsoft.client_secret",
+                client.client_secret.take(),
+                client.client_secret_file.take(),
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Resolves an **optional** secret: reads `file` (trimmed) when set, errors if
+/// both an inline value and a file are given, `None` when neither is.
+fn resolve_optional_secret(
+    name: &str,
+    inline: Option<String>,
+    file: Option<PathBuf>,
+) -> Result<Option<String>> {
+    match (inline, file) {
+        (Some(_), Some(_)) => bail!("{name}: set either the inline value or {name}_file, not both"),
+        (Some(value), None) => Ok(Some(value)),
+        (None, Some(path)) => Ok(Some(read_secret_file(name, &path)?)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Resolves a **required** secret. The inline value arrives as a (possibly
+/// empty) string; an empty inline with no file is an error.
+fn resolve_required_secret(name: &str, inline: String, file: Option<PathBuf>) -> Result<String> {
+    match (inline.is_empty(), file) {
+        (false, Some(_)) => bail!("{name}: set either the inline value or {name}_file, not both"),
+        (false, None) => Ok(inline),
+        (true, Some(path)) => read_secret_file(name, &path),
+        (true, None) => bail!("{name} is required: set it inline or via {name}_file"),
+    }
+}
+
+/// Reads and trims a secret file, rejecting an empty result.
+fn read_secret_file(name: &str, path: &Path) -> Result<String> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("Cannot read {name} from {}", path.display()))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{name} file {} is empty", path.display());
+    }
+    Ok(trimmed.to_owned())
 }
 
 /// Server-wide settings.
@@ -219,6 +328,10 @@ pub struct ApiConfig {
     /// and secret; it is the whole fleet's key.
     #[serde(default)]
     pub admin_token: Option<String>,
+    /// Read `admin_token` from this file (trimmed) instead of inline — for
+    /// systemd `LoadCredential`, sops-nix, etc. Set exactly one of the two.
+    #[serde(default)]
+    pub admin_token_file: Option<PathBuf>,
     /// Public base URL of this API, used to build the OAuth redirect URI
     /// (`{public_url}/oauth/callback`). Defaults to `http://{listen}` — fine
     /// for local self-host; set it to the externally reachable URL when
@@ -238,6 +351,7 @@ impl Default for ApiConfig {
             ui_dir: None,
             cors_allow_origin: None,
             admin_token: None,
+            admin_token_file: None,
             public_url: None,
             dashboard_url: None,
         }
@@ -376,4 +490,80 @@ fn default_mailbox() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_temp(name: &str, contents: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!("carillon-secret-test-{name}"));
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn inline_optional_secret_passes_through() {
+        assert_eq!(
+            resolve_optional_secret("x", Some("v".into()), None).unwrap(),
+            Some("v".to_owned())
+        );
+        assert_eq!(resolve_optional_secret("x", None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn file_secret_is_read_and_trimmed() {
+        let path = write_temp("read", "  sk_live_abc\n");
+        assert_eq!(
+            resolve_required_secret("x", String::new(), Some(path.clone())).unwrap(),
+            "sk_live_abc"
+        );
+        assert_eq!(
+            resolve_optional_secret("x", None, Some(path.clone())).unwrap(),
+            Some("sk_live_abc".to_owned())
+        );
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn both_inline_and_file_is_rejected() {
+        let path = write_temp("both", "v");
+        assert!(resolve_optional_secret("x", Some("v".into()), Some(path.clone())).is_err());
+        assert!(resolve_required_secret("x", "v".into(), Some(path.clone())).is_err());
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn missing_required_secret_is_rejected() {
+        assert!(resolve_required_secret("x", String::new(), None).is_err());
+    }
+
+    #[test]
+    fn empty_secret_file_is_rejected() {
+        let path = write_temp("empty", "   \n");
+        assert!(resolve_required_secret("x", String::new(), Some(path.clone())).is_err());
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn stripe_secret_key_resolves_from_file_on_load() {
+        let key = write_temp("stripe-sk", "sk_live_fromfile\n");
+        let toml = format!(
+            r#"
+            [billing.stripe]
+            secret_key_file = "{}"
+            webhook_secret = "whsec_inline"
+            [billing.stripe.prices]
+            pack = "price_1"
+            "#,
+            key.display()
+        );
+        let cfg_path = write_temp("cfg.toml", &toml);
+        let config = Config::load(&cfg_path).unwrap();
+        let stripe = config.billing.stripe.unwrap();
+        assert_eq!(stripe.secret_key, "sk_live_fromfile");
+        assert_eq!(stripe.webhook_secret, "whsec_inline");
+        fs::remove_file(key).ok();
+        fs::remove_file(cfg_path).ok();
+    }
 }

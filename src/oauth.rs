@@ -331,17 +331,45 @@ fn provider_for(host: &str) -> Option<&'static KnownProvider> {
 /// `offline_access` if the server uses it (needed for a refresh token).
 /// E.g. Fastmail → `urn:ietf:params:oauth:scope:mail offline_access`.
 fn mail_scope(supported: &[String]) -> Option<String> {
-    let mut chosen = Vec::new();
-    if let Some(mail) = supported.iter().find(|scope| {
-        let scope = scope.to_ascii_lowercase();
+    scope_for(supported, |scope| {
         scope.contains("imap") || scope.contains(":mail") || scope.ends_with("/mail")
-    }) {
-        chosen.push(mail.clone());
-    }
+    })
+}
+
+/// Picks a **contacts / CardDAV** scope from advertised `scopes_supported` (for a
+/// dynamically-registered client), plus `offline_access`. E.g. Fastmail →
+/// `urn:ietf:params:oauth:scope:contacts offline_access`. Without this a CardDAV
+/// login gets [`mail_scope`] and the token 401s against CardDAV (the consent even
+/// shows mail permissions). Mirrors cardamum-android's `contacts_scope`.
+///
+/// Carillon only reads etags, never writes, so it **prefers a read-only** contacts
+/// scope when the provider advertises one; many providers (Fastmail among them)
+/// only offer a read-write CardDAV scope, in which case that is used.
+fn contacts_scope(supported: &[String]) -> Option<String> {
+    let is_contacts = |scope: &str| scope.contains("carddav") || scope.contains("contact");
+    let is_readonly = |scope: &str| {
+        scope.contains("readonly")
+            || scope.contains("read-only")
+            || scope.ends_with(".ro")
+            || scope.ends_with(":ro")
+    };
+    scope_for(supported, |scope| is_contacts(scope) && is_readonly(scope))
+        .or_else(|| scope_for(supported, is_contacts))
+}
+
+/// Shared scope picker: the first advertised scope matching `wanted`, plus
+/// `offline_access` when the server advertises it. `None` when nothing matches
+/// (never returns a bare `offline_access`, so callers can fall back). Compares
+/// case-insensitively.
+fn scope_for(supported: &[String], wanted: impl Fn(&str) -> bool) -> Option<String> {
+    let primary = supported
+        .iter()
+        .find(|scope| wanted(&scope.to_ascii_lowercase()))?;
+    let mut chosen = vec![primary.clone()];
     if supported.iter().any(|scope| scope == "offline_access") {
         chosen.push("offline_access".to_string());
     }
-    (!chosen.is_empty()).then(|| chosen.join(" "))
+    Some(chosen.join(" "))
 }
 
 /// Config-provided client overrides for the static providers, each
@@ -372,6 +400,9 @@ pub struct AuthInput {
     pub authorization_endpoint: Option<String>,
     pub token_endpoint: Option<String>,
     pub scope: Option<String>,
+    /// Whether this login is for CardDAV (contacts): picks the contacts scope
+    /// from the server's advertised metadata instead of the mail scope.
+    pub contacts: bool,
 }
 
 /// The result of planning an authorization: the built request plus what the
@@ -450,7 +481,12 @@ pub fn plan_authorization(
     // public client (Google/Microsoft, Thunderbird's apps for now) with its
     // hardcoded mail scope.
     let (client, scope) = if let Some(registration) = &endpoints.registration {
-        let scope = mail_scope(&endpoints.scopes_supported).or_else(|| input.scope.clone());
+        let picked = if input.contacts {
+            contacts_scope(&endpoints.scopes_supported)
+        } else {
+            mail_scope(&endpoints.scopes_supported)
+        };
+        let scope = picked.or_else(|| input.scope.clone());
         let client = register_client(registration, redirect_uri, scope.as_deref())?;
         (client, scope)
     } else if let Some(provider) = provider {

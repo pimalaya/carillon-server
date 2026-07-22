@@ -68,17 +68,19 @@ paths:
   /discover:
     post:
       tags: [onboarding]
-      summary: Discover IMAP config from an email/domain/server
+      summary: Discover email (IMAP) or contacts (CardDAV) config
       security: []
       description: |
         Resolves a "put anything" identifier — an email address, or a bare
-        domain / server host — to candidate IMAP endpoints and the auth
-        methods each accepts, via `io-pim-discovery` (provider rules, PACC,
-        Mozilla autoconfig/ISPDB, RFC 6186 SRV). Only IMAP is discovered for
-        now. Every result is a hint the wizard confirms/overrides; an
-        unresolvable input returns an empty list (fall back to manual
-        entry), never an error. Public and rate-limited per client IP
-        (it makes outbound DNS/HTTP requests).
+        domain / server host — to candidate endpoints and the auth methods
+        each accepts, via `io-pim-discovery`. The type-first wizard picks
+        `kind` before discovering, so only that protocol is resolved:
+        `email` → IMAP (provider rules, PACC, Mozilla autoconfig/ISPDB, RFC
+        6186 SRV); `contacts` → CardDAV (RFC 6764 SRV + `.well-known`).
+        `choices` are shaped per `kind` (IMAP: host/port/security/auth;
+        CardDAV: a context-root url/auth). Every result is a hint the wizard
+        confirms/overrides; an unresolvable input returns an empty list
+        (manual entry), never an error. Public, rate-limited per client IP.
       requestBody:
         required: true
         content:
@@ -90,18 +92,30 @@ paths:
                 input:
                   type: string
                   description: An email address, or a bare domain / server host.
+                kind:
+                  type: string
+                  enum: [email, contacts]
+                  default: email
+                  description: What to watch — email (IMAP) or contacts (CardDAV).
       responses:
         "200":
-          description: The discovered IMAP choices (possibly empty).
+          description: The discovered choices for the requested kind (possibly empty).
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   input: { type: string }
+                  kind: { type: string, enum: [email, contacts] }
                   choices:
                     type: array
-                    items: { $ref: "#/components/schemas/ImapChoice" }
+                    description: >
+                      ImapChoice items for kind=email, CardDavChoice items for
+                      kind=contacts.
+                    items:
+                      oneOf:
+                        - $ref: "#/components/schemas/ImapChoice"
+                        - $ref: "#/components/schemas/CardDavChoice"
         "429":
           description: Too many lookups from this IP.
           headers:
@@ -137,9 +151,25 @@ paths:
                 token_endpoint: { type: string }
                 scope: { type: string }
                 login: { type: string }
-                imap_host: { type: string }
+                imap_host:
+                  type: string
+                  description: >
+                    IMAP host, or (for a CardDAV login) the DAV host — it keys
+                    the mailbox, matching what the poller resolves against.
                 imap_port: { type: integer, default: 993 }
                 mailbox: { type: string, default: INBOX }
+                source_kind:
+                  type: string
+                  enum: [imap, carddav]
+                  default: imap
+                  description: What this OAuth login is for.
+                carddav_url:
+                  type: string
+                  format: uri
+                  description: >
+                    CardDAV collection context-root URL (required when
+                    source_kind=carddav). The callback probes it with the bearer
+                    token and stores the credential for the poller.
       responses:
         "200":
           description: The provider authorization URL to open.
@@ -230,6 +260,81 @@ paths:
         "400": { description: Could not authenticate or list. }
         "401": { description: OAuth flow with an invalid/missing link. }
         "429": { description: Too many attempts. }
+
+  /addressbooks:
+    post:
+      tags: [onboarding]
+      summary: List a CardDAV account's addressbooks (the contacts target picker)
+      security: []
+      description: |
+        The CardDAV analogue of `/mailboxes`: current-user-principal →
+        addressbook-home-set → the collections under it (RFC 5397 + 6352),
+        following redirects. Content-free (hrefs + display names only). A
+        non-empty `password` authenticates directly; an empty one reuses the
+        account's stored credential (requires a capability link). Rate-limited
+        per `(IP, login)`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [carddav_url, login]
+              properties:
+                carddav_url: { type: string, format: uri, description: CardDAV context-root URL. }
+                login: { type: string }
+                password:
+                  type: string
+                  description: Empty ⇒ reuse the account's stored credential (needs a link).
+      responses:
+        "200":
+          description: The account's addressbook collections.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  addressbooks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        url: { type: string, format: uri, description: The collection URL a service watches. }
+        "400": { description: Could not authenticate or list. }
+        "401": { description: Empty password without a valid link. }
+        "429": { description: Too many attempts. }
+
+  /forget:
+    post:
+      tags: [watches]
+      summary: Forget a PIM account (its membership + services + shared credential)
+      description: |
+        Removes a PIM account: its `(mailbox_key, protocol)` membership and every
+        service under it, then drops the identity's **shared** credential only
+        when no other protocol of that identity remains. Scoped to the caller's
+        Carillon account.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mailbox_key, protocol]
+              properties:
+                mailbox_key: { type: string }
+                protocol: { type: string, enum: [imap, carddav] }
+      responses:
+        "200":
+          description: Forgotten.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  removed: { type: integer, description: Number of services deleted. }
+        "403": { description: A capability link is required. }
 
   /webhook/test:
     post:
@@ -472,15 +577,18 @@ paths:
       tags: [watches]
       summary: Create a watch
       description: |
-        Notify URL must be `https://` (loopback `http://` is allowed for
-        local sinks). Declaring a service is free; on the metered SaaS it only
-        starts once activated (`POST /watches/{id}/activate`). Dedup is
-        **per Carillon account**: a service is unique by
-        `(account, login, service-type, target folder)` — a PIM account may run
-        several services (different folders), and *different* Carillon accounts
-        may watch the same mailbox, but re-adding the exact same one under one
-        account is refused with `409`. A scoped account may watch up to the
-        fair-use cap; beyond it, `402`.
+        The credential lives on the service (§ SERVICE_MODEL v3): pass the
+        mailbox `password` and it is stored (encrypted) on the watch — no prior
+        `/auth` step is required. Omit the password only to reuse a stored OAuth
+        credential (proven at `/oauth/callback`), which still requires that
+        mailbox to have been signed in. A free-trial head start is granted on the
+        account's **first service per provider** (the resolved provider domain).
+        Notify URL must be `https://` (loopback `http://` is allowed for local
+        sinks). Declaring a service is free; on the metered SaaS it only starts
+        once activated (`POST /watches/{id}/activate`). **No same-target dedup**:
+        adding the same folder/addressbook twice is allowed (e.g. a second
+        webhook endpoint) and simply billed twice. A scoped account may watch up
+        to the fair-use cap of distinct mailboxes; beyond it, `402`.
       requestBody:
         required: true
         content:
@@ -496,6 +604,18 @@ paths:
                 properties:
                   status: { type: string, const: ok }
                   id: { type: string }
+                  free_trial:
+                    description: >
+                      Whether a free-trial head start was granted (§ SERVICE_MODEL
+                      v3): the account's FIRST service on this provider auto-
+                      watches free for a week, no credit spent.
+                    type: boolean
+                  provider:
+                    description: >
+                      The provider domain the service was grouped and trial-gated
+                      under — the registrable domain of the server host, e.g.
+                      `fastmail.com` for both `imap.` and `carddav.` hosts.
+                    type: string
         "400":
           description: Invalid notify URL.
           content:
@@ -506,10 +626,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
-        "409":
+        "403":
           description: >
-            This account already runs the same service (same folder). A
-            different account may still watch the same mailbox.
+            No credential: the password was omitted for a mailbox that has not
+            been signed in with OAuth. Provide the password instead.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -767,6 +887,15 @@ components:
         port: { type: integer }
         security: { type: string, enum: [tls, starttls, plain] }
         auth: { $ref: "#/components/schemas/AuthMethod" }
+    CardDavChoice:
+      type: object
+      description: >
+        One contacts (CardDAV) onboarding choice — a discovered RFC 6764
+        context-root URL plus how to authenticate. No host/port (CardDAV is
+        HTTP): the wizard confirms the url, then lists its addressbooks.
+      properties:
+        url: { type: string, format: uri, description: CardDAV context-root URL. }
+        auth: { $ref: "#/components/schemas/AuthMethod" }
     AuthMethod:
       type: object
       description: >
@@ -794,16 +923,16 @@ components:
           description: >
             `imap` (default) watches a mailbox over held IDLE. `carddav`
             polls the `carddav_url` addressbook; `imap_host`/`login` then
-            carry the PIM-account identity so the mailbox key and stored
-            credential are shared with the account's IMAP membership.
+            carry the identity (host + login) that keys the mailbox.
         imap_host: { type: string }
         imap_port: { type: integer, default: 993 }
         login: { type: string }
         password:
           type: string
           description: >
-            Omit to reuse the PIM account's stored credential (password from
-            `/auth`, or OAuth). Provide it to store a password on the watch.
+            The mailbox password — stored (encrypted) on the watch and used to
+            watch it (§ SERVICE_MODEL v3). Omit only to reuse a stored OAuth
+            credential (proven at `/oauth/callback`).
         mailbox:
           type: string
           default: INBOX
@@ -836,7 +965,7 @@ components:
       type: object
       properties:
         account: { type: string }
-        event: { type: string, enum: [new, flags_added, flags_removed, removed] }
+        event: { type: string, enum: [new, changed, flags_added, flags_removed, removed] }
         uid:
           type: integer
           description: >
@@ -871,27 +1000,32 @@ components:
               auto_renew: { type: boolean, description: Next credit drawn from the pool at expiry. }
     AuthRequest:
       type: object
-      required: [imap_host, login, password]
+      required: [login, password]
       properties:
-        imap_host: { type: string }
+        protocol:
+          type: string
+          enum: [imap, carddav]
+          default: imap
+          description: >
+            Selects how the credential is validated (IMAP LOGIN vs a CardDAV
+            PROPFIND) and the PIM account's protocol. The proven credential is
+            stored per identity and shared across its protocols.
+        imap_host: { type: string, description: "Required for protocol=imap." }
         imap_port: { type: integer, default: 993 }
         login: { type: string }
         password: { type: string }
         mailbox: { type: string, default: INBOX }
+        carddav_url:
+          type: string
+          format: uri
+          description: "CardDAV context-root URL (required when protocol=carddav)."
     AuthResult:
       type: object
       properties:
         account_id: { type: string }
         action: { type: string, enum: [created, recovered, joined] }
         link: { type: string, description: The capability link (bearer). Store it. }
+        protocol: { type: string, enum: [imap, carddav] }
         watchable: { type: boolean }
-        idle: { type: boolean }
-        qresync: { type: boolean }
-        free_credit:
-          type: string
-          enum: [granted, already_credited, already_claimed]
-          description: >
-            Welcome-credit outcome for this PIM account: `granted`, the account
-            had `already_credited` used its one credit, or this mailbox's credit
-            was `already_claimed` by another Carillon account (per-mailbox_key
-            sybil barrier). Also on the OAuth callback payload.
+        idle: { type: boolean, description: "IMAP only; false for CardDAV." }
+        qresync: { type: boolean, description: "IMAP only; false for CardDAV." }

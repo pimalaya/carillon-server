@@ -249,6 +249,7 @@ async fn serve(config: Config) -> Result<()> {
         mailer,
         metered,
         max_watches: config.server.max_watches_per_account.max(1),
+        carddav_poll_secs: config.server.carddav_poll_interval_secs,
         admin_token: config.api.admin_token.clone(),
         public_url,
         dashboard_origin,
@@ -314,6 +315,7 @@ fn import(config: &Config, path: &Path) -> Result<()> {
             hmac_secret_prev_expires: None,
             // One watch, one billing account until grouped (M7).
             account_id: id.clone(),
+            provider: metering::provider_domain(&account.imap_host),
             auth_kind: String::from("password"),
             // Self-host import is unmetered, so activation is moot (watches run
             // regardless); leave the service un-activated.

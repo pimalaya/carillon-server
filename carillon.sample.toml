@@ -44,6 +44,12 @@ listen = "127.0.0.1:3000"
 # reachable only through a per-account capability link. Keep it long and
 # secret — it is the whole fleet's key.
 # admin_token = "change-me-to-a-long-random-secret"
+# Every secret below (admin_token, the Stripe keys, the Resend key, and the
+# oauth client_secret) also has a `<name>_file` variant that reads the value
+# (trimmed) from a file — set exactly one. Prefer the file form in production so
+# secrets never sit in this config: point it at a systemd `LoadCredential`
+# ($CREDENTIALS_DIRECTORY/…), a sops-nix/agenix path (/run/secrets/…), etc.
+# admin_token_file = "/run/credentials/carillon.service/admin_token"
 # Public base URL of this API, used to build the OAuth redirect URI
 # ({public_url}/oauth/callback). Defaults to http://{listen} (fine for
 # local self-host); set it to the externally reachable URL when exposed.
@@ -74,7 +80,9 @@ listen = "127.0.0.1:3000"
 # Create ONE one-time Price in Stripe (the PACK price, e.g. €5); the price lives THERE.
 # [billing.stripe]
 # secret_key = "sk_test_…"          # sandbox key; sk_live_… in production
+# secret_key_file = "/run/secrets/carillon-stripe-secret-key"   # …or from a file
 # webhook_secret = "whsec_…"        # from `stripe listen` or the dashboard endpoint
+# webhook_secret_file = "/run/secrets/carillon-stripe-webhook-secret"
 # success_url and cancel_url are OPTIONAL — default to `dashboard_url` (or
 # `public_url`) with a ?checkout=success/cancel marker. Set them to override:
 # success_url = "https://app.carillon.example.org/?checkout=success"
@@ -91,4 +99,5 @@ listen = "127.0.0.1:3000"
 # production.
 # [email.resend]
 # api_key = "re_…"
+# api_key_file = "/run/secrets/carillon-resend-api-key"   # …or from a file
 # from = "Carillon <no-reply@mail.carillon.example.org>"

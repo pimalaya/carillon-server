@@ -25,6 +25,11 @@ use crate::util::now_secs;
 pub enum ChangeKind {
     /// A message appeared (new UID).
     New,
+    /// A resource was created or modified. Used by CardDAV, where a poll's
+    /// `sync-collection` reports a changed member (new *or* edited — the same
+    /// etag change) without distinguishing the two; "changed" is the honest,
+    /// content-free label. (IMAP splits new/flags instead.)
+    Changed,
     /// Flags were set on an existing message.
     FlagsAdded,
     /// Flags were cleared on an existing message.
@@ -38,6 +43,7 @@ impl ChangeKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             ChangeKind::New => "new",
+            ChangeKind::Changed => "changed",
             ChangeKind::FlagsAdded => "flags_added",
             ChangeKind::FlagsRemoved => "flags_removed",
             ChangeKind::Removed => "removed",
@@ -102,8 +108,9 @@ impl ChangeEvent {
 
     /// Folds a CardDAV addressbook change into the canonical shape. There is
     /// no UID; the changed member is identified by its opaque `resource`
-    /// reference (its href's last segment). Only `new` (created/updated) and
-    /// `removed` occur — WebDAV has no flag concept.
+    /// reference (its href's last segment). Only `changed` (created or edited —
+    /// a poll can't tell them apart) and `removed` occur — WebDAV has no flag
+    /// concept.
     pub fn carddav(
         account: impl Into<String>,
         event: ChangeKind,
