@@ -165,7 +165,7 @@ memory-bound, not CPU-bound:
 
 ## 9. Deploy pipeline
 
-- `cargo build --release`; embed the `carillon-admin` build via `api.ui_dir`
+- `cargo build --release`; embed the `carillon-frontend` build via `api.ui_dir`
   (single origin, no CORS) **or** serve the SPA from a CDN with locked CORS.
 - Versioned artifacts, config-file (not env) for secrets via `LoadCredential`,
   graceful shutdown already handled (SSE drain + supervisor stop), documented

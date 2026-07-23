@@ -101,7 +101,7 @@ watches, deliveries, accounts or stream.
 - **`GET /events` (SSE) is authed and scoped.** Live events carry the
   billing account they concern (`Routed`), and the stream forwards only the
   subscriber's own (admin sees all). Since `EventSource` can't send an
-  `Authorization` header, `carillon-admin` reads the stream via an
+  `Authorization` header, `carillon-frontend` reads the stream via an
   authenticated fetch + SSE-frame parser carrying the Bearer link. A
   forwarding task pumps the scoped broadcast into a bounded channel backing
   the response body and ends on **either** server shutdown (a `watch` signal
@@ -124,7 +124,7 @@ confirms/overrides; an unresolvable input returns an empty list, never an
 error. `src/discover.rs` (blocking std client in `spawn_blocking`) + the
 `ImapCandidate`/`AuthMethod` OpenAPI schemas. Live-verified against
 gmail.com (→ imap.gmail.com:993, Google OAuth + password) and fastmail.com.
-carillon-admin's Identify stage rewritten to email/server → discover →
+carillon-frontend's Identify stage rewritten to email/server → discover →
 choose (himalaya/ortie-style, TLS candidate auto-picked).
 
 **OAuth watching — Stages A–C BUILT (2026-07-20); interactive e2e pending.**
@@ -147,7 +147,7 @@ A watch can authenticate via OAuth instead of a password: the server holds a
   Google/Microsoft = **Thunderbird's public client IDs** for now (swap for
   Carillon-owned apps later), mail-only scopes, Google's `access_type=offline`+
   `prompt=consent`. `/oauth/start` verified non-interactively for both.
-- **Stage C** — carillon-admin: the Authenticate stage branches to an OAuth
+- **Stage C** — carillon-frontend: the Authenticate stage branches to an OAuth
   sign-in popup (`/oauth/start` → provider → callback `postMessage`), Configure
   creates a password-less OAuth watch.
 
@@ -228,13 +228,13 @@ loopback/localhost redirect until Carillon registers hosted apps. RFC 8707
 ## Next — the fronts
 
 ### M6 — OpenAPI + self-host serving modes (the UI is its own repo)
-- **The dashboard is a separate repo, `carillon-admin`** — the default/reference
+- **The dashboard is a separate repo, `carillon-frontend`** — the default/reference
   SPA (Vite + React + TS + Tailwind + shadcn/ui), a pure client of this API. Its
-  own build plan lives in `carillon-admin/docs/PLAN.md`. carillon-server's job here
+  own build plan lives in `carillon-frontend/docs/PLAN.md`. carillon-backend's job here
   is only to make it *consumable*.
-- Publish an **OpenAPI** spec (the contract `carillon-admin` and any third-party UI
+- Publish an **OpenAPI** spec (the contract `carillon-frontend` and any third-party UI
   build against).
-- **Serve `carillon-admin`'s `dist/` per-front:** self-host **embeds** a pinned
+- **Serve `carillon-frontend`'s `dist/` per-front:** self-host **embeds** a pinned
   build via `rust-embed` (one binary, no CORS) *or* points at a self-served copy;
   SaaS serves it from a **CDN** (M7). API base URL via `VITE_API_BASE_URL`.
 - Self-host modes: headless (localhost API + token) and daemon+UI (local token).

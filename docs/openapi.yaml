@@ -7,7 +7,7 @@ info:
     The REST + SSE control surface of the Carillon watch server. Carillon
     signals, it never syncs: it holds IMAP IDLE and POSTs small, signed,
     **content-free** change events to each watch's notify URL. This API is
-    the contract `carillon-admin` (and any third-party UI) builds against.
+    the contract `carillon-frontend` (and any third-party UI) builds against.
 
     All bodies are JSON. Timestamps are unix seconds. Watch-time balances
     are in seconds.

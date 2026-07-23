@@ -249,4 +249,4 @@ The model above is **implemented** in the server (clippy-clean, tests green):
   updated.
 
 Not built: auto-refill / auto-recharge (deferred), API keys (deferred), and the
-`carillon-admin` dashboard (separate repo — still shows the old subscription UI).
+`carillon-frontend` dashboard (separate repo — still shows the old subscription UI).

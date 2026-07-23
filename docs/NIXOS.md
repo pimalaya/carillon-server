@@ -14,7 +14,7 @@ The flake exposes three things (`flake.nix`):
 |---|---|
 | `nixosModules.carillon` (`= default`) | **Layer 1** — the hardened service. Backend-agnostic: knows *nothing* about how secrets arrive. Usable on its own. |
 | `nixosModules.sops` | **Layer 2** — the sops-nix secret binding. Points each of the daemon's `*_file` secret options at a per-secret sops runtime path. |
-| `overlays.default` | Adds `pkgs.carillon-server` (this flake's build) so the module's default `package` resolves. |
+| `overlays.default` | Adds `pkgs.carillon-backend` (this flake's build) so the module's default `package` resolves. |
 
 The seam works two ways. The daemon reads each secret from a file via a `*_file`
 config option (`api.admin_token_file`, `billing.stripe.secret_key_file`,
@@ -33,7 +33,7 @@ non-metered self-host.
 {
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
-    carillon.url = "github:pimalaya/carillon-server";
+    carillon.url = "github:pimalaya/carillon-backend";
     sops-nix.url = "github:Mic92/sops-nix";
   };
 
@@ -65,7 +65,7 @@ non-metered self-host.
       server.max_concurrent_handshakes = 25;   # 2 vCore: keep reconnect storms tame
       server.max_watches_per_account = 25;
       api.listen = "127.0.0.1:3000";            # loopback; a proxy fronts it
-      api.ui_dir = "/var/lib/carillon/ui";      # same-origin carillon-admin dist
+      api.ui_dir = "/var/lib/carillon/ui";      # same-origin carillon-frontend dist
       api.public_url = "https://carillon.example.org";
       billing.stripe.prices.pack = "price_...";  # the price id is not a secret
       email.resend.from = "Carillon <no-reply@mail.carillon.example.org>";
@@ -77,7 +77,7 @@ non-metered self-host.
       enable = true;
       secrets = {
         ageKey = "carillon-age-key";                       # required
-        adminToken = "carillon-admin-token";
+        adminToken = "carillon-frontend-token";
         stripeSecretKey = "carillon-stripe-secret-key";
         stripeWebhookSecret = "carillon-stripe-webhook-secret";
         resendApiKey = "carillon-resend-api-key";
@@ -92,7 +92,7 @@ non-metered self-host.
   sops.defaultSopsFile = ./secrets.yaml;
   sops.age.keyFile = "/var/lib/sops-nix/key.txt";  # the sops MASTER key (see below)
   sops.secrets.carillon-age-key = { };
-  sops.secrets.carillon-admin-token = { };
+  sops.secrets.carillon-frontend-token = { };
   sops.secrets.carillon-stripe-secret-key = { };
   sops.secrets.carillon-stripe-webhook-secret = { };
   sops.secrets.carillon-resend-api-key = { };
@@ -145,7 +145,7 @@ guard.
 - **Host firewall + conntrack sizing.** Use `networking.firewall` /
   `networking.nftables`; raise `nf_conntrack_max` there.
 - **Backups.** Litestream + the offline age-key copy.
-- **The `carillon-admin` build** at `ui_dir` (build it in CI; rsync the `dist/`).
+- **The `carillon-frontend` build** at `ui_dir` (build it in CI; rsync the `dist/`).
 
 ## Testing locally (no OS rebuild)
 
@@ -189,10 +189,10 @@ at whatever runtime paths your provider creates:
 ```nix
 # agenix example — one file per secret, same as the sops binding does
 age.secrets.carillon-age-key.file = ./secrets/age-key.age;
-age.secrets.carillon-admin-token.file = ./secrets/admin-token.age;
+age.secrets.carillon-frontend-token.file = ./secrets/admin-token.age;
 services.carillon.settings = {
   server.age_key_file = config.age.secrets.carillon-age-key.path;
-  api.admin_token_file = config.age.secrets.carillon-admin-token.path;
+  api.admin_token_file = config.age.secrets.carillon-frontend-token.path;
 };
 ```
 
@@ -207,8 +207,8 @@ The module is NixOS-only (systemd + sops-nix). For a container, take the
 
 ```nix
 pkgs.dockerTools.buildLayeredImage {
-  name = "carillon-server";
-  config.Entrypoint = [ "${carillon.packages.x86_64-linux.default}/bin/carillon-server" "serve" ];
+  name = "carillon-backend";
+  config.Entrypoint = [ "${carillon.packages.x86_64-linux.default}/bin/carillon-backend" "serve" ];
   config.Env = [ "CARILLON_CONFIG=/config/carillon.toml" ];
 }
 ```

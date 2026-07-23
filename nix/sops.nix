@@ -39,7 +39,7 @@ in
       default = { };
       example = {
         ageKey = "carillon-age-key";
-        adminToken = "carillon-admin-token";
+        adminToken = "carillon-frontend-token";
         stripeSecretKey = "carillon-stripe-secret-key";
         stripeWebhookSecret = "carillon-stripe-webhook-secret";
         resendApiKey = "carillon-resend-api-key";

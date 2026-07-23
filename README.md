@@ -1,4 +1,4 @@
-# carillon-server
+# carillon-backend
 
 *Carillon watch server — prototype.* Holds IMAP IDLE for many accounts on one
 box and, the instant a mailbox changes, POSTs a small, HMAC-signed,

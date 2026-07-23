@@ -5,7 +5,7 @@ store) behind a REST + SSE API, deployed in one of three fronts. The core
 is identical in each; only the *front* differs.
 
 The API contract is [`openapi.yaml`](openapi.yaml), served live at
-`GET /openapi.yaml`. The reference UI is a separate repo, `carillon-admin`
+`GET /openapi.yaml`. The reference UI is a separate repo, `carillon-frontend`
 (a pure client of this API); you can embed its build, serve it yourself,
 or bring your own.
 
@@ -18,7 +18,7 @@ front:
 ```toml
 [api]
 listen = "127.0.0.1:3000"
-# Serve a built carillon-admin dist/ at the origin (self-host + UI):
+# Serve a built carillon-frontend dist/ at the origin (self-host + UI):
 # ui_dir = "/var/lib/carillon/ui"
 # Allow a cross-origin CDN front to call the API (SaaS):
 # cors_allow_origin = "https://carillon.example.org"
@@ -82,13 +82,13 @@ not rely on "it's internal".
 ## Mode 2 — self-host with the UI
 
 Same daemon, plus the reference dashboard served from the same origin (no
-CORS). Build `carillon-admin` (`vite build` → `dist/`) and point `ui_dir`
+CORS). Build `carillon-frontend` (`vite build` → `dist/`) and point `ui_dir`
 at it:
 
 ```toml
 [api]
 listen = "0.0.0.0:3000"
-ui_dir = "/var/lib/carillon/ui"    # a carillon-admin dist/
+ui_dir = "/var/lib/carillon/ui"    # a carillon-frontend dist/
 ```
 
 Static files own `/` (unknown paths fall back to the SPA entrypoint);
@@ -101,7 +101,7 @@ is same-origin, `VITE_API_BASE_URL` is empty when you build it.
 
 ## Mode 3 — SaaS (API box + CDN front)
 
-The API box serves only JSON; `carillon-admin`'s `dist/` is served from a
+The API box serves only JSON; `carillon-frontend`'s `dist/` is served from a
 CDN/Netlify with `VITE_API_BASE_URL` set to the API host. Enable CORS for
 that origin:
 

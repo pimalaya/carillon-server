@@ -1,6 +1,6 @@
 [package]
-name = "carillon-server"
-description = "Carillon watch server prototype: holds IMAP IDLE and emits content-free webhooks"
+name = "carillon-backend"
+description = "Carillon backend"
 version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"

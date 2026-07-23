@@ -28,10 +28,10 @@
         sops = import ./nix/sops.nix;
       };
 
-      # Adds `pkgs.carillon-server` (this flake's build) so the module's default
+      # Adds `pkgs.carillon-backend` (this flake's build) so the module's default
       # `package` resolves. Consumers add this to `nixpkgs.overlays`.
       overlays.default = final: _prev: {
-        carillon-server = inputs.self.packages.${final.stdenv.hostPlatform.system}.default;
+        carillon-backend = inputs.self.packages.${final.stdenv.hostPlatform.system}.default;
       };
 
       # Local dev/test targets (see docs/NIXOS.md "Testing locally"). Both run

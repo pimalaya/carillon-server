@@ -318,19 +318,19 @@ every client with zero codegen and is trivially remoteable (TLS + auth).
   Pure client SPA, no SSR (preserves serve-per-front). Chosen for build velocity and
   consistency with the charlie web stack; SvelteKit-static was the runner-up.
 
-**The UI is a separate repo — `carillon-admin` — a *client* of the API, not part of
+**The UI is a separate repo — `carillon-frontend` — a *client* of the API, not part of
 the daemon.** It is the **default / reference** admin SPA that Carillon ships and
 the SaaS serves; a self-hoster can embed its build **or bring their own**. This is
 the point: the daemon exposes only the REST+SSE API (the contract); the UI is one
 consumer of it. Separation of concerns — the API can evolve a typed contract
 (OpenAPI) and anyone can build against it.
 
-**One static `dist/` from `carillon-admin`, served per-front:**
+**One static `dist/` from `carillon-frontend`, served per-front:**
 
-- **Self-host: embed** a pinned `carillon-admin` build in the daemon via
+- **Self-host: embed** a pinned `carillon-frontend` build in the daemon via
   `rust-embed` (one binary, one port, no CORS, airgapped) — or point at your own.
   The standard self-hosted pattern (Grafana, Syncthing, Portainer).
-- **SaaS: serve `carillon-admin` from a CDN / Netlify.** The API box serves only
+- **SaaS: serve `carillon-frontend` from a CDN / Netlify.** The API box serves only
   JSON; static assets get edge caching and scale/deploy independently. CORS is a
   non-issue — a preflight + an allowlist — and pairs cleanly with the localStorage
   **bearer token** (§5): `Authorization` header cross-origin, no cookie/SameSite/

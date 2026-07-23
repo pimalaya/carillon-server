@@ -39,7 +39,7 @@ in
   options.services.carillon = {
     enable = mkEnableOption "the Carillon watch server (holds IMAP IDLE, emits content-free webhooks)";
 
-    package = mkPackageOption pkgs "carillon-server" { };
+    package = mkPackageOption pkgs "carillon-backend" { };
 
     user = mkOption {
       type = types.str;
@@ -162,7 +162,7 @@ in
 
     systemd.services.carillon = {
       description = "Carillon watch server";
-      documentation = [ "https://github.com/pimalaya/carillon-server" ];
+      documentation = [ "https://github.com/pimalaya/carillon-backend" ];
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
@@ -174,7 +174,7 @@ in
 
       serviceConfig = {
         Type = "simple";
-        ExecStart = "${getExe' cfg.package "carillon-server"} serve";
+        ExecStart = "${getExe' cfg.package "carillon-backend"} serve";
         User = cfg.user;
         Group = cfg.group;
         Restart = "on-failure";

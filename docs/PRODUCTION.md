@@ -21,7 +21,7 @@ artifacts, capacity numbers, and a hard go-live gate.
 - **One box, vertical scale, local sqlite.** No HA, no shared store. Accept a
   brief reconnect blip on deploy (watchers reconnect on their own).
 - **Front = Mode 2, single origin** ([`SELF_HOST.md`](SELF_HOST.md)). The Rust
-  app serves the `carillon-admin` build via `api.ui_dir`; Caddy only
+  app serves the `carillon-frontend` build via `api.ui_dir`; Caddy only
   TLS-terminates and reverse-proxies. **No CORS, no cross-origin, no cookies.**
 - **App listens on loopback only** (`127.0.0.1:3000`); the reverse proxy is the
   only public surface.
@@ -67,7 +67,7 @@ Kernel tunables that make 10³–10⁴ held sockets possible are in Phase 1.
 - [ ] **Resend** (or chosen mailer): API key + verified sending subdomain.
 - [ ] **Object storage** for Litestream: an S3-compatible bucket (Backblaze B2 /
       Scaleway / OVH) + scoped credentials.
-- [ ] **Build `carillon-admin`** on a machine with Node (CI, **not** the VPS —
+- [ ] **Build `carillon-frontend`** on a machine with Node (CI, **not** the VPS —
       keep the Node toolchain off the box). Produce `dist/` with
       `VITE_API_BASE_URL` **empty** (same-origin). Artifact to ship: the `dist/`.
 - [ ] **age key generated offline** (§ Phase 2) and its backup already stored in
@@ -200,9 +200,9 @@ per-watch HMAC via `/rotate-secret` with overlap) live in `DEPLOY_HARDENING.md` 
 ```sh
 # Build the release binary (uses the repo's nix flake + the imap-types patch).
 nix develop --command cargo build --release
-sudo install -m 0755 target/release/carillon-server /usr/local/bin/carillon
+sudo install -m 0755 target/release/carillon-backend /usr/local/bin/carillon
 
-# Ship the carillon-admin dist/ (built in CI) to the box, served same-origin.
+# Ship the carillon-frontend dist/ (built in CI) to the box, served same-origin.
 sudo mkdir -p /var/lib/carillon/ui
 sudo rsync -a dist/ /var/lib/carillon/ui/
 sudo chown -R carillon:carillon /var/lib/carillon

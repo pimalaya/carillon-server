@@ -114,7 +114,7 @@ pub struct AppState {
 }
 
 /// Builds the control API router. `ui_dir`, if set, is served as static
-/// files at the origin (self-host embedding a `carillon-admin` build);
+/// files at the origin (self-host embedding a `carillon-frontend` build);
 /// `cors_origin`, if set, enables cross-origin access for a CDN-served
 /// front.
 pub fn router(state: AppState, ui_dir: Option<PathBuf>, cors_origin: Option<String>) -> Router {
@@ -175,7 +175,7 @@ pub fn router(state: AppState, ui_dir: Option<PathBuf>, cors_origin: Option<Stri
 /// Service metadata for the root path (self-host without a UI).
 async fn service_info() -> Json<serde_json::Value> {
     Json(json!({
-        "name": "carillon-server",
+        "name": "carillon-backend",
         "version": env!("CARGO_PKG_VERSION"),
         "openapi": "/openapi.yaml",
         "docs": "https://carillon.pimalaya.org",

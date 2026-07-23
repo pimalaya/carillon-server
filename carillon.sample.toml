@@ -34,7 +34,7 @@ reconcile_interval_secs = 60
 [api]
 # Listen address of the HTTP control API.
 listen = "127.0.0.1:3000"
-# Serve a built carillon-admin dist/ at the origin (self-host + UI).
+# Serve a built carillon-frontend dist/ at the origin (self-host + UI).
 # ui_dir = "/var/lib/carillon/ui"
 # Allow a cross-origin CDN front to call the API (SaaS).
 # cors_allow_origin = "https://app.carillon.example.org"

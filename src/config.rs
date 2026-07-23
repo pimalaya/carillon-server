@@ -308,7 +308,7 @@ pub struct ApiConfig {
     /// Listen address of the HTTP control API.
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Optional directory of static UI assets (a built `carillon-admin`
+    /// Optional directory of static UI assets (a built `carillon-frontend`
     /// `dist/`) to serve at the API origin. Unset = API only (the SaaS
     /// front serves the UI from a CDN instead).
     #[serde(default)]
