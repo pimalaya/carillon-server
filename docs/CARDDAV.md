@@ -71,8 +71,8 @@ later poll emits the real delta. A server that rejects a stale token surfaces as
 - `src/supervisor.rs` — `carddav_watch_loop`: resolve credential (Basic, or a
   fresh OAuth bearer), poll, checkpoint, sleep, back off on failure.
 
-Built on the local [`io-webdav`](../../io-webdav) crate (RFC 6578
-`SyncCollection`) over [`io-http`](../../io-http), driven exactly like the IMAP
+Built on the [`io-webdav`](https://github.com/pimalaya/io-webdav) crate (RFC 6578
+`SyncCollection`) over [`io-http`](https://github.com/pimalaya/io-http), driven exactly like the IMAP
 coroutines — no blocking client, our own tokio-rustls stream.
 
 ## Not yet
