@@ -1,17 +1,17 @@
 //! SSRF egress guard.
 //!
 //! Several public, unauthenticated endpoints make the server originate
-//! connections to caller-supplied destinations: `/test` and `/mailboxes`
-//! TLS-connect to an arbitrary `imap_host:port`, and `/webhook/test` (plus a
-//! created watch) POSTs to an arbitrary URL. Without a guard those become an
-//! internal port-scanner and an SSRF into loopback / the cloud metadata
-//! service.
+//! connections to caller-supplied destinations (`/test` and
+//! `/mailboxes` TLS-connect to an arbitrary `imap_host:port`;
+//! `/webhook/test` and a created watch POST to an arbitrary URL).
+//! Without a guard those become an internal port-scanner and an SSRF
+//! into loopback or the cloud metadata service.
 //!
-//! This module classifies destination IPs and resolves a host to a **single
-//! validated address** so the caller connects to exactly what was checked
-//! (closing the DNS-rebinding TOCTOU window). Loopback/private/link-local
-//! targets are refused unless the operator opts in with
-//! `[server] allow_private_targets` (self-host / local dev / tests).
+//! Destination IPs are classified and a host is resolved to a single
+//! validated address, so the caller connects to exactly what was
+//! checked (closing the DNS-rebinding TOCTOU window). Private targets
+//! are refused unless the operator opts in with
+//! `[server] allow_private_targets`.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::OnceLock;
@@ -20,12 +20,12 @@ use anyhow::{Context, Result, bail};
 use tokio::net::lookup_host;
 use url::Url;
 
-/// Process-wide policy set once at startup. `None`/`false` = block private
-/// targets (the secure default); `true` = permit them (self-host / dev).
+/// Process-wide policy set once at startup. `None`/`false` blocks
+/// private targets (the secure default); `true` permits them.
 static ALLOW_PRIVATE: OnceLock<bool> = OnceLock::new();
 
-/// Sets the process-wide egress policy from config. Idempotent; the first
-/// call wins (later calls, e.g. in tests, are ignored).
+/// Sets the process-wide egress policy from config. Idempotent; the
+/// first call wins.
 pub fn set_allow_private_targets(allow: bool) {
     let _ = ALLOW_PRIVATE.set(allow);
 }
@@ -34,11 +34,11 @@ fn allow_private() -> bool {
     *ALLOW_PRIVATE.get().unwrap_or(&false)
 }
 
-/// Whether we refuse to originate a connection to this IP: anything that is
-/// not a globally-routable unicast address — loopback, private (RFC1918 /
-/// IPv6 ULA), link-local (which includes the cloud metadata address
-/// `169.254.169.254`), unspecified, multicast, broadcast, and the
-/// `0.0.0.0/8` / CGNAT ranges.
+/// Whether to refuse originating a connection to this IP: anything not
+/// a globally-routable unicast address (loopback, private (RFC1918 /
+/// IPv6 ULA), link-local including the cloud metadata address
+/// `169.254.169.254`, unspecified, multicast, broadcast, and the
+/// `0.0.0.0/8` / CGNAT ranges).
 pub fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -48,7 +48,8 @@ pub fn is_blocked_ip(ip: &IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.is_broadcast()
                 || v4.is_multicast()
-                // 0.0.0.0/8 ("this network") and 100.64.0.0/10 (CGNAT).
+                // NOTE: 0.0.0.0/8 ("this network") and 100.64.0.0/10
+                // (CGNAT).
                 || v4.octets()[0] == 0
                 || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
         }
@@ -58,8 +59,8 @@ pub fn is_blocked_ip(ip: &IpAddr) -> bool {
                 || v6.is_multicast()
                 || is_unique_local_v6(v6)
                 || is_link_local_v6(v6)
-                // An IPv4-mapped address (`::ffff:a.b.c.d`) is only as safe as
-                // the embedded IPv4 — validate that.
+                // NOTE: an IPv4-mapped address (`::ffff:a.b.c.d`) is
+                // only as safe as its embedded IPv4; validate that.
                 || v6
                     .to_ipv4_mapped()
                     .is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
@@ -77,10 +78,11 @@ fn is_link_local_v6(ip: &Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
-/// Resolves `host:port` and returns the first allowed socket address. The
-/// caller must connect to *this* address (not re-resolve the host) to stay
-/// rebinding-safe. Errors if the host resolves to nothing, or only to blocked
-/// addresses (and the private-target opt-in is off).
+/// Resolves `host:port` and returns the first allowed socket address.
+///
+/// The caller must connect to this address (not re-resolve the host) to
+/// stay rebinding-safe. Errors if the host resolves to nothing, or only
+/// to blocked addresses with the private-target opt-in off.
 pub async fn resolve_allowed(host: &str, port: u16) -> Result<SocketAddr> {
     let allow = allow_private();
     let addrs = lookup_host((host, port))
@@ -104,9 +106,9 @@ pub async fn resolve_allowed(host: &str, port: u16) -> Result<SocketAddr> {
     bail!("host '{host}' resolved to no addresses");
 }
 
-/// Validates that a URL's host is a permitted egress target — an IP literal is
-/// checked directly, a name is resolved and validated. Used before the server
-/// POSTs to a caller-supplied webhook URL.
+/// Validates that a URL's host is a permitted egress target: an IP
+/// literal is checked directly, a name is resolved and validated. Used
+/// before POSTing to a caller-supplied webhook URL.
 pub async fn check_url_host(url: &Url) -> Result<()> {
     let host = url.host_str().context("URL has no host")?;
 

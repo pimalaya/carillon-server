@@ -1,11 +1,10 @@
 //! A small fixed-window rate limiter.
 //!
 //! The `/test` endpoint authenticates arbitrary credentials against
-//! arbitrary servers on request — an open credential-testing oracle if
-//! left ungated. This caps attempts per key (we key on `(client IP,
-//! login)`) so Carillon adds no meaningful guessing power beyond what
-//! the target IMAP server already exposes: the server *is* the oracle;
-//! we only refuse to parallelise it.
+//! arbitrary servers on request, an open credential-testing oracle if
+//! left ungated. Capping attempts per `(client IP, login)` key adds no
+//! meaningful guessing power beyond what the target IMAP server already
+//! exposes; it only refuses to parallelise it.
 //!
 //! Fixed windows are coarse (a caller can burst at a boundary) but
 //! simple, allocation-light and adequate for an anti-oracle guard.
@@ -46,8 +45,8 @@ impl RateLimiter {
         let now = Instant::now();
         let mut windows = self.windows.lock().expect("rate limiter mutex poisoned");
 
-        // Opportunistic prune so a churn of distinct keys does not grow
-        // the map without bound.
+        // NOTE: opportunistic prune so a churn of distinct keys does not
+        // grow the map without bound.
         if windows.len() > 4096 {
             windows.retain(|_, window| window.reset_at > now);
         }

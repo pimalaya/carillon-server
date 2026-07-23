@@ -1,17 +1,15 @@
 //! The canonical, content-free change event.
 //!
-//! Every watcher, whatever the source protocol, folds its native
-//! change into this single shape. It carries *that* something changed
-//! and *which* UID — never the sender, subject or body. Enriching the
-//! notification is the consumer's job (it holds the credentials); the
-//! signal Carillon emits stays pure.
+//! Every watcher folds its native change into this single shape. It
+//! carries that something changed and which UID; never the sender,
+//! subject or body. Enriching the notification is the consumer's job
+//! (it holds the credentials).
 //!
-//! Two fields exist purely for delivery hygiene, not content: a unique
-//! [`id`](ChangeEvent::id) so receivers can dedupe our retries
-//! (idempotency), and a creation [`ts`](ChangeEvent::ts) that is folded
-//! into the signed preimage for replay protection. Both are stamped
-//! once, at fold time, so every retry of the same event carries the
-//! same id, timestamp and signature.
+//! [`id`](ChangeEvent::id) lets receivers dedupe retries;
+//! [`ts`](ChangeEvent::ts) is folded into the signed preimage for
+//! replay protection. Both are stamped once, at fold time, so every
+//! retry of the same event carries the same id, timestamp and
+//! signature.
 
 use io_imap::watch::ImapMailboxWatchEvent;
 use rand::RngExt;
@@ -25,10 +23,10 @@ use crate::util::now_secs;
 pub enum ChangeKind {
     /// A message appeared (new UID).
     New,
-    /// A resource was created or modified. Used by CardDAV, where a poll's
-    /// `sync-collection` reports a changed member (new *or* edited — the same
-    /// etag change) without distinguishing the two; "changed" is the honest,
-    /// content-free label. (IMAP splits new/flags instead.)
+    /// A resource was created or modified. Used by CardDAV, whose
+    /// `sync-collection` poll reports a changed member (new or edited,
+    /// the same etag change) without distinguishing the two. IMAP splits
+    /// new/flags instead.
     Changed,
     /// Flags were set on an existing message.
     FlagsAdded,
@@ -54,40 +52,38 @@ impl ChangeKind {
 /// The signed payload POSTed to a watch's notify URL.
 #[derive(Clone, Debug, Serialize)]
 pub struct ChangeEvent {
-    /// Unique event id (128-bit random, hex). Stable across retries so
-    /// receivers can dedupe; never a content leak.
+    /// Unique event id (128-bit random, hex), stable across retries so
+    /// receivers can dedupe.
     pub id: String,
-    /// Unix timestamp (seconds) the event was folded. Signed for replay
-    /// protection; stable across retries.
+    /// Unix timestamp (seconds) the event was folded, stable across
+    /// retries and signed for replay protection.
     pub ts: i64,
-    /// The watch (account) identifier this change belongs to.
+    /// The watch (account) this change belongs to.
     pub account: String,
     /// What changed.
     pub event: ChangeKind,
-    /// The affected message UID (IMAP). Omitted for sources that identify a
-    /// change by an opaque reference instead (CardDAV — see [`resource`]).
+    /// The affected message UID (IMAP). Omitted for sources that
+    /// identify a change by opaque reference (CardDAV, see [`resource`]).
     ///
     /// [`resource`]: ChangeEvent::resource
     #[serde(skip_serializing_if = "is_zero")]
     pub uid: u32,
-    /// The changed resource's opaque reference — a CardDAV member href's last
-    /// path segment. Content-free (a resource id, never card contents), the
-    /// exact analogue of an IMAP UID. `None` for IMAP.
+    /// The changed resource's opaque reference: a CardDAV member href's
+    /// last path segment, the content-free analogue of an IMAP UID.
+    /// `None` for IMAP.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
 }
 
-/// Whether a UID is zero — the sentinel for "not applicable" (a CardDAV
-/// event), so the `uid` field is dropped from that payload. IMAP UIDs are
-/// always ≥ 1, so an IMAP payload always carries it.
+/// Whether a UID is zero, the "not applicable" sentinel for a CardDAV
+/// event (dropping `uid` from its payload). IMAP UIDs are always ≥ 1.
 fn is_zero(uid: &u32) -> bool {
     *uid == 0
 }
 
 impl ChangeEvent {
     /// Folds a native IMAP watch event into the canonical shape,
-    /// tagging it with the owning account and stamping a fresh id and
-    /// timestamp.
+    /// stamping a fresh id and timestamp.
     pub fn from_watch(account: impl Into<String>, event: &ImapMailboxWatchEvent) -> Self {
         let (kind, uid) = match event {
             ImapMailboxWatchEvent::EnvelopeAdded { uid, .. } => (ChangeKind::New, uid.get()),
@@ -100,17 +96,17 @@ impl ChangeEvent {
         Self::build(account.into(), kind, uid, None)
     }
 
-    /// A `new`-mail event for a UID, used by the IDLE-only watcher (which,
-    /// lacking QRESYNC/CONDSTORE, tracks new messages only).
+    /// A `new`-mail event for a UID, used by the IDLE-only watcher
+    /// (which, lacking QRESYNC/CONDSTORE, tracks new messages only).
     pub fn new_mail(account: impl Into<String>, uid: u32) -> Self {
         Self::build(account.into(), ChangeKind::New, uid, None)
     }
 
-    /// Folds a CardDAV addressbook change into the canonical shape. There is
-    /// no UID; the changed member is identified by its opaque `resource`
-    /// reference (its href's last segment). Only `changed` (created or edited —
-    /// a poll can't tell them apart) and `removed` occur — WebDAV has no flag
-    /// concept.
+    /// Folds a CardDAV addressbook change into the canonical shape.
+    ///
+    /// There is no UID; the changed member is identified by its opaque
+    /// `resource` reference (its href's last segment). Only `changed`
+    /// and `removed` occur, since WebDAV has no flag concept.
     pub fn carddav(
         account: impl Into<String>,
         event: ChangeKind,

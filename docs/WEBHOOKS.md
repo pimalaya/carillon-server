@@ -1,12 +1,8 @@
-# Carillon webhooks — payload, signature & verification
+# Carillon webhooks: payload, signature & verification
 
-Carillon POSTs a small, **content-free** JSON body to your notify URL the
-instant a watched mailbox changes. This document is the contract: the
-payload shape, the headers, and how to verify a delivery is genuinely
-from Carillon and not a spoof or a replay.
+Carillon POSTs a small, **content-free** JSON body to your notify URL the instant a watched mailbox changes. This document is the contract: the payload shape, the headers, and how to verify a delivery is genuinely from Carillon and not a spoof or a replay.
 
-> The signature **is** the authentication. Your notify URL is a public
-> endpoint; anyone who learns it can POST to it. Verify every call.
+> The signature **is** the authentication. Your notify URL is a public endpoint; anyone who learns it can POST to it. Verify every call.
 
 ## Payload
 
@@ -20,21 +16,19 @@ from Carillon and not a spoof or a replay.
 }
 ```
 
-- `id` — unique per event, **stable across retries**: dedupe on it.
-- `ts` — unix seconds the event was observed (also in the signature).
-- `account` — the watch id.
-- `event` — `new` · `flags_added` · `flags_removed` · `removed`.
-- `uid` — the affected message UID.
+- `id`: unique per event, **stable across retries**: dedupe on it.
+- `ts`: unix seconds the event was observed (also in the signature).
+- `account`: the watch id.
+- `event`: `new` · `flags_added` · `flags_removed` · `removed`.
+- `uid`: the affected message UID.
 
-There is deliberately **no** sender, subject or body. If you want a rich
-notification, fetch the envelope yourself with your own credentials after
-the ping — Carillon never sees it.
+There is deliberately **no** sender, subject or body. If you want a rich notification, fetch the envelope yourself with your own credentials after the ping: Carillon never sees it.
 
 ## Headers
 
 | Header | Meaning |
 |---|---|
-| `X-Carillon-Signature` | `t=<ts>,v1=<hex>[,v1=<hex>]` — see below |
+| `X-Carillon-Signature` | `t=<ts>,v1=<hex>[,v1=<hex>]`: see below |
 | `X-Carillon-Id` | the event `id`, for idempotency |
 | `X-Carillon-Event` | the `event` kind |
 | `X-Carillon-Account` | the watch id |
@@ -42,8 +36,7 @@ the ping — Carillon never sees it.
 
 ## Signature scheme
 
-Stripe-style. The signed **preimage** is the timestamp, a literal `.`,
-then the exact raw request body:
+Stripe-style. The signed **preimage** is the timestamp, a literal `.`, then the exact raw request body:
 
 ```
 preimage = "{t}.{raw_body}"
@@ -56,24 +49,18 @@ The header carries the timestamp and one or more `v1` values:
 X-Carillon-Signature: t=1784501124,v1=5257af…,v1=9b31c0…
 ```
 
-Multiple `v1` values appear **during a secret rotation overlap** (signed
-with both the new and the previous secret). Accept the delivery if *any*
-`v1` matches the HMAC computed with the secret you hold.
+Multiple `v1` values appear **during a secret rotation overlap** (signed with both the new and the previous secret). Accept the delivery if *any* `v1` matches the HMAC computed with the secret you hold.
 
 To verify:
 
 1. Read `t` and the `v1` list from the header.
-2. Recompute `expected = hex(HMAC_SHA256(your_secret, t + "." + raw_body))`.
-   Use the **raw** bytes you received — do not re-serialize the JSON.
+2. Recompute `expected = hex(HMAC_SHA256(your_secret, t + "." + raw_body))`. Use the **raw** bytes you received; do not re-serialize the JSON.
 3. Constant-time compare `expected` against each `v1`; accept on any match.
 4. **Replay**: reject if `abs(now - t)` exceeds your tolerance (~5 min).
-5. **Idempotency**: we retry failed deliveries, so the same `id` can
-   arrive more than once. Treat a repeated `id` as already handled.
+5. **Idempotency**: we retry failed deliveries, so the same `id` can arrive more than once. Treat a repeated `id` as already handled.
 6. Respond `2xx` quickly and process asynchronously.
 
-Carillon only delivers over `https://` (the sole exception is a loopback
-host, for local sinks and self-host). Non-loopback `http://` notify URLs
-are refused at watch-creation time.
+Carillon only delivers over `https://` (the sole exception is a loopback host, for local sinks and self-host). Non-loopback `http://` notify URLs are refused at watch-creation time.
 
 ## Recipes
 
@@ -152,9 +139,4 @@ curl -X POST http://<carillon>/watches/<id>/rotate-secret \
 # -> { "status": "ok", "secret": "<new>", "prev_expires_at": <unix> }
 ```
 
-Update your receiver's configured secret to the returned value. Until
-`prev_expires_at`, deliveries are signed with **both** the old and new
-secrets (two `v1` values), so a receiver on either secret keeps
-validating — no dropped events during the cutover. Omit `new_secret` to
-have Carillon generate one, or pass your own.
-```
+Update your receiver's configured secret to the returned value. Until `prev_expires_at`, deliveries are signed with **both** the old and new secrets (two `v1` values), so a receiver on either secret keeps validating: no dropped events during the cutover. Omit `new_secret` to have Carillon generate one, or pass your own.

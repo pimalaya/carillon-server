@@ -2,9 +2,8 @@
 //!
 //! A small axum service to manage watches at runtime and inspect the
 //! delivery log. It writes the store (the source of truth) and nudges
-//! the supervisor to reconcile; the supervisor owns all the
-//! connections. This is the prototype's stand-in for the eventual
-//! dashboard and billing gate.
+//! the supervisor to reconcile; the supervisor owns all the connections.
+//! The prototype's stand-in for the eventual dashboard and billing gate.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -82,34 +81,33 @@ pub struct AppState {
     pub discover_limiter: Arc<RateLimiter>,
     /// Live bus the `/events` SSE stream subscribes to.
     pub live: LiveBus,
-    /// Flips to `true` when the server begins shutting down. The `/events`
-    /// SSE stream watches it and ends, so a held connection cannot block
-    /// graceful shutdown (an open SSE body never completes on its own, and
-    /// hyper waits for every in-flight connection).
+    /// Flips to `true` when the server begins shutting down. The
+    /// `/events` SSE stream watches it and ends, so a held connection
+    /// cannot block graceful shutdown.
     pub shutdown: watch::Receiver<bool>,
     /// Payment provider adapter (stubbed until keys are wired).
     pub billing: Arc<Billing>,
     /// Transactional email sender (magic links + notices).
     pub mailer: Arc<Mailer>,
-    /// Whether watching is credit-metered (SaaS). Surfaced so the dashboard can
+    /// Whether watching is credit-metered (SaaS), so the dashboard can
     /// hide credit UI on an unmetered self-host.
     pub metered: bool,
     /// Fair-use cap: max distinct mailboxes a scoped account may watch.
     pub max_watches: usize,
-    /// Default CardDAV poll interval (seconds), surfaced on `/me` so the
-    /// dashboard can show a contacts service's poll frequency.
+    /// Default CardDAV poll interval (seconds), surfaced on `/me`.
     pub carddav_poll_secs: u64,
     /// Optional master token granting unscoped access to every account
-    /// (ops / headless self-host). `None` = no unscoped access exists;
-    /// every data route is reachable only via a capability link.
+    /// (ops / headless self-host). `None` means no unscoped access
+    /// exists; every data route is reachable only via a capability link.
     pub admin_token: Option<String>,
     /// Public base URL of this API; the OAuth redirect URI is
     /// `{public_url}/oauth/callback`.
     pub public_url: String,
-    /// Origin the OAuth-callback popup posts its result to (the dashboard).
+    /// Origin the OAuth-callback popup posts its result to (the
+    /// dashboard).
     pub dashboard_origin: String,
     /// Config-provided OAuth client overrides (own apps) for the static
-    /// providers; empty = the built-in Thunderbird public clients.
+    /// providers; empty uses the built-in Thunderbird public clients.
     pub oauth_clients: oauth::StaticClients,
 }
 
@@ -151,8 +149,8 @@ pub fn router(state: AppState, ui_dir: Option<PathBuf>, cors_origin: Option<Stri
         .route("/billing/checkout", post(billing_checkout))
         .route("/billing/webhook", post(billing_webhook));
 
-    // With a UI, static files own `/` (and unknown paths fall back to the
-    // SPA entrypoint); without one, `/` returns service metadata.
+    // NOTE: with a UI, static files own `/` (unknown paths fall back to
+    // the SPA entrypoint); without one, `/` returns service metadata.
     app = match &ui_dir {
         Some(_) => app,
         None => app.route("/", get(service_info)),
@@ -188,8 +186,8 @@ async fn openapi() -> Response {
 }
 
 /// A CORS layer allowing the configured origin (`*` for any) with the
-/// `Authorization` bearer header — pairs with the localStorage capability
-/// link, no cookies/CSRF.
+/// `Authorization` bearer header, pairing with the localStorage
+/// capability link (no cookies/CSRF).
 fn cors_layer(origin: &str) -> CorsLayer {
     let layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::DELETE])
@@ -215,20 +213,19 @@ async fn health() -> &'static str {
 struct DiscoverRequest {
     /// An email address, or a bare domain / server host.
     input: String,
-    /// What to watch: `email` (IMAP, the default) or `contacts` (CardDAV). The
-    /// type-first wizard picks this before discovering, so we resolve only the
-    /// relevant protocol.
+    /// What to watch: `email` (IMAP, the default) or `contacts`
+    /// (CardDAV). The type-first wizard picks this before discovering, so
+    /// only the relevant protocol is resolved.
     #[serde(default)]
     kind: Option<String>,
 }
 
-/// `POST /discover` — resolve an email/domain/server to IMAP onboarding
-/// **choices**: each a server endpoint + one auth method (password / OAuth /
-/// token), grouped across discovery mechanisms (via `io-pim-discovery`).
-/// Public onboarding surface, like `/test`: no credit, no account — just a
-/// hint the wizard confirms. Rate-limited per IP because it makes outbound
-/// DNS/HTTP requests. Never surfaces an error for an unresolvable input;
-/// it returns an empty choice list and the user types the server in.
+/// `POST /discover`: resolve an email/domain/server to onboarding
+/// choices, each a server endpoint + one auth method (password / OAuth /
+/// token), grouped across discovery mechanisms. Public onboarding
+/// surface, like `/test`: no credit, no account. Rate-limited per IP
+/// because it makes outbound DNS/HTTP requests. Never surfaces an error
+/// for an unresolvable input; it returns an empty choice list.
 async fn discover(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -249,8 +246,8 @@ async fn discover(
             .into_response();
     }
 
-    // Type-first: resolve only the requested protocol (Email→IMAP, the default;
-    // Contacts→CardDAV). Both serialize to a `choices` array shaped per kind.
+    // NOTE: resolve only the requested protocol (Email→IMAP default,
+    // Contacts→CardDAV). Both serialize to a `choices` array per kind.
     let contacts = matches!(request.kind.as_deref(), Some("contacts") | Some("carddav"));
     let kind_label = if contacts { "contacts" } else { "email" };
     let lookup = input.clone();
@@ -289,8 +286,9 @@ struct OauthStartRequest {
     #[serde(default)]
     scope: Option<String>,
     login: String,
-    /// For an IMAP login, the IMAP host. For a CardDAV login, the DAV host — it
-    /// keys the mailbox, matching what the poller resolves the credential by.
+    /// For an IMAP login, the IMAP host. For a CardDAV login, the DAV
+    /// host, which keys the mailbox as the poller resolves the credential
+    /// by.
     imap_host: String,
     #[serde(default = "default_port")]
     imap_port: u16,
@@ -299,17 +297,18 @@ struct OauthStartRequest {
     /// What this OAuth login is for: `imap` (default) or `carddav`.
     #[serde(default = "default_source_kind")]
     source_kind: String,
-    /// CardDAV collection context-root URL (required when `source_kind=carddav`).
+    /// CardDAV collection context-root URL (required when
+    /// `source_kind=carddav`).
     #[serde(default)]
     carddav_url: Option<String>,
 }
 
-/// `POST /oauth/start` — begin an OAuth login for a mailbox. Resolves the
-/// provider (dynamic registration where offered — Fastmail — else a known
-/// public client for Google/Microsoft), builds the authorization URL, and
-/// stashes the flow keyed by its CSRF state. The dashboard opens the URL in a
-/// popup; the provider redirects the browser to `/oauth/callback`. Public
-/// onboarding surface, rate-limited per `(IP, login)`.
+/// `POST /oauth/start`: begin an OAuth login for a mailbox. Resolves the
+/// provider (dynamic registration where offered, else a known public
+/// client), builds the authorization URL, and stashes the flow keyed by
+/// its CSRF state. The dashboard opens the URL in a popup; the provider
+/// redirects the browser to `/oauth/callback`. Public onboarding surface,
+/// rate-limited per `(IP, login)`.
 async fn oauth_start(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -327,7 +326,7 @@ async fn oauth_start(
             .into_response();
     }
 
-    // Join the account behind a presented capability link, if any.
+    // NOTE: join the account behind a presented capability link, if any.
     let account_id =
         bearer(&headers).and_then(|token| state.store.resolve_capability(&token).ok().flatten());
 
@@ -399,12 +398,11 @@ struct OauthCallbackParams {
     error_description: Option<String>,
 }
 
-/// `GET /oauth/callback` — the provider's redirect. Exchanges the code,
-/// verifies the token actually authenticates to IMAP (`OAUTHBEARER`), mints
-/// or joins the capability-link account (exactly like `/auth`), and stores the
-/// encrypted refresh token as the mailbox's OAuth credential. Returns a small
-/// HTML page that hands the result back to the dashboard window that opened
-/// the popup and closes.
+/// `GET /oauth/callback`: the provider's redirect. Exchanges the code,
+/// verifies the token authenticates (`OAUTHBEARER`), mints or joins the
+/// capability-link account (like `/auth`), and stores the encrypted
+/// refresh token as the mailbox's OAuth credential. Returns a small HTML
+/// page that hands the result back to the dashboard popup and closes.
 async fn oauth_callback(
     State(state): State<AppState>,
     Query(params): Query<OauthCallbackParams>,
@@ -423,7 +421,8 @@ async fn oauth_callback(
         return oauth_popup(&state.dashboard_origin, oauth_err("missing state"));
     }
 
-    // Consume the pending flow (single-use, CSRF-checked by the state key).
+    // NOTE: consume the pending flow (single-use, CSRF-checked by the
+    // state key).
     let store = state.store.clone();
     let state_key = params.state.clone();
     let oauth_session = match tokio::task::spawn_blocking(move || {
@@ -441,7 +440,6 @@ async fn oauth_callback(
         _ => return oauth_popup(&state.dashboard_origin, oauth_err("server error")),
     };
 
-    // Exchange the code for tokens.
     let client_secret = match &oauth_session.enc_client_secret {
         Some(enc) => match state.crypto.decrypt(enc) {
             Ok(secret) => Some(secret),
@@ -486,9 +484,9 @@ async fn oauth_callback(
         );
     };
 
-    // Prove the token authenticates. IMAP does a full probe (auth + IDLE/
-    // QRESYNC); CardDAV does a current-user-principal PROPFIND with the bearer
-    // (a DAV collection is polled, so there is no IDLE/QRESYNC to check).
+    // NOTE: prove the token authenticates. IMAP does a full probe (auth
+    // + IDLE/QRESYNC); CardDAV does a current-user-principal PROPFIND
+    // (a polled collection has no IDLE/QRESYNC to check).
     let is_carddav = oauth_session.source_kind == "carddav";
     let (watchable, missing, qresync) = if is_carddav {
         let account = CardDavAccount {
@@ -525,8 +523,9 @@ async fn oauth_callback(
                 )),
             );
         }
-        // QRESYNC-less providers (Gmail, Yahoo, …) are still watchable, but new
-        // mail only — the UI surfaces that as a warning.
+        // NOTE: QRESYNC-less providers (Gmail, Yahoo, …) are still
+        // watchable, but new mail only; the UI surfaces that as a
+        // warning.
         (probe.watchable(), probe.missing(), probe.qresync)
     };
 
@@ -537,7 +536,8 @@ async fn oauth_callback(
 
     let mailbox_key = metering::mailbox_key(&oauth_session.login, &oauth_session.imap_host);
     let expires = Some(now_secs() + CAPABILITY_TTL.as_secs() as i64);
-    // Keep the mailbox context for the success payload before the session moves.
+    // NOTE: keep the mailbox context for the success payload before the
+    // session moves.
     let login = oauth_session.login.clone();
     let imap_host = oauth_session.imap_host.clone();
     let imap_port = oauth_session.imap_port;
@@ -545,8 +545,9 @@ async fn oauth_callback(
 
     let store = state.store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
-        // Join the presented account, else recover the mailbox's account, else
-        // create a fresh one — the same identity flow as `/auth`.
+        // NOTE: join the presented account, else recover the mailbox's
+        // account, else create a fresh one; the same identity flow as
+        // `/auth`.
         let (account_id, link) = match oauth_session.account_id.clone() {
             Some(id) => {
                 let link = random_secret();
@@ -568,10 +569,11 @@ async fn oauth_callback(
                 }
             },
         };
-        // Record the membership under the login's protocol (CardDAV carries the
-        // context root as its base_url). The welcome trial is granted per-service
-        // at create_watch (§ v3), so the OAuth login itself grants nothing — it
-        // just proves + stores the credential and joins/mints the account.
+        // NOTE: record the membership under the login's protocol
+        // (CardDAV carries the context root as its base_url). The welcome
+        // trial is granted per-service at create_watch, so the OAuth
+        // login grants nothing; it just proves + stores the credential
+        // and joins/mints the account.
         let (protocol, base_url) = if is_carddav {
             ("carddav", oauth_session.carddav_url.clone())
         } else {
@@ -629,9 +631,10 @@ fn oauth_err(message: &str) -> serde_json::Value {
     json!({ "type": "carillon-oauth", "ok": false, "error": message })
 }
 
-/// A tiny HTML page that hands the OAuth result to the dashboard window that
-/// opened the popup (via `postMessage` to its origin) and closes. `<` is
-/// escaped in the embedded JSON so a value cannot break out of the script.
+/// A tiny HTML page that hands the OAuth result to the dashboard window
+/// that opened the popup (via `postMessage` to its origin) and closes.
+/// `<` is escaped in the embedded JSON so a value cannot break out of the
+/// script.
 fn oauth_popup(dashboard_origin: &str, payload: serde_json::Value) -> Response {
     let json = serde_json::to_string(&payload)
         .unwrap_or_else(|_| "{}".into())
@@ -649,7 +652,7 @@ fn oauth_popup(dashboard_origin: &str, payload: serde_json::Value) -> Response {
 }
 
 /// Body of `POST /test`: credentials to probe, read-only. `source_kind`
-/// selects the protocol (`imap` default, or `carddav` — which probes the
+/// selects the protocol (`imap` default, or `carddav`, which probes the
 /// `carddav_url` collection instead of an IMAP mailbox).
 #[derive(Deserialize)]
 struct TestRequest {
@@ -668,11 +671,10 @@ struct TestRequest {
     carddav_url: Option<String>,
 }
 
-/// Structured verdict returned by `POST /test`. `ok` is the plan's green
-/// light. For IMAP that is reachable + authenticated + IDLE (QRESYNC is a
-/// bonus); for CardDAV it is reachable + authenticated + a reported
-/// `sync-token`. The unused capability flags are simply `false` for the
-/// other protocol.
+/// Structured verdict returned by `POST /test`. `ok` is the green light:
+/// for IMAP, reachable + authenticated + IDLE (QRESYNC a bonus); for
+/// CardDAV, reachable + authenticated + a reported `sync-token`. The
+/// unused capability flags are `false` for the other protocol.
 #[derive(Serialize)]
 struct TestVerdict {
     ok: bool,
@@ -681,8 +683,9 @@ struct TestVerdict {
     idle: bool,
     qresync: bool,
     condstore: bool,
-    /// CardDAV: the collection reports a change token (RFC 6578 sync-token
-    /// or a CalendarServer ctag), so it can be watched by polling.
+    /// CardDAV: the collection reports a change token (RFC 6578
+    /// sync-token or a CalendarServer ctag), so it can be watched by
+    /// polling.
     sync: bool,
     missing: Vec<&'static str>,
     error: Option<String>,
@@ -711,9 +714,9 @@ async fn test_connect(
             .into_response();
     }
 
-    // CardDAV: probe the addressbook collection instead of an IMAP mailbox,
-    // reusing the PIM account's stored credential when no password is given
-    // (the 'Add service' flow holds a capability link, not the raw password).
+    // NOTE: probe the addressbook collection instead of an IMAP mailbox,
+    // reusing the PIM account's stored credential when no password is
+    // given (the 'Add service' flow holds a capability link).
     if request.source_kind == "carddav" {
         let Some(url) = request.carddav_url.clone() else {
             return bad_request("carddav_url is required for a CardDAV test");
@@ -803,8 +806,8 @@ async fn test_connect(
 
 /// Body of `POST /mailboxes`: the connection to list folders on. A
 /// non-empty `password` lists via `LOGIN` (unauthenticated, rate-limited
-/// like `/test`); an empty one lists an **OAuth** mailbox using the stored
-/// credential — which requires a capability link scoping the caller.
+/// like `/test`); an empty one lists an OAuth mailbox using the stored
+/// credential, requiring a capability link scoping the caller.
 #[derive(Deserialize)]
 struct MailboxesRequest {
     imap_host: String,
@@ -815,10 +818,10 @@ struct MailboxesRequest {
     password: String,
 }
 
-/// `POST /mailboxes` — authenticate and `LIST` the account's selectable
+/// `POST /mailboxes`: authenticate and `LIST` the account's selectable
 /// mailboxes, so onboarding can offer a picker (defaulting to the inbox)
 /// instead of a free-text folder field. Rate-limited per `(IP, login)`,
-/// same as `/test`. Returns `{ mailboxes: [{ name, role }] }`.
+/// like `/test`. Returns `{ mailboxes: [{ name, role }] }`.
 async fn list_mailboxes(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -844,9 +847,10 @@ async fn list_mailboxes(
         mailbox: default_mailbox(),
     };
 
-    // Empty password ⇒ reuse the PIM account's stored credential (the folder
-    // picker for 'Add service'): a password (decrypt + LOGIN) or, failing that,
-    // OAuth (mint a fresh bearer token) — exactly as the watcher resolves it.
+    // NOTE: an empty password reuses the PIM account's stored credential
+    // (the folder picker for 'Add service'): a password (decrypt +
+    // LOGIN) or, failing that, OAuth (mint a fresh bearer token), as the
+    // watcher resolves it.
     if request.password.is_empty() {
         let Some(token) = bearer(&headers) else {
             return unauthorized();
@@ -885,18 +889,19 @@ async fn list_mailboxes(
     }
 }
 
-/// Body of `POST /webhook/test`: where to send the one-shot test event and
-/// the secret to sign it with (the wizard already holds the watch's secret).
+/// Body of `POST /webhook/test`: where to send the one-shot test event
+/// and the secret to sign it with (the wizard already holds the watch's
+/// secret).
 #[derive(Deserialize)]
 struct WebhookTestRequest {
     notify_url: String,
     hmac_secret: String,
 }
 
-/// `POST /webhook/test` — POST one synthetic, signed `test` event to the
+/// `POST /webhook/test`: POST one synthetic, signed `test` event to the
 /// given URL so onboarding can prove the endpoint is reachable and
-/// verifying signatures **before** activating. Rate-limited per IP (it
-/// makes an outbound request to a caller-supplied URL). Never retried.
+/// verifying signatures before activating. Rate-limited per IP (it makes
+/// an outbound request to a caller-supplied URL). Never retried.
 async fn test_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -915,7 +920,8 @@ async fn test_webhook(
     if let Err(err) = validate_notify_url(&request.notify_url) {
         return bad_request(&err.to_string());
     }
-    // SSRF guard: refuse to POST to a private/loopback target (unless opted in).
+    // NOTE: SSRF guard; refuse to POST to a private/loopback target
+    // (unless opted in).
     match Url::parse(&request.notify_url) {
         Ok(url) => {
             if let Err(err) = guard::check_url_host(&url).await {
@@ -935,22 +941,24 @@ async fn test_webhook(
     .into_response()
 }
 
-/// Body of `POST /addressbooks`: the CardDAV account to list collections on.
-/// Like `/mailboxes`, an empty `password` reuses the account's stored credential
-/// (requires a capability link scoping the caller).
+/// Body of `POST /addressbooks`: the CardDAV account to list collections
+/// on. Like `/mailboxes`, an empty `password` reuses the account's stored
+/// credential (requiring a capability link scoping the caller).
 #[derive(Deserialize)]
 struct AddressbooksRequest {
-    /// CardDAV context-root URL (from discovery, or the account's stored one).
+    /// CardDAV context-root URL (from discovery, or the account's stored
+    /// one).
     carddav_url: String,
     login: String,
     #[serde(default)]
     password: String,
 }
 
-/// `POST /addressbooks` — the CardDAV target picker: list an account's
-/// addressbook collections (current-user-principal → home-set → collections,
-/// following redirects). Content-free (hrefs + display names only). Rate-limited
-/// per `(IP, login)`, same as `/mailboxes`. Returns `{ addressbooks: [{ name, url }] }`.
+/// `POST /addressbooks`: the CardDAV target picker, listing an account's
+/// addressbook collections (current-user-principal → home-set →
+/// collections, following redirects). Content-free (hrefs + display
+/// names only). Rate-limited per `(IP, login)`, like `/mailboxes`.
+/// Returns `{ addressbooks: [{ name, url }] }`.
 async fn list_addressbooks(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -968,10 +976,10 @@ async fn list_addressbooks(
             .into_response();
     }
 
-    // Resolve the credential: an explicit password, else (empty) the account's
-    // stored one — keyed by the identity (host from the DAV URL). Empty falls
-    // back to a stored password credential, then to OAuth (mint a fresh bearer
-    // from the refresh token) — exactly as the poller and `/mailboxes` do.
+    // NOTE: an explicit password, else (empty) the account's stored one,
+    // keyed by the identity (host from the DAV URL): a password
+    // credential, then OAuth (mint a fresh bearer from the refresh
+    // token), as the poller and `/mailboxes` do.
     let host = Url::parse(&request.carddav_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
@@ -996,8 +1004,9 @@ async fn list_addressbooks(
                 Err(err) => return AppError(err).into_response(),
             },
             Ok(None) => {
-                // OAuth account: mint a bearer from the stored refresh token,
-                // keyed by the DAV identity (host from the URL).
+                // NOTE: OAuth account; mint a bearer from the stored
+                // refresh token, keyed by the DAV identity (host from the
+                // URL).
                 let identity = ImapAccount {
                     host: host.clone(),
                     port: 443,
@@ -1041,9 +1050,10 @@ struct ForgetRequest {
     protocol: String,
 }
 
-/// `POST /forget` — forget a PIM account: remove its membership + every service
-/// under it, and drop the shared credential when no other protocol of the same
-/// identity remains (§ SERVICE_MODEL). Scoped to the caller's account.
+/// `POST /forget`: forget a PIM account, removing its membership + every
+/// service under it, and dropping the shared credential when no other
+/// protocol of the same identity remains (§ SERVICE_MODEL). Scoped to the
+/// caller's account.
 async fn forget_account(
     State(state): State<AppState>,
     caller: Caller,
@@ -1072,9 +1082,9 @@ struct WatchView {
     imap_host: String,
     imap_port: u16,
     login: String,
-    /// The provider domain (registrable domain of the server host, e.g.
-    /// `fastmail.com`) — what the front end labels the service by. Falls back to
-    /// the host-derived value for rows predating the column.
+    /// The provider domain (registrable domain of the server host), what
+    /// the front end labels the service by. Falls back to the
+    /// host-derived value for rows predating the column.
     provider: String,
     mailbox: String,
     notify_url: String,
@@ -1121,15 +1131,15 @@ async fn list_watches(
 }
 
 /// Body of `POST /watches`. The password is plaintext on the wire and
-/// encrypted at rest. Omit it to create an **OAuth** watch — the mailbox
-/// must already have an OAuth credential from a completed `/oauth/callback`.
+/// encrypted at rest. Omit it to create an OAuth watch; the mailbox must
+/// already have an OAuth credential from a completed `/oauth/callback`.
 #[derive(Deserialize)]
 struct CreateWatch {
     id: String,
     /// Source protocol: `imap` (default) or `carddav`. For `carddav`,
-    /// `imap_host`/`login` carry the PIM-account identity (so the mailbox key
-    /// and stored credential are shared with the account's IMAP membership),
-    /// and `carddav_url` is the collection actually polled.
+    /// `imap_host`/`login` carry the PIM-account identity (sharing the
+    /// mailbox key and credential with the account's IMAP membership) and
+    /// `carddav_url` is the collection actually polled.
     #[serde(default = "default_source_kind")]
     source_kind: String,
     imap_host: String,
@@ -1162,7 +1172,8 @@ async fn create_watch(
     if let Err(err) = validate_notify_url(&request.notify_url) {
         return Ok(bad_request(&err.to_string()));
     }
-    // SSRF guard: the notify URL must not resolve to a private/loopback target.
+    // NOTE: SSRF guard; the notify URL must not resolve to a
+    // private/loopback target.
     match Url::parse(&request.notify_url) {
         Ok(url) => {
             if let Err(err) = guard::check_url_host(&url).await {
@@ -1174,8 +1185,9 @@ async fn create_watch(
 
     let mailbox_key = metering::mailbox_key(&request.login, &request.imap_host);
 
-    // CardDAV: the collection URL is required + https, and is the service's
-    // collection URL (two addressbooks on one account are distinct services).
+    // NOTE: the CardDAV collection URL is required + https, and is the
+    // service's key (two addressbooks on one account are distinct
+    // services).
     if request.source_kind == "carddav" {
         match request.carddav_url.as_deref().map(Url::parse) {
             Some(Ok(url)) if url.scheme() == "https" => {}
@@ -1185,15 +1197,13 @@ async fn create_watch(
         }
     }
 
-    // Resolve the billing account and enforce ownership. A scoped caller
-    // watches under *its own* account (the body's account_id is ignored). The
-    // credential now lives on the service (§ SERVICE_MODEL v3): a create that
-    // carries a password is self-proving — the wizard just validated it (POST
-    // /test + the target listing) and it is stored on the watch, so no prior
-    // membership is required. Only the credential-reuse path (empty password → a
-    // stored OAuth credential, proven at /oauth/callback) still requires a
-    // recorded membership: you cannot reuse a credential you never proved. The
-    // unscoped admin may place the watch in any account (ops / import).
+    // NOTE: a scoped caller watches under its own account (the body's
+    // account_id is ignored). A create carrying a password is
+    // self-proving (the wizard just validated it), so no prior membership
+    // is required. The credential-reuse path (empty password → a stored
+    // OAuth credential) still requires a recorded membership: you cannot
+    // reuse a credential you never proved. The unscoped admin may place
+    // the watch in any account.
     let account_id = match caller.scope() {
         Some(account_id) => {
             if request.password.is_empty() {
@@ -1221,15 +1231,14 @@ async fn create_watch(
             .unwrap_or_else(|| request.id.clone()),
     };
 
-    // No same-target dedup: a user may knowingly add the same folder /
-    // addressbook twice (e.g. two webhook endpoints for it) and simply pay for
-    // each — a second identical service is a deliberate choice, not an error. An
-    // upsert of the same watch id still edits in place. (Only the fair-use cap
-    // below bounds the number of distinct mailboxes.)
+    // NOTE: no same-target dedup; a user may knowingly add the same
+    // folder twice (e.g. two webhook endpoints) and pay for each. An
+    // upsert of the same watch id still edits in place; only the fair-use
+    // cap below bounds distinct mailboxes.
 
-    // Fair-use cap: a scoped account may watch up to `max_watches` distinct
-    // mailboxes; beyond that it needs a volume plan (the ops/import path is
-    // exempt). Cost is negligible per mailbox — this only stops reselling.
+    // NOTE: fair-use cap; a scoped account may watch up to `max_watches`
+    // distinct mailboxes, beyond that it needs a volume plan (the
+    // ops/import path is exempt). This only stops reselling.
     if caller.scope().is_some() {
         let store = state.store.clone();
         let (owner, key, cap) = (account_id.clone(), mailbox_key.clone(), state.max_watches);
@@ -1247,11 +1256,10 @@ async fn create_watch(
         }
     }
 
-    // Credential kind (§ SERVICE_MODEL v3: the credential lives on the service).
-    // An explicit password is stored on the watch. An empty password reuses a
-    // stored OAuth credential for this `(account, mailbox)` (proven at
-    // `/oauth/callback`) — the only shared credential left; the supervisor
-    // resolves it per connect.
+    // NOTE: an explicit password is stored on the watch. An empty
+    // password reuses a stored OAuth credential for this `(account,
+    // mailbox)` (proven at `/oauth/callback`); the supervisor resolves it
+    // per connect.
     let (auth_kind, enc_password) = if !request.password.is_empty() {
         (
             "password".to_string(),
@@ -1273,8 +1281,9 @@ async fn create_watch(
         }
     };
 
-    // The provider domain (registrable domain of the server host) is stamped on
-    // the watch and reused for the trial gate + the create response.
+    // NOTE: the provider domain (registrable domain of the server host)
+    // is stamped on the watch and reused for the trial gate + the create
+    // response.
     let provider = metering::provider_domain(&request.imap_host);
     let watch = Watch {
         id: request.id,
@@ -1290,16 +1299,17 @@ async fn create_watch(
         account_id: account_id.clone(),
         provider: provider.clone(),
         auth_kind,
-        // Not activated yet: on the metered SaaS the service starts only after
-        // `POST /watches/{id}/activate` spends a credit (upsert leaves these,
-        // so an edit-in-place keeps the activation).
+        // NOTE: not activated yet; on the metered SaaS the service starts
+        // only after `POST /watches/{id}/activate` spends a credit
+        // (upsert leaves these, so an edit-in-place keeps the
+        // activation).
         watching_until: None,
         auto_renew: false,
         active: request.active,
         source_kind: request.source_kind,
         carddav_url: request.carddav_url,
-        // Runtime poll state: established on the first poll; the default poll
-        // interval applies (no per-service override from the API yet).
+        // NOTE: runtime poll state, established on the first poll; the
+        // default poll interval applies (no per-service override yet).
         carddav_sync_token: None,
         carddav_poll_secs: None,
     };
@@ -1307,13 +1317,12 @@ async fn create_watch(
     let id = watch.id.clone();
     let store = state.store.clone();
     let claim_account = account_id.clone();
-    // Free-trial head start (§ SERVICE_MODEL v3): the account's FIRST service on a
-    // provider auto-watches free for a week — no credit spent, no separate
-    // 'activate' step. Gated per (account, provider domain): the provider is the
-    // registrable domain of the server host, so an account's mail (imap.…) and
-    // contacts (carddav.…) hosts share one provider and only the first earns it.
-    // It is time-on-THIS-service, not a fungible credit, so it can't be farmed.
-    // `watching_until` is runtime state upsert_watch doesn't write, set it after.
+    // NOTE: free-trial head start; the account's first service on a
+    // provider auto-watches free for a week (no credit, no separate
+    // 'activate' step). Gated per (account, provider domain), so mail and
+    // contacts hosts share one provider and only the first earns it.
+    // `watching_until` is runtime state upsert_watch doesn't write, set
+    // it after.
     let claim_provider = provider.clone();
     let free_trial = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         store.upsert_watch(&watch)?;
@@ -1340,9 +1349,9 @@ async fn create_watch(
         .into_response())
 }
 
-/// Authorizes a caller for a watch by id. `Ok(None)` = allowed;
-/// `Ok(Some(resp))` = a `404` rejection that hides the watch's existence
-/// from other accounts, indistinguishable from a genuinely missing watch.
+/// Authorizes a caller for a watch by id. `Ok(None)` means allowed;
+/// `Ok(Some(resp))` is a `404` rejection that hides the watch's existence
+/// from other accounts, indistinguishable from a missing watch.
 async fn authorize_watch(
     state: &AppState,
     caller: &Caller,
@@ -1425,8 +1434,8 @@ async fn set_active(state: AppState, id: String, active: bool) -> Result<Respons
 /// empty body rotates to a fresh random secret with the default overlap.
 #[derive(Default, Deserialize)]
 struct RotateRequest {
-    /// The new secret. If omitted, a random 256-bit one is generated
-    /// and returned.
+    /// The new secret. If omitted, a random 256-bit one is generated and
+    /// returned.
     #[serde(default)]
     new_secret: Option<String>,
     /// How long (seconds) the previous secret keeps being signed with.
@@ -1436,7 +1445,7 @@ struct RotateRequest {
 
 /// Rotates a watch's HMAC secret, keeping the old one valid for an
 /// overlap window (both are signed with meanwhile). Returns the new
-/// secret and the overlap expiry. The secret does not affect the IMAP
+/// secret and the overlap expiry. The secret does not affect the
 /// connection (the supervisor fingerprint excludes it), so no reconnect.
 async fn rotate_secret(
     State(state): State<AppState>,
@@ -1511,10 +1520,10 @@ async fn list_deliveries(
 ) -> Result<Json<Vec<DeliveryView>>, AppError> {
     let limit = query.limit.clamp(1, 1000);
 
-    // Scope to the caller's account. A scoped caller may filter to one of
-    // *its own* watches (`?account=<watch id>`); asking for a watch it does
-    // not own yields an empty log, never another account's deliveries. The
-    // unscoped admin keeps the global view with the optional filter.
+    // NOTE: a scoped caller may filter to one of its own watches
+    // (`?account=<watch id>`); asking for a watch it does not own yields
+    // an empty log, never another account's deliveries. The unscoped
+    // admin keeps the global view with the optional filter.
     let scope = caller.scope();
     let filter = query.account.clone();
     let store = state.store.clone();
@@ -1548,23 +1557,22 @@ async fn list_deliveries(
     Ok(Json(views))
 }
 
-/// `GET /events` — a Server-Sent Events stream of live delivery outcomes
+/// `GET /events`: a Server-Sent Events stream of live delivery outcomes
 /// and watch connection-status changes, for the dashboard. One-way,
-/// browser-native (`EventSource`), proxy-friendly. A slow client that lags
-/// simply misses the oldest events (surfaced as a `lagged` SSE event)
-/// rather than stalling the bus. Purely observational and content-free.
+/// browser-native (`EventSource`), proxy-friendly. A slow client that
+/// lags simply misses the oldest events (surfaced as a `lagged` SSE
+/// event). Purely observational and content-free.
 ///
 /// A forwarding task pumps the (scoped) broadcast into a bounded channel
-/// that backs the response body, and ends on **either** server shutdown or
-/// client disconnect — so a held connection never blocks graceful shutdown
-/// (an open SSE body never completes on its own, and hyper waits for it).
+/// that backs the response body, ending on either server shutdown or
+/// client disconnect, so a held connection never blocks graceful
+/// shutdown.
 async fn events(
     State(state): State<AppState>,
     caller: Caller,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    // Scope the live fan-out: a capability-link subscriber sees only its
-    // own account's events (delivery/status/notice all carry the billing
-    // account they concern); the unscoped admin sees everything.
+    // NOTE: scope the live fan-out; a capability-link subscriber sees
+    // only its own account's events, the unscoped admin sees everything.
     let scope = caller.scope();
     let mut live = state.live.subscribe();
     let mut shutdown = state.shutdown.clone();
@@ -1573,7 +1581,8 @@ async fn events(
     tokio::spawn(async move {
         loop {
             let event = tokio::select! {
-                // Prefer shutdown, so it wins promptly over a busy bus.
+                // NOTE: prefer shutdown so it wins promptly over a busy
+                // bus.
                 biased;
                 _ = shutdown.wait_for(|stopping| *stopping) => break,
                 message = live.recv() => match message {
@@ -1586,15 +1595,16 @@ async fn events(
                             .event(routed.event.name())
                             .data(serde_json::to_string(&routed.event).unwrap_or_default())
                     }
-                    // The subscriber fell behind and lost some events.
+                    // NOTE: the subscriber fell behind and lost events.
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         Event::default().event("lagged").data(skipped.to_string())
                     }
-                    // The bus closed (server tearing down).
+                    // NOTE: the bus closed (server tearing down).
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
             };
-            // A send error means the client disconnected (body dropped).
+            // NOTE: a send error means the client disconnected (body
+            // dropped).
             if tx.send(Ok(event)).await.is_err() {
                 break;
             }
@@ -1605,19 +1615,22 @@ async fn events(
 }
 
 /// A slot within an account view: a service (watch) with its per-service
-/// activation state, or a proven PIM account (mailbox) that has no service yet.
+/// activation state, or a proven PIM account (mailbox) with no service
+/// yet.
 #[derive(Serialize)]
 struct MailboxView {
     /// The PIM account key (normalised login) this slot belongs to.
     mailbox_key: String,
     /// Source protocol of this PIM account (`imap` / `carddav`).
     protocol: String,
-    /// The service (watch) on this PIM account, or null (proven, no service yet).
+    /// The service (watch) on this PIM account, or null (proven, no
+    /// service yet).
     watch_id: Option<String>,
-    /// The watched target — the IMAP mailbox (folder) — that distinguishes
-    /// several services on one PIM account. Null for a service-less PIM account.
+    /// The watched target (the IMAP mailbox) that distinguishes several
+    /// services on one PIM account. Null for a service-less PIM account.
     mailbox: Option<String>,
-    /// Unix time watching is paid up to; null/past = not currently watching.
+    /// Unix time watching is paid up to; null/past means not currently
+    /// watching.
     watching_until: Option<i64>,
     /// Whether this service currently watches (paid month in the future).
     watching: bool,
@@ -1634,8 +1647,8 @@ struct AccountView {
     email: Option<String>,
     /// Fungible credit-pool balance (1 credit = one service-month).
     credits: i64,
-    /// The account's services (billed units) plus any proven-but-unwatched
-    /// mailboxes, each activated independently.
+    /// The account's services (billed units) plus any
+    /// proven-but-unwatched mailboxes, each activated independently.
     mailboxes: Vec<MailboxView>,
 }
 
@@ -1648,9 +1661,8 @@ async fn list_accounts(
     let views = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<AccountView>> {
         let now = now_secs();
         match scope {
-            // Scoped callers see only their own account (the dashboard
-            // reads it via `/me`; this keeps the list route from leaking
-            // the fleet).
+            // NOTE: scoped callers see only their own account, keeping
+            // this list route from leaking the fleet.
             Some(account_id) => Ok(vec![account_view(&store, &account_id, now)?]),
             None => store
                 .all_account_ids()?
@@ -1688,8 +1700,9 @@ async fn get_account(
     Ok(Json(view).into_response())
 }
 
-/// Builds an account view: the credit pool and each service's activation state
-/// (which lives on the watch). Blocking; call inside `spawn_blocking`.
+/// Builds an account view: the credit pool and each service's activation
+/// state (which lives on the watch). Blocking; call inside
+/// `spawn_blocking`.
 fn account_view(store: &Store, id: &str, now: i64) -> anyhow::Result<AccountView> {
     let account = store.get_account(id)?.unwrap_or(crate::store::AccountRow {
         id: id.to_string(),
@@ -1697,11 +1710,10 @@ fn account_view(store: &Store, id: &str, now: i64) -> anyhow::Result<AccountView
         credits: 0,
     });
 
-    // One slot per service (watch), carrying its activation state — a PIM account
-    // may have several. Then any PIM account (identity+protocol) with no service
-    // yet (a slot the user can add a service to). Keyed per (mailbox_key,
-    // protocol) so, e.g., an Email account with a service and a Contacts account
-    // without one both surface.
+    // NOTE: one slot per service (watch), carrying its activation state,
+    // then any PIM account (identity+protocol) with no service yet. Keyed
+    // per (mailbox_key, protocol) so a serviced Email account and a
+    // service-less Contacts account both surface.
     let mut with_service: BTreeSet<(String, String)> = BTreeSet::new();
     let mut mailboxes: Vec<MailboxView> = store
         .watches_by_account(id)?
@@ -1742,14 +1754,12 @@ fn account_view(store: &Store, id: &str, now: i64) -> anyhow::Result<AccountView
     })
 }
 
-// --- Capability-link accounts & billing (M7) ---
-
 /// The authenticated caller behind a bearer token. Every data route
-/// requires one — there is no unauthenticated access to watches,
+/// requires one; there is no unauthenticated access to watches,
 /// deliveries or events (§ DECISIONS 5). A caller is either the unscoped
-/// **admin** (presented the configured `admin_token` — ops / headless
-/// self-host) or a single **account** (presented a valid capability link,
-/// scoped to its own watches and pool).
+/// admin (presented the configured `admin_token`) or a single account
+/// (presented a valid capability link, scoped to its own watches and
+/// pool).
 enum Caller {
     /// The ops master token: sees and touches every account.
     Admin,
@@ -1780,8 +1790,8 @@ impl FromRequestParts<AppState> for Caller {
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Response> {
         let token = bearer(&parts.headers).ok_or_else(unauthorized)?;
-        // The admin token, if configured, wins. Compare digests so the
-        // comparison leaks nothing exploitable about the secret.
+        // NOTE: the admin token, if configured, wins. Compare digests so
+        // the comparison leaks nothing exploitable about the secret.
         if let Some(admin) = &state.admin_token
             && token_matches(&token, admin)
         {
@@ -1795,15 +1805,16 @@ impl FromRequestParts<AppState> for Caller {
 }
 
 /// Constant-preimage token comparison: compares SHA-256 digests rather
-/// than the raw strings, so a timing side-channel on the byte comparison
-/// reveals nothing about the secret (digests are preimage-resistant).
+/// than raw strings, so a timing side-channel on the byte comparison
+/// reveals nothing about the secret.
 fn token_matches(token: &str, expected: &str) -> bool {
     Sha256::digest(token.as_bytes()) == Sha256::digest(expected.as_bytes())
 }
 
-/// The account behind a valid capability link. Extractor: reads the
-/// `Authorization: Bearer <link>` header and resolves it, rejecting with
-/// `401` if missing, unknown or expired. Server-validated on every call.
+/// The account behind a valid capability link. An extractor that reads
+/// the `Authorization: Bearer <link>` header and resolves it, rejecting
+/// with `401` if missing, unknown or expired. Server-validated on every
+/// call.
 struct CapabilityAccount(String);
 
 impl FromRequestParts<AppState> for CapabilityAccount {
@@ -1838,9 +1849,9 @@ fn unauthorized() -> Response {
 /// Body of `POST /auth`: prove control of a PIM account (identity + protocol).
 #[derive(Deserialize)]
 struct AuthRequest {
-    /// `imap` (default) or `carddav`. The credential is validated the right way
-    /// (IMAP LOGIN vs CardDAV PROPFIND) and the proven `(identity, protocol)`
-    /// becomes a PIM account.
+    /// `imap` (default) or `carddav`. The credential is validated the
+    /// right way (IMAP LOGIN vs CardDAV PROPFIND) and the proven
+    /// `(identity, protocol)` becomes a PIM account.
     #[serde(default = "default_source_kind")]
     protocol: String,
     #[serde(default)]
@@ -1856,12 +1867,12 @@ struct AuthRequest {
     carddav_url: Option<String>,
 }
 
-/// `POST /auth` — the login-less identity flow. Authenticating proves control of
-/// a PIM account (identity + protocol); the first auth creates a Carillon
-/// account and mints its capability link, a re-auth to a member identity
-/// recovers (re-mints) the link, and an auth carrying a valid link adds the PIM
-/// account to it. The credential is stored per identity (shared across an
-/// identity's protocols). Rate-limited per `(IP, login)`.
+/// `POST /auth`: the login-less identity flow. Authenticating proves
+/// control of a PIM account (identity + protocol); the first auth creates
+/// a Carillon account and mints its capability link, a re-auth to a
+/// member identity recovers the link, and an auth carrying a valid link
+/// adds the PIM account to it. The credential is stored per identity.
+/// Rate-limited per `(IP, login)`.
 async fn auth(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1880,8 +1891,8 @@ async fn auth(
             .into_response();
     }
 
-    // Validate the credential the right way and derive the membership's server
-    // info (host/port/base_url) per protocol.
+    // NOTE: validate the credential the right way and derive the
+    // membership's server info (host/port/base_url) per protocol.
     let is_carddav = request.protocol == "carddav";
     let (authenticated, error, watchable, idle, qresync, host, port, base_url) = if is_carddav {
         let Some(url) = request.carddav_url.clone() else {
@@ -1936,8 +1947,8 @@ async fn auth(
             .into_response();
     }
 
-    // The proven password becomes the identity's credential (§ SERVICE_MODEL:
-    // shared across its protocols) — reused when adding services.
+    // NOTE: the proven password becomes the identity's credential
+    // (shared across its protocols), reused when adding services.
     let enc_password = match state.crypto.encrypt(&request.password) {
         Ok(enc) => enc,
         Err(err) => return AppError(err).into_response(),
@@ -1953,9 +1964,10 @@ async fn auth(
             let mailbox_key = metering::mailbox_key(&login, &membership_host);
             let expires = Some(now_secs() + CAPABILITY_TTL.as_secs() as i64);
 
-            // Join the account the presented link controls, else recover the
-            // account this identity already belongs to, else create a new one.
-            // Recovery is protocol-blind (any protocol proves the identity).
+            // NOTE: join the account the presented link controls, else
+            // recover the account this identity already belongs to, else
+            // create a new one. Recovery is protocol-blind (any protocol
+            // proves the identity).
             let joined = match &existing {
                 Some(token) => store
                     .resolve_capability(token)?
@@ -1990,9 +2002,9 @@ async fn auth(
                 base_url.as_deref(),
             )?;
             store.upsert_password_credential(&account_id, &mailbox_key, &enc_password)?;
-            // No welcome credit here (§ SERVICE_MODEL v3): the free head start is
-            // a per-service trial granted at create_watch, not a fungible credit —
-            // so this endpoint can't be farmed for spendable credits.
+            // NOTE: no welcome credit here; the free head start is a
+            // per-service trial granted at create_watch, so this endpoint
+            // can't be farmed for spendable credits.
             Ok((account_id, action, link))
         })
         .await;
@@ -2024,10 +2036,10 @@ struct MagicRequest {
     email: String,
 }
 
-/// `POST /auth/magic/request` — email a single-use sign-in link (§ BILLING_MODEL:
-/// magic-link is the human identity flow, and the sybil barrier for the free
-/// credit — a new account needs a real inbox). Rate-limited per `(IP, email)`.
-/// A delivery failure is surfaced: the user must receive the link to sign in.
+/// `POST /auth/magic/request`: email a single-use sign-in link, the human
+/// identity flow and the sybil barrier for the free credit (a new account
+/// needs a real inbox). Rate-limited per `(IP, email)`. A delivery
+/// failure is surfaced, since the user must receive the link to sign in.
 async fn magic_request(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -2058,9 +2070,9 @@ async fn magic_request(
         _ => return AppError(anyhow::anyhow!("cannot store sign-in token")).into_response(),
     }
 
-    // Point the emailed link at the dashboard's `/verify` route (it exchanges the
-    // token via POST /auth/magic/verify), falling back to the API's own GET
-    // verify endpoint when no distinct dashboard origin is configured.
+    // NOTE: point the emailed link at the dashboard's `/verify` route,
+    // falling back to the API's own GET verify endpoint when no distinct
+    // dashboard origin is configured.
     let base = state.dashboard_origin.trim_end_matches('/');
     let link = if base.is_empty() || base == "*" {
         format!(
@@ -2086,10 +2098,10 @@ async fn magic_request(
     }
 }
 
-/// Verifies a magic-link token, minting a fresh capability link for the account
-/// that owns the email — creating the account (no free credit yet: that waits
-/// for a validated PIM account) on first sign-in. Blocking; call inside
-/// `spawn_blocking`. `None` = unknown or expired token.
+/// Verifies a magic-link token, minting a fresh capability link for the
+/// account that owns the email, creating the account (no free credit yet,
+/// that waits for a validated PIM account) on first sign-in. Blocking;
+/// call inside `spawn_blocking`. `None` for an unknown or expired token.
 fn verify_magic(store: &Store, token: &str) -> anyhow::Result<Option<(String, String)>> {
     let Some(email) = store.take_magic_link(token, MAGIC_LINK_TTL)? else {
         return Ok(None);
@@ -2114,8 +2126,9 @@ struct MagicVerifyRequest {
     token: String,
 }
 
-/// `POST /auth/magic/verify` — exchange a magic-link token for a capability
-/// link (programmatic / dashboard). Returns `{ account_id, link }`.
+/// `POST /auth/magic/verify`: exchange a magic-link token for a
+/// capability link (programmatic / dashboard). Returns `{ account_id,
+/// link }`.
 async fn magic_verify(
     State(state): State<AppState>,
     Json(request): Json<MagicVerifyRequest>,
@@ -2143,9 +2156,9 @@ struct MagicVerifyQuery {
     token: String,
 }
 
-/// `GET /auth/magic/verify` — what the emailed link opens in the browser. Mints
-/// the capability link and hands it to the dashboard window that opened it (via
-/// `postMessage`), mirroring the OAuth popup.
+/// `GET /auth/magic/verify`: what the emailed link opens in the browser.
+/// Mints the capability link and hands it to the dashboard window that
+/// opened it (via `postMessage`), mirroring the OAuth popup.
 async fn magic_verify_get(
     State(state): State<AppState>,
     Query(query): Query<MagicVerifyQuery>,
@@ -2176,7 +2189,7 @@ fn magic_err(message: &str) -> serde_json::Value {
     json!({ "type": "carillon-magic", "ok": false, "error": message })
 }
 
-/// `GET /me` — the account behind the capability link: its members,
+/// `GET /me`: the account behind the capability link, with its members,
 /// watches and balance.
 async fn me(
     State(state): State<AppState>,
@@ -2219,7 +2232,7 @@ async fn me(
     Ok(Json(body).into_response())
 }
 
-/// `POST /signout` — revoke the presented capability link.
+/// `POST /signout`: revoke the presented capability link.
 async fn signout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(token) = bearer(&headers) else {
         return unauthorized();
@@ -2244,10 +2257,10 @@ fn default_activate_credits() -> i64 {
     1
 }
 
-/// `POST /watches/{id}/activate` — spend `credits` credits (default 1) to give a
-/// service that many months of watching (§ BILLING_MODEL); the time stacks onto
-/// any still remaining. `402` when the pool can't cover it (all-or-nothing),
-/// `404` when the caller does not own the service.
+/// `POST /watches/{id}/activate`: spend `credits` credits (default 1) to
+/// give a service that many months of watching, stacking onto any still
+/// remaining. `402` when the pool can't cover it (all-or-nothing), `404`
+/// when the caller does not own the service.
 async fn activate_watch(
     State(state): State<AppState>,
     caller: Caller,
@@ -2272,11 +2285,12 @@ async fn activate_watch(
         let Some(watch) = store.get_watch(&watch_id)? else {
             return Ok(Outcome::Gone);
         };
-        // All-or-nothing: never spend a partial amount the pool can't cover.
+        // NOTE: all-or-nothing; never spend a partial amount the pool
+        // can't cover.
         if !store.debit_credits(&watch.account_id, n)? {
             return Ok(Outcome::NoCredits);
         }
-        // Stack onto any time still remaining, else start from now.
+        // NOTE: stack onto any time still remaining, else start from now.
         let now = now_secs();
         let base = watch
             .watching_until
@@ -2297,7 +2311,7 @@ async fn activate_watch(
         Outcome::NoCredits => no_credits(),
         Outcome::Activated { until, credits } => {
             info!(watch = %id, until, "service activated");
-            // Start it now that it is paid.
+            // NOTE: start it now that it is paid.
             state.commands.send(SupervisorCmd::Reconcile).await.ok();
             Json(json!({
                 "status": "ok",
@@ -2316,7 +2330,7 @@ struct AutoRenewRequest {
     enabled: bool,
 }
 
-/// `POST /watches/{id}/auto-renew` — draw the next credit from the pool at
+/// `POST /watches/{id}/auto-renew`: draw the next credit from the pool at
 /// expiry instead of stopping. Off by default.
 async fn set_watch_auto_renew(
     State(state): State<AppState>,
@@ -2347,9 +2361,9 @@ struct CheckoutRequest {
     packs: i64,
 }
 
-/// `POST /billing/checkout` — buy `packs` packs of credits in one payment
-/// (§ BILLING_MODEL: the only refill unit is a pack of `PACK_SIZE`). Records a
-/// pending session for the resolved credit count and returns the provider
+/// `POST /billing/checkout`: buy `packs` packs of credits in one payment
+/// (the only refill unit is a pack of `PACK_SIZE`). Records a pending
+/// session for the resolved credit count and returns the provider
 /// checkout URL; the pool is topped up on the verified webhook.
 async fn billing_checkout(
     State(state): State<AppState>,
@@ -2362,8 +2376,9 @@ async fn billing_checkout(
     }
     let credits = packs * billing::PACK_SIZE;
 
-    // Create the provider checkout first (it can fail / call out); only then
-    // record the pending session, so a failed checkout leaves no orphan row.
+    // NOTE: create the provider checkout first (it can fail / call out),
+    // then record the pending session, so a failed checkout leaves no
+    // orphan row.
     let session_id = random_secret();
     let url = match state
         .billing
@@ -2394,10 +2409,10 @@ async fn billing_checkout(
     .into_response())
 }
 
-/// `POST /billing/webhook` — the provider's payment callback. The **raw body**
-/// is verified against the provider signature (Stripe's `Stripe-Signature`
-/// HMAC) before it is trusted, then a paid checkout tops the account's pool up
-/// by the quantity that session recorded (idempotent against retried webhooks).
+/// `POST /billing/webhook`: the provider's payment callback. The raw body
+/// is verified against the provider signature before it is trusted, then
+/// a paid checkout tops the account's pool up by the quantity that
+/// session recorded (idempotent against retried webhooks).
 async fn billing_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2451,7 +2466,8 @@ fn forbidden(message: &str) -> Response {
     (StatusCode::FORBIDDEN, Json(json!({ "error": message }))).into_response()
 }
 
-/// `402` — the pool is empty; buy a pack of credits before activating a service.
+/// `402`: the pool is empty; buy a pack of credits before activating a
+/// service.
 fn no_credits() -> Response {
     (
         StatusCode::PAYMENT_REQUIRED,
@@ -2460,7 +2476,8 @@ fn no_credits() -> Response {
         .into_response()
 }
 
-/// `402` — the account hit its fair-use mailbox cap and needs a volume plan.
+/// `402`: the account hit its fair-use mailbox cap and needs a volume
+/// plan.
 fn fair_use(cap: usize) -> Response {
     (
         StatusCode::PAYMENT_REQUIRED,

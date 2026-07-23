@@ -1,22 +1,20 @@
 //! OAuth 2.0 for watch credentials.
 //!
-//! The dynamic-registration path (RFC 7591), used first because Fastmail
-//! supports it: resolve an issuer's endpoints from its RFC 8414 metadata,
-//! register a public client on the fly, run authorization-code + PKCE
-//! (with the RFC 8707 `resource` param where a provider needs it), and
-//! refresh the resulting refresh-token into short-lived access tokens.
-//! A later "static registration" path (a config-provided `client_id` per
-//! provider, for Google/Microsoft which don't offer dynamic registration)
-//! plugs in at [`ClientId`].
+//! The dynamic-registration path (RFC 7591) resolves an issuer's
+//! endpoints from its RFC 8414 metadata, registers a public client on
+//! the fly, runs authorization-code + PKCE (with the RFC 8707 `resource`
+//! param where needed), and refreshes the refresh-token into short-lived
+//! access tokens. The static-registration path (a config-provided
+//! `client_id` per provider, for Google/Microsoft) plugs in at
+//! [`ClientId`].
 //!
-//! Everything here is **blocking** (io-oauth's std client and the RFC 8414
+//! Everything here is blocking (io-oauth's std client and the RFC 8414
 //! fetch each open their own connection), so callers run it inside
-//! `spawn_blocking`. Access tokens and refresh tokens are secrets — they
-//! are returned to the caller to persist encrypted, never logged.
+//! `spawn_blocking`. Access and refresh tokens are secrets, returned to
+//! the caller to persist encrypted, never logged.
 //!
 //! Wired into the watch flow through the `/oauth/*` endpoints and the
-//! supervisor's per-connect token refresh; also live-exercised against
-//! Fastmail on its own (see the ignored test below).
+//! supervisor's per-connect token refresh.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,18 +42,17 @@ pub struct OauthEndpoints {
     pub authorization: Url,
     /// Where to exchange/refresh tokens.
     pub token: Url,
-    /// RFC 7591 dynamic-registration endpoint, when the issuer offers one.
+    /// RFC 7591 dynamic-registration endpoint, when the issuer offers
+    /// one.
     pub registration: Option<Url>,
-    /// The scopes the authorization server advertises (RFC 8414), used to
-    /// pick a mail scope for a dynamically-registered client (a static
-    /// provider uses its own hardcoded scope instead). Empty for direct
-    /// endpoints with no metadata.
+    /// The scopes the authorization server advertises (RFC 8414), used
+    /// to pick a mail scope for a dynamically-registered client. Empty
+    /// for direct endpoints with no metadata.
     pub scopes_supported: Vec<String>,
 }
 
-/// The client identity to authenticate as: registered on the fly (RFC 7591)
-/// or provided by config (static registration, for providers without dynamic
-/// registration). Only the dynamic arm is used today.
+/// The client identity to authenticate as: registered on the fly (RFC
+/// 7591) or provided by config (static registration).
 #[derive(Clone, Debug)]
 pub enum ClientId {
     /// A `client_id` (and optional secret) issued by dynamic registration.
@@ -86,24 +83,26 @@ impl ClientId {
     }
 }
 
-/// A freshly built authorization request: the URL to send the user to, plus
-/// the `state` and PKCE `verifier` to persist for the callback.
+/// A freshly built authorization request: the URL to send the user to,
+/// plus the `state` and PKCE `verifier` to persist for the callback.
 #[derive(Clone, Debug)]
 pub struct AuthRequest {
     pub url: String,
-    /// The CSRF `state` echoed back on the callback (compare as a string).
+    /// The CSRF `state` echoed back on the callback (compare as a
+    /// string).
     pub state: String,
     /// The PKCE code verifier, needed to exchange the code.
     pub verifier: String,
 }
 
-/// The tokens a code-exchange or refresh yields. Secrets — persist encrypted.
+/// The tokens a code-exchange or refresh yields. Secrets, persist
+/// encrypted.
 #[derive(Clone, Debug)]
 pub struct Tokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
-    // Reported by the provider; kept for a future access-token cache (today the
-    // supervisor refreshes on every connect, so they are not read yet).
+    // TODO: kept for a future access-token cache; the supervisor
+    // refreshes on every connect, so these are not read yet.
     #[allow(dead_code)]
     pub expires_in: Option<usize>,
     #[allow(dead_code)]
@@ -124,8 +123,8 @@ impl Tokens {
 }
 
 /// Resolves an issuer's endpoints from its RFC 8414 metadata (trying the
-/// OAuth then the OpenID Connect well-known URL). Fails if the issuer has no
-/// discoverable metadata or lacks an authorization/token endpoint.
+/// OAuth then the OpenID Connect well-known URL). Fails if the issuer has
+/// no discoverable metadata or lacks an authorization/token endpoint.
 pub fn resolve_issuer(issuer: &str) -> Result<OauthEndpoints> {
     let issuer_url: Url = issuer.parse().context("invalid issuer URL")?;
     let client = DiscoveryComposeClientStd::new(discover::resolver(), discover::tls());
@@ -144,9 +143,9 @@ pub fn resolve_issuer(issuer: &str) -> Result<OauthEndpoints> {
     })
 }
 
-/// Registers a **public** client (RFC 7591) for the authorization-code +
-/// refresh-token grants at `registration`, returning its issued identity.
-/// `token_endpoint_auth_method` is `none` (public client, PKCE-protected).
+/// Registers a public client (RFC 7591) for the authorization-code +
+/// refresh-token grants at `registration`, returning its issued
+/// identity. The auth method is `none` (public client, PKCE-protected).
 pub fn register_client(
     registration: &Url,
     redirect_uri: &str,
@@ -186,10 +185,10 @@ pub fn register_client(
     })
 }
 
-/// Builds the authorization URL (S256 PKCE + a random state), with extra
-/// query params (an RFC 8707 `resource`, or provider-specific params like
-/// Google's `access_type=offline`). Returns the URL plus the `state`/
-/// `verifier` to persist until the callback.
+/// Builds the authorization URL (S256 PKCE + a random state) with extra
+/// query params (an RFC 8707 `resource`, or provider-specific params).
+/// Returns the URL plus the `state`/`verifier` to persist until the
+/// callback.
 pub fn build_authorization(
     endpoints: &OauthEndpoints,
     client_id: &str,
@@ -226,7 +225,8 @@ pub fn build_authorization(
 
     AuthRequest {
         url: url.to_string(),
-        // state/verifier bytes are printable ASCII (VSCHAR / unreserved).
+        // NOTE: state/verifier bytes are printable ASCII (VSCHAR /
+        // unreserved), so the from_utf8 never fails.
         state: String::from_utf8(state.expose().to_vec()).expect("state is printable ASCII"),
         verifier: String::from_utf8(challenge.verifier.expose().to_vec())
             .expect("verifier is unreserved ASCII"),
@@ -283,14 +283,13 @@ pub fn refresh(token_endpoint: &Url, client: &ClientId, refresh_token: &str) -> 
 }
 
 /// A well-known public OAuth application, matched by a substring of the
-/// authorization/token/issuer host. Thunderbird's public clients for now —
-/// swapped for Carillon-owned apps later. `client_*` are used only on the
-/// **static** path (a provider with no dynamic registration: Google,
-/// Microsoft). `scope` is the mail-only scope for that static path (a
+/// authorization/token/issuer host.
+///
+/// `client_*` and `scope` apply only on the static path (Google,
+/// Microsoft, which offer no dynamic registration); a
 /// dynamically-registered client derives its scope from the issuer's
-/// advertised `scopes_supported` instead). `auth_params` are extra
-/// authorization-URL params the provider needs (e.g. Google's
-/// `access_type=offline`+`prompt=consent` to return a refresh token).
+/// advertised `scopes_supported`. `auth_params` are extra
+/// authorization-URL params the provider needs.
 struct KnownProvider {
     host: &'static str,
     client_id: &'static str,
@@ -299,16 +298,16 @@ struct KnownProvider {
     auth_params: &'static [(&'static str, &'static str)],
 }
 
-/// Thunderbird's public clients (from ortie's `KNOWN_APPS`), reduced to the
-/// mail-only scope needed to watch. Fastmail is registered dynamically, so it
-/// has no static entry here (its scope comes from its metadata).
+/// Thunderbird's public clients (from ortie's `KNOWN_APPS`), reduced to
+/// the mail-only scope needed to watch. Fastmail is registered
+/// dynamically, so it has no static entry.
 const KNOWN_PROVIDERS: &[KnownProvider] = &[
     KnownProvider {
         host: "google",
         client_id: "406964657835-aq8lmia8j95dhl1a2bvharmfk3t1hgqj.apps.googleusercontent.com",
         client_secret: Some("kSmqreRr0qwBWJgbf5Y-PjSU"),
         scope: "https://mail.google.com/",
-        // Google only returns a refresh token with these.
+        // NOTE: Google only returns a refresh token with these.
         auth_params: &[("access_type", "offline"), ("prompt", "consent")],
     },
     KnownProvider {
@@ -329,22 +328,20 @@ fn provider_for(host: &str) -> Option<&'static KnownProvider> {
 /// Picks a mail-access scope from an authorization server's advertised
 /// `scopes_supported` (for a dynamically-registered client), plus
 /// `offline_access` if the server uses it (needed for a refresh token).
-/// E.g. Fastmail → `urn:ietf:params:oauth:scope:mail offline_access`.
 fn mail_scope(supported: &[String]) -> Option<String> {
     scope_for(supported, |scope| {
         scope.contains("imap") || scope.contains(":mail") || scope.ends_with("/mail")
     })
 }
 
-/// Picks a **contacts / CardDAV** scope from advertised `scopes_supported` (for a
-/// dynamically-registered client), plus `offline_access`. E.g. Fastmail →
-/// `urn:ietf:params:oauth:scope:contacts offline_access`. Without this a CardDAV
-/// login gets [`mail_scope`] and the token 401s against CardDAV (the consent even
-/// shows mail permissions). Mirrors cardamum-android's `contacts_scope`.
+/// Picks a contacts/CardDAV scope from advertised `scopes_supported`
+/// (for a dynamically-registered client), plus `offline_access`. Without
+/// it a CardDAV login gets [`mail_scope`] and the token 401s against
+/// CardDAV.
 ///
-/// Carillon only reads etags, never writes, so it **prefers a read-only** contacts
-/// scope when the provider advertises one; many providers (Fastmail among them)
-/// only offer a read-write CardDAV scope, in which case that is used.
+/// Prefers a read-only contacts scope when the provider advertises one,
+/// since Carillon only reads etags; falls back to a read-write CardDAV
+/// scope otherwise (Fastmail offers only that).
 fn contacts_scope(supported: &[String]) -> Option<String> {
     let is_contacts = |scope: &str| scope.contains("carddav") || scope.contains("contact");
     let is_readonly = |scope: &str| {
@@ -357,10 +354,10 @@ fn contacts_scope(supported: &[String]) -> Option<String> {
         .or_else(|| scope_for(supported, is_contacts))
 }
 
-/// Shared scope picker: the first advertised scope matching `wanted`, plus
-/// `offline_access` when the server advertises it. `None` when nothing matches
-/// (never returns a bare `offline_access`, so callers can fall back). Compares
-/// case-insensitively.
+/// Shared scope picker: the first advertised scope matching `wanted`
+/// (case-insensitive), plus `offline_access` when the server advertises
+/// it. `None` when nothing matches, never a bare `offline_access`, so
+/// callers can fall back.
 fn scope_for(supported: &[String], wanted: impl Fn(&str) -> bool) -> Option<String> {
     let primary = supported
         .iter()
@@ -373,8 +370,8 @@ fn scope_for(supported: &[String], wanted: impl Fn(&str) -> bool) -> Option<Stri
 }
 
 /// Config-provided client overrides for the static providers, each
-/// `(client_id, client_secret)`. Replaces the built-in Thunderbird public
-/// client when set (e.g. an own Google app with a hosted redirect).
+/// `(client_id, client_secret)`. Replaces the built-in Thunderbird
+/// public client when set.
 #[derive(Clone, Debug, Default)]
 pub struct StaticClients {
     pub google: Option<(String, Option<String>)>,
@@ -391,23 +388,24 @@ impl StaticClients {
     }
 }
 
-/// The discovered OAuth method to authorize against: an issuer (RFC 8414,
-/// resolved to endpoints + a possible registration endpoint) or direct
-/// endpoints. Plus the scope discovery reported, if any.
+/// The discovered OAuth method to authorize against: an issuer (RFC
+/// 8414, resolved to endpoints + a possible registration endpoint) or
+/// direct endpoints, plus the scope discovery reported.
 #[derive(Debug, Default)]
 pub struct AuthInput {
     pub issuer: Option<String>,
     pub authorization_endpoint: Option<String>,
     pub token_endpoint: Option<String>,
     pub scope: Option<String>,
-    /// Whether this login is for CardDAV (contacts): picks the contacts scope
-    /// from the server's advertised metadata instead of the mail scope.
+    /// Whether this login is for CardDAV (contacts): picks the contacts
+    /// scope from the server's advertised metadata instead of the mail
+    /// scope.
     pub contacts: bool,
 }
 
-/// The result of planning an authorization: the built request plus what the
-/// callback must persist to exchange and later refresh (token endpoint,
-/// client id/secret, resource, scope).
+/// The result of planning an authorization: the built request plus what
+/// the callback must persist to exchange and later refresh (token
+/// endpoint, client id/secret, resource, scope).
 pub struct Planned {
     pub auth: AuthRequest,
     pub token_endpoint: String,
@@ -417,11 +415,11 @@ pub struct Planned {
     pub scope: Option<String>,
 }
 
-/// Plans an authorization for a discovered OAuth method: resolves endpoints,
-/// chooses a client (dynamic registration where the issuer offers it — e.g.
-/// Fastmail — else a config-provided or built-in public client for Google/
-/// Microsoft), requests the provider's mail-only scope, and builds the
-/// authorization URL. Blocking.
+/// Plans an authorization for a discovered OAuth method: resolves
+/// endpoints, chooses a client (dynamic registration where the issuer
+/// offers it, else a config-provided or built-in public client),
+/// requests the mail-only scope, and builds the authorization URL.
+/// Blocking.
 pub fn plan_authorization(
     input: &AuthInput,
     redirect_uri: &str,
@@ -459,10 +457,11 @@ pub fn plan_authorization(
             registration: None,
             scopes_supported: Vec::new(),
         };
-        // A provider can be *discovered* as direct endpoints yet still support
-        // dynamic registration (e.g. Fastmail, whose per-email discovery yields
-        // endpoints, not an issuer). If it isn't a known static provider, try
-        // the endpoint's origin as an issuer to find a registration endpoint.
+        // NOTE: a provider can be discovered as direct endpoints yet
+        // still support dynamic registration (Fastmail's per-email
+        // discovery yields endpoints, not an issuer). If not a known
+        // static provider, try the endpoint's origin as an issuer to
+        // find a registration endpoint.
         let endpoints = if provider_for(&host).is_none() {
             origin_of(authorization)
                 .and_then(|issuer| resolve_issuer(&issuer).ok())
@@ -476,10 +475,9 @@ pub fn plan_authorization(
 
     let provider = provider_for(&host);
 
-    // Dynamic registration when the issuer offers it (Fastmail) — the scope
-    // then comes from the server's advertised metadata; otherwise a known
-    // public client (Google/Microsoft, Thunderbird's apps for now) with its
-    // hardcoded mail scope.
+    // NOTE: dynamic registration when the issuer offers it (Fastmail),
+    // scope from advertised metadata; otherwise a known public client
+    // (Google/Microsoft) with its hardcoded mail scope.
     let (client, scope) = if let Some(registration) = &endpoints.registration {
         let picked = if input.contacts {
             contacts_scope(&endpoints.scopes_supported)
@@ -490,7 +488,8 @@ pub fn plan_authorization(
         let client = register_client(registration, redirect_uri, scope.as_deref())?;
         (client, scope)
     } else if let Some(provider) = provider {
-        // A config-provided client (own app) overrides the built-in default.
+        // NOTE: a config-provided client (own app) overrides the
+        // built-in default.
         let (client_id, client_secret) =
             clients.for_host(provider.host).cloned().unwrap_or_else(|| {
                 (
@@ -507,13 +506,10 @@ pub fn plan_authorization(
         bail!("OAuth is not configured for this provider yet");
     };
 
-    // Extra authorization params: the provider's own (e.g. Google's
-    // access_type/prompt), plus an RFC 8707 `resource` indicator where a
-    // provider requires one. Fastmail bounces the authorization *pre-consent*
-    // with `invalid_target` unless `resource` is present; discovery doesn't
-    // surface it yet, so supply the known value (as ortie does). Fastmail binds
-    // the token from the authorization request, so it need not be repeated on
-    // the token exchange (io-oauth's token params carry none anyway).
+    // NOTE: extra authorization params, the provider's own plus an RFC
+    // 8707 `resource` where required. Fastmail bounces the authorization
+    // pre-consent with `invalid_target` unless `resource` is present;
+    // discovery doesn't surface it yet, so supply the known value.
     let mut extra_params: Vec<(String, String)> = provider
         .map(|provider| {
             provider
@@ -548,9 +544,9 @@ pub fn plan_authorization(
 }
 
 /// The RFC 8707 `resource` indicator a provider is known to require but
-/// discovery does not yet surface. Fastmail rejects the authorization with
-/// `invalid_target` without it; one resource covers all its protocols
-/// (IMAP/SMTP/JMAP), so the JMAP session URL is used for the mail flow too.
+/// discovery does not yet surface. Fastmail rejects the authorization
+/// with `invalid_target` without it; one resource covers all its
+/// protocols, so the JMAP session URL serves the mail flow too.
 fn required_resource(host: &str) -> Option<String> {
     host.ends_with("fastmail.com")
         .then(|| "https://api.fastmail.com/jmap/session".to_string())

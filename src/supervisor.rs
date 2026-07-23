@@ -1,11 +1,11 @@
 //! The watcher supervisor.
 //!
 //! Owns one tokio task per active watch, each running an independent
-//! connect → watch → reconnect loop. It reconciles the running set
-//! against the store on boot, on API-triggered commands, and on a
-//! periodic timer. A shared semaphore caps simultaneous TLS handshakes
-//! so a restart (or a store full of accounts) does not fire a
-//! reconnect storm or trip per-IP provider limits.
+//! connect → watch → reconnect loop. Reconciles the running set against
+//! the store on boot, on API-triggered commands, and on a periodic
+//! timer. A shared semaphore caps simultaneous TLS handshakes so a
+//! restart does not fire a reconnect storm or trip per-IP provider
+//! limits.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -39,8 +39,8 @@ use crate::store::{Store, Watch};
 use crate::util::now_secs;
 
 /// How a watcher authenticates each time it connects. A password is
-/// constant; OAuth mints a fresh access token from the stored refresh token
-/// on every connect (tokens are short-lived, connections reconnect often).
+/// constant; OAuth mints a fresh access token from the stored refresh
+/// token on every connect.
 enum Credential {
     Password(String),
     Oauth,
@@ -67,8 +67,8 @@ pub enum SupervisorCmd {
 struct WatcherHandle {
     shutdown: Arc<AtomicBool>,
     fingerprint: u64,
-    /// The watch's billing account, kept so a stop/shutdown status event
-    /// can be tagged for scoped SSE fan-out without re-reading the store.
+    /// The watch's billing account, so a stop/shutdown status event can
+    /// be tagged for scoped SSE fan-out without re-reading the store.
     account_id: String,
     task: JoinHandle<()>,
 }
@@ -83,18 +83,18 @@ pub struct Supervisor {
     handshake_sem: Arc<Semaphore>,
     handles: HashMap<String, WatcherHandle>,
     live: LiveBus,
-    /// Whether watching is credit-metered (SaaS, Stripe). When false (self-host
-    /// / stub billing) the entitlement gate is bypassed — self-host is not billed.
+    /// Whether watching is credit-metered (SaaS, Stripe). When false the
+    /// entitlement gate is bypassed, since self-host is not billed.
     metered: bool,
     /// Default poll interval (seconds) for CardDAV services that do not
-    /// override it. IMAP services ignore it (they hold IDLE, not poll).
+    /// override it. IMAP services ignore it (they hold IDLE).
     carddav_poll_secs: u64,
 }
 
 impl Supervisor {
     /// Creates a supervisor. `max_handshakes` caps simultaneous TLS
-    /// handshakes across all watchers. `metered` gates watches on the credit
-    /// pool (SaaS); unmetered self-host runs every active watch.
+    /// handshakes across all watchers. `metered` gates watches on the
+    /// credit pool; unmetered self-host runs every active watch.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Store>,
@@ -130,7 +130,8 @@ impl Supervisor {
         self.reconcile().await;
 
         let mut ticker = interval(reconcile_interval);
-        ticker.tick().await; // consume the immediate first tick
+        // NOTE: consume the immediate first tick.
+        ticker.tick().await;
 
         loop {
             tokio::select! {
@@ -156,10 +157,10 @@ impl Supervisor {
             }
         };
 
-        // Desired = active watches that are also entitled (paid) when metered.
-        // Filtering here (not just at spawn) makes the gate continuous: a service
-        // whose paid month lapsed drops out of `desired` and is stopped below;
-        // re-activating it (a fresh credit) brings it back on the next reconcile.
+        // NOTE: desired = active watches also entitled (paid) when
+        // metered. Filtering here (not just at spawn) makes the gate
+        // continuous: a lapsed service drops out and is stopped below;
+        // re-activating it brings it back on the next reconcile.
         let now = now_secs();
         let metered = self.metered;
         let desired: HashMap<String, Watch> = watches
@@ -168,8 +169,8 @@ impl Supervisor {
             .map(|watch| (watch.id.clone(), watch))
             .collect();
 
-        // Stop watchers that vanished or whose connection parameters
-        // changed.
+        // NOTE: stop watchers that vanished or whose connection
+        // parameters changed.
         let stale: Vec<String> = self
             .handles
             .iter()
@@ -192,7 +193,6 @@ impl Supervisor {
             }
         }
 
-        // Start watchers that are missing.
         for (id, watch) in &desired {
             if self.handles.contains_key(id) {
                 continue;
@@ -209,15 +209,15 @@ impl Supervisor {
     }
 
     fn spawn_watcher(&self, watch: &Watch) -> anyhow::Result<WatcherHandle> {
-        // Entitlement (the paid-month gate) is enforced in `reconcile`, which
-        // only ever hands `spawn_watcher` an entitled service when metered.
+        // NOTE: entitlement (the paid-month gate) is enforced in
+        // `reconcile`, which only ever hands `spawn_watcher` an entitled
+        // service when metered.
 
-        // Resolve the credential kind. An OAuth watch defers to the stored
-        // `oauth_credential`, minting a fresh access token per connect (see
-        // `watch_loop`). A password is decrypted once from the watch itself
-        // (self-host / import) or, when the watch carries none, from the PIM
-        // account's stored password credential (§ BILLING_MODEL) — so a re-auth
-        // that updates that credential is picked up on the next reconnect.
+        // NOTE: an OAuth watch defers to the stored `oauth_credential`,
+        // minting a fresh access token per connect. A password is
+        // decrypted once from the watch itself (self-host / import) or,
+        // when the watch carries none, from the PIM account's stored
+        // password credential, so a re-auth is picked up on reconnect.
         let credential = if watch.auth_kind == "oauth" {
             Credential::Oauth
         } else {
@@ -246,7 +246,8 @@ impl Supervisor {
         let store = self.store.clone();
         let crypto = self.crypto.clone();
 
-        // A CardDAV service is polled (no held IDLE); everything else is IMAP.
+        // NOTE: a CardDAV service is polled (no held IDLE); everything
+        // else is IMAP.
         let task = if watch.source_kind == "carddav" {
             let url = watch
                 .carddav_url
@@ -334,7 +335,7 @@ fn stop(handle: WatcherHandle) {
 
 /// Fingerprint of the connection-relevant fields. Notify URL and HMAC
 /// secret are excluded on purpose: the delivery side re-reads them, so
-/// changing a webhook must not drop the IMAP connection.
+/// changing a webhook must not drop the connection.
 fn fingerprint(watch: &Watch) -> u64 {
     let mut hasher = DefaultHasher::new();
     watch.source_kind.hash(&mut hasher);
@@ -344,20 +345,21 @@ fn fingerprint(watch: &Watch) -> u64 {
     watch.enc_password.hash(&mut hasher);
     watch.auth_kind.hash(&mut hasher);
     watch.mailbox.hash(&mut hasher);
-    // CardDAV connection params: a re-point or poll-rate change restarts the
-    // poller (the sync-token is runtime state, deliberately not fingerprinted).
+    // NOTE: a CardDAV re-point or poll-rate change restarts the poller;
+    // the sync-token is runtime state, deliberately not fingerprinted.
     watch.carddav_url.hash(&mut hasher);
     watch.carddav_poll_secs.hash(&mut hasher);
     hasher.finish()
 }
 
-/// Everything one watcher task needs. Bundled into a struct to keep the
+/// Everything one watcher task needs, bundled into a struct to keep the
 /// spawn site readable (and satisfy `clippy::too_many_arguments`).
 struct WatchLoop {
     id: String,
     /// The billing account (for tagging live status events).
     account_id: String,
-    /// Connection params; `auth` is a placeholder set before each connect.
+    /// Connection params; `auth` is a placeholder set before each
+    /// connect.
     account: ImapAccount,
     credential: Credential,
     connector: TlsConnector,
@@ -369,9 +371,9 @@ struct WatchLoop {
     crypto: Arc<Crypto>,
 }
 
-/// One watch's connect → watch → reconnect loop. Stopped by aborting
-/// the task; the shutdown flag lets the watcher coroutine wind down
-/// cleanly if it happens to be resumed.
+/// One watch's connect → watch → reconnect loop. Stopped by aborting the
+/// task; the shutdown flag lets the watcher coroutine wind down cleanly
+/// if resumed.
 async fn watch_loop(ctx: WatchLoop) {
     let WatchLoop {
         id,
@@ -387,8 +389,8 @@ async fn watch_loop(ctx: WatchLoop) {
         crypto,
     } = ctx;
 
-    // Tag every status change with the watch's billing account so the SSE
-    // stream can scope it to the right subscriber.
+    // NOTE: tag every status change with the watch's billing account so
+    // the SSE stream can scope it to the right subscriber.
     let status =
         |state, detail| Routed::new(account_id.clone(), LiveEvent::status(&id, state, detail));
 
@@ -407,10 +409,9 @@ async fn watch_loop(ctx: WatchLoop) {
     let mut backoff = INITIAL_BACKOFF;
 
     while !shutdown.load(Ordering::SeqCst) {
-        // Resolve this attempt's credential. A password is constant; OAuth
-        // mints a fresh access token from the stored refresh token. A refresh
-        // failure is transient (network, provider): surface it and back off,
-        // exactly like a connect failure.
+        // NOTE: a password is constant; OAuth mints a fresh access token
+        // from the stored refresh token. A refresh failure is transient,
+        // so surface it and back off like a connect failure.
         account.auth = match &credential {
             Credential::Password(password) => ImapAuth::Password(password.clone()),
             Credential::Oauth => {
@@ -432,7 +433,7 @@ async fn watch_loop(ctx: WatchLoop) {
             }
         };
 
-        // Throttle simultaneous handshakes across all watchers.
+        // NOTE: throttle simultaneous handshakes across all watchers.
         let permit = handshake_sem
             .clone()
             .acquire_owned()
@@ -444,7 +445,7 @@ async fn watch_loop(ctx: WatchLoop) {
 
         match connected {
             Ok(Ok(mut session)) => {
-                // Full QRESYNC deltas where the server supports it, else the
+                // NOTE: full QRESYNC deltas where supported, else the
                 // IDLE-only new-mail watcher (Gmail, Yahoo, …).
                 let has_qresync = session.capabilities.contains(&Capability::QResync);
                 info!(
@@ -509,8 +510,8 @@ async fn watch_loop(ctx: WatchLoop) {
             break;
         }
 
-        // A connection that lasted resets the backoff; a flapping one
-        // keeps growing it.
+        // NOTE: a connection that lasted resets the backoff; a flapping
+        // one keeps growing it.
         if started.elapsed() >= HEALTHY_THRESHOLD {
             backoff = INITIAL_BACKOFF;
         }
@@ -534,11 +535,11 @@ struct CardDavLoop {
     url: String,
     /// PIM-account login (HTTP Basic username / OAuth identity).
     login: String,
-    /// PIM-account host + port: the identity the stored credential and any
-    /// OAuth token are keyed by (the CardDAV host lives in `url`, not here).
+    /// PIM-account host + port: the identity the stored credential and
+    /// any OAuth token are keyed by (the CardDAV host lives in `url`).
     imap_host: String,
     imap_port: u16,
-    /// Last checkpoint token loaded from the store (`None` = never synced).
+    /// Last checkpoint token loaded from the store (`None` never synced).
     initial_token: Option<String>,
     /// Poll interval in seconds.
     poll_secs: u64,
@@ -554,8 +555,8 @@ struct CardDavLoop {
 
 /// One CardDAV service's poll loop: resolve the credential, run a
 /// `sync-collection` round, checkpoint the returned token, sleep, repeat.
-/// Transport failures back off exactly like the IMAP reconnect loop. Stopped
-/// by aborting the task; the shutdown flag lets a between-polls wait exit
+/// Transport failures back off like the IMAP reconnect loop. Stopped by
+/// aborting the task; the shutdown flag lets a between-polls wait exit
 /// promptly.
 async fn carddav_watch_loop(ctx: CardDavLoop) {
     let CardDavLoop {
@@ -585,8 +586,8 @@ async fn carddav_watch_loop(ctx: CardDavLoop) {
     let mut announced = false;
 
     while !shutdown.load(Ordering::SeqCst) {
-        // Resolve this round's credential. A password is constant; OAuth mints a
-        // fresh bearer token, keyed by the PIM identity (not the CardDAV host).
+        // NOTE: a password is constant; OAuth mints a fresh bearer token
+        // keyed by the PIM identity (not the CardDAV host).
         let auth = match &credential {
             Credential::Password(password) => CardDavAuth::Password(password.clone()),
             Credential::Oauth => {
@@ -666,9 +667,9 @@ async fn carddav_watch_loop(ctx: CardDavLoop) {
     debug!(watch = %id, "carddav watch loop exited");
 }
 
-/// Sleeps for `dur`, returning within ~a second once shutdown is requested so
-/// a stopped poller does not linger a whole interval before its task is torn
-/// down.
+/// Sleeps for `dur`, returning within ~a second once shutdown is
+/// requested so a stopped poller does not linger a whole interval before
+/// its task is torn down.
 async fn sleep_interruptible(dur: Duration, shutdown: &Arc<AtomicBool>) {
     let step = Duration::from_secs(1);
     let mut left = dur;
@@ -688,9 +689,9 @@ fn jitter(base: Duration) -> Duration {
 }
 
 /// Mints a fresh OAuth access token for a watch: loads its stored
-/// credential, decrypts the refresh token, refreshes (blocking io-oauth in
-/// `spawn_blocking`), and persists the refresh token if the provider rotated
-/// it. Returns the access token to authenticate with (`OAUTHBEARER`).
+/// credential, decrypts the refresh token, refreshes (blocking io-oauth
+/// in `spawn_blocking`), and persists the refresh token if the provider
+/// rotated it. Returns the access token (`OAUTHBEARER`).
 pub(crate) async fn resolve_oauth_access(
     store: &Arc<Store>,
     crypto: &Arc<Crypto>,
@@ -727,7 +728,8 @@ pub(crate) async fn resolve_oauth_access(
     })
     .await??;
 
-    // Persist a rotated refresh token so the next refresh uses the current one.
+    // NOTE: persist a rotated refresh token so the next refresh uses the
+    // current one.
     if let Some(new_refresh) = &tokens.refresh_token
         && new_refresh != &refresh_token
     {

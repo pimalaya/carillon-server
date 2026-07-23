@@ -1,20 +1,20 @@
-//! Billing — the payment provider behind a small enum.
+//! Billing: the payment provider behind a small enum.
 //!
-//! Payment is **stateless on our side** (§ BILLING_MODEL): the provider (Stripe)
-//! owns the customer and the receipt; Carillon persists only the integer credit
-//! balance a purchase tops up — never card details or PII. There is **no
-//! subscription**: a purchase is a one-shot payment for a chosen quantity of
-//! credits (1 credit = one PIM-account-month), priced by a one-time Stripe Price.
+//! Payment is stateless on our side (§ BILLING_MODEL): Stripe owns the
+//! customer and receipt; Carillon persists only the integer credit
+//! balance a purchase tops up, never card details or PII. There is no
+//! subscription; a purchase is a one-shot payment for a chosen quantity
+//! of credits (1 credit = one PIM-account-month).
 //!
-//! The purchase unit is a **pack** (`PACK_SIZE` credits, § BILLING_MODEL): one
-//! Stripe line item priced per pack, `quantity` = number of packs. The credit
-//! count a pack yields is resolved by the caller (`api`), not here.
+//! The purchase unit is a pack (`PACK_SIZE` credits): one Stripe line
+//! item priced per pack, `quantity` = number of packs. The credit count
+//! a pack yields is resolved by the caller (`api`).
 //!
-//! [`Billing::Stub`] needs no keys and stands in for local/dev use:
-//! `create_checkout` returns a placeholder URL and the webhook credits on trust.
-//! [`Billing::Stripe`] creates a real hosted Checkout Session in `payment` mode,
-//! verifies the webhook signature, and turns `checkout.session.completed` into a
-//! pool top-up. An enum (not a `dyn` trait) keeps the async calls native.
+//! [`Billing::Stub`] needs no keys and stands in for local/dev:
+//! `create_checkout` returns a placeholder URL and the webhook credits
+//! on trust. [`Billing::Stripe`] creates a real hosted Checkout Session
+//! in `payment` mode, verifies the webhook signature, and turns
+//! `checkout.session.completed` into a pool top-up.
 
 use std::collections::BTreeMap;
 
@@ -30,16 +30,14 @@ use crate::util::now_secs;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// The Stripe price-map key for the pack line item (a one-time Price = the
-/// price of one [`PACK_SIZE`]-credit pack).
+/// The Stripe price-map key for the pack line item.
 const PACK_PRICE_KEY: &str = "pack";
 
-/// Credits per pack — the only purchase quantum (§ BILLING_MODEL: refill only
-/// in 5-credit packs).
+/// Credits per pack, the only purchase quantum.
 pub const PACK_SIZE: i64 = 5;
 
-/// Stripe rejects/accepts a webhook within this clock skew of its timestamp
-/// (replay-window guard), matching Stripe's own default tolerance.
+/// Clock skew a webhook timestamp may fall within (replay-window guard),
+/// matching Stripe's own default tolerance.
 const SIGNATURE_TOLERANCE_SECS: i64 = 300;
 
 /// The Stripe Checkout Sessions endpoint.
@@ -47,18 +45,20 @@ const STRIPE_CHECKOUT_URL: &str = "https://api.stripe.com/v1/checkout/sessions";
 
 /// What a verified provider webhook tells us to do.
 pub enum WebhookOutcome {
-    /// A payment completed: credit the pool of the account referenced by our
-    /// internal session id, by the quantity that session recorded.
+    /// A payment completed: credit the referenced account's pool by the
+    /// quantity that session recorded.
     Credit {
-        /// Our internal checkout session id (Stripe's `client_reference_id`).
+        /// Our internal checkout session id (Stripe's
+        /// `client_reference_id`).
         session_id: String,
     },
-    /// A valid but irrelevant event (wrong type, unpaid, unsigned test ping).
+    /// A valid but irrelevant event (wrong type, unpaid, unsigned test
+    /// ping).
     Ignore,
 }
 
-/// The payment provider. `Stub` is keyless (dev/self-host on trust); `Stripe`
-/// talks to the real API.
+/// The payment provider. `Stub` is keyless (dev/self-host on trust);
+/// `Stripe` talks to the real API.
 pub enum Billing {
     /// Keyless stand-in: placeholder checkout URL, webhook credits on trust.
     Stub,
@@ -75,10 +75,10 @@ impl Billing {
         }
     }
 
-    /// Starts a one-shot checkout for `packs` packs and returns the URL to send
-    /// the buyer to. The internal `session_id` is threaded through so the webhook
-    /// maps the payment back to the pending session (which holds the credit count
-    /// the pool is topped up by).
+    /// Starts a one-shot checkout for `packs` packs and returns the URL
+    /// to send the buyer to. The internal `session_id` is threaded
+    /// through so the webhook maps the payment back to the pending
+    /// session.
     pub async fn create_checkout(
         &self,
         session_id: &str,
@@ -91,9 +91,9 @@ impl Billing {
         }
     }
 
-    /// Verifies a provider webhook over its **raw** body and returns what to do.
-    /// The stub trusts a `{"session_id": …}` body; Stripe verifies the
-    /// `Stripe-Signature` HMAC then maps a paid checkout to a credit.
+    /// Verifies a provider webhook over its raw body and returns what to
+    /// do. The stub trusts a `{"session_id": …}` body; Stripe verifies
+    /// the `Stripe-Signature` HMAC then maps a paid checkout to a credit.
     pub fn verify_webhook(
         &self,
         signature: Option<&str>,
@@ -115,23 +115,24 @@ impl Billing {
     }
 }
 
-/// The Stripe adapter: a hosted one-shot Checkout Session per purchase and
-/// signature-verified webhooks. Deliberately minimal — a form-encoded API call
-/// over the shared `reqwest` client and an HMAC check — rather than an SDK.
+/// The Stripe adapter: a hosted one-shot Checkout Session per purchase
+/// and signature-verified webhooks. Deliberately minimal (a form-encoded
+/// API call over the shared `reqwest` client and an HMAC check) rather
+/// than an SDK.
 pub struct StripeBilling {
     http: reqwest::Client,
     secret_key: String,
     webhook_secret: String,
     success_url: String,
     cancel_url: String,
-    /// Plan-key → Stripe Price id. The `credit` key is the one-time credit Price.
+    /// Plan-key to Stripe Price id.
     prices: BTreeMap<String, String>,
 }
 
 impl StripeBilling {
-    /// Builds the adapter from config, sharing the server's pooled client.
-    /// `default_base` (the dashboard URL) is where the buyer is returned after
-    /// payment when the config leaves the URLs unset.
+    /// Builds the adapter from config, sharing the server's pooled
+    /// client. `default_base` (the dashboard URL) is where the buyer is
+    /// returned after payment when the config leaves the URLs unset.
     pub fn new(http: reqwest::Client, config: &StripeConfig, default_base: &str) -> Self {
         let base = default_base.trim_end_matches('/');
         Self {
@@ -150,9 +151,9 @@ impl StripeBilling {
         }
     }
 
-    /// Creates a hosted Checkout Session in `payment` mode for `packs` packs
-    /// (one pack-priced line item, `quantity` = packs), tagging it with our
-    /// internal `session_id` and the account, and returns the hosted page URL.
+    /// Creates a hosted Checkout Session in `payment` mode for `packs`
+    /// packs (one pack-priced line item), tagging it with our internal
+    /// `session_id` and the account, and returns the hosted page URL.
     async fn create_checkout(
         &self,
         session_id: &str,
@@ -164,7 +165,8 @@ impl StripeBilling {
             .get(PACK_PRICE_KEY)
             .with_context(|| format!("no Stripe price configured for '{PACK_PRICE_KEY}'"))?;
 
-        // Form-encoded, Stripe's wire format (incl. its bracketed nesting).
+        // NOTE: form-encoded, Stripe's wire format (incl. its bracketed
+        // nesting).
         let body = form_urlencoded::Serializer::new(String::new())
             .append_pair("mode", "payment")
             .append_pair("success_url", &self.success_url)
@@ -205,8 +207,9 @@ impl StripeBilling {
         serde_json::from_str(&text).context("invalid Stripe checkout response")
     }
 
-    /// Verifies the `Stripe-Signature` HMAC over `"{t}.{raw_body}"` and maps
-    /// the event to an outcome. Rejects a missing/expired/forged signature.
+    /// Verifies the `Stripe-Signature` HMAC over `"{t}.{raw_body}"` and
+    /// maps the event to an outcome. Rejects a missing/expired/forged
+    /// signature.
     fn verify_webhook(&self, signature: Option<&str>, raw_body: &[u8]) -> Result<WebhookOutcome> {
         let header = signature.context("missing Stripe-Signature header")?;
 
@@ -225,8 +228,9 @@ impl StripeBilling {
             bail!("Stripe webhook timestamp outside tolerance");
         }
 
-        // Recompute the MAC over "{t}.{body}" and constant-time compare (via
-        // `verify_slice`) against each provided v1 signature.
+        // NOTE: recompute the MAC over "{t}.{body}" and constant-time
+        // compare (via `verify_slice`) against each provided v1
+        // signature.
         let verified = candidates.iter().any(|candidate| {
             let Ok(expected) = hex::decode(candidate) else {
                 return false;
@@ -252,7 +256,8 @@ impl StripeBilling {
 }
 
 /// Maps a completed one-shot checkout to a [`WebhookOutcome::Credit`], or
-/// [`WebhookOutcome::Ignore`] when it is unpaid or lacks our session reference.
+/// [`WebhookOutcome::Ignore`] when it is unpaid or lacks our session
+/// reference.
 fn credit_from_session(object: Option<&Value>) -> WebhookOutcome {
     let Some(object) = object else {
         return WebhookOutcome::Ignore;

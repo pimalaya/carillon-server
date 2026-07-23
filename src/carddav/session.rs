@@ -1,16 +1,15 @@
 //! CardDAV connection, probe and change enumeration.
 //!
 //! WebDAV has no long-held push like IMAP IDLE, so a CardDAV service is
-//! **polled**: each round opens a fresh TLS connection, drives one
-//! io-webdav coroutine (a `sync-collection` REPORT, RFC 6578, or a
-//! baseline `PROPFIND`) to completion over it, and closes. The coroutines
-//! are I/O-free (`WantsRead` / `WantsWrite`); [`drive`] is the async pump
-//! that runs them — the CardDAV analogue of [`crate::imap::pump::run`].
+//! polled: each round opens a fresh TLS connection, drives one io-webdav
+//! coroutine to completion over it, and closes. The coroutines are
+//! I/O-free (`WantsRead` / `WantsWrite`); [`drive`] is the async pump
+//! that runs them, the CardDAV analogue of [`crate::imap::pump::run`].
 //!
-//! The signal stays **content-free by construction**: only `getetag` and
+//! The signal stays content-free by construction: only `getetag` and
 //! `sync-token` are requested, never `address-data` (the vCard body). A
-//! change is identified by its opaque href, exactly as an IMAP change is
-//! identified by its UID.
+//! change is identified by its opaque href, as an IMAP change is by its
+//! UID.
 
 use anyhow::{Context, Result, bail};
 use io_http::rfc6750::bearer::HttpAuthBearer;
@@ -46,8 +45,8 @@ const MAX_REDIRECTS: usize = 5;
 /// `User-Agent` sent on every WebDAV request.
 const USER_AGENT: &str = "carillon";
 
-/// How to authenticate a CardDAV request: a password (HTTP Basic, RFC 7617)
-/// or an OAuth 2.0 bearer token (RFC 6750) — mirroring
+/// How to authenticate a CardDAV request: a password (HTTP Basic, RFC
+/// 7617) or an OAuth 2.0 bearer token (RFC 6750), mirroring
 /// [`crate::imap::session::ImapAuth`]. Resolved just before each poll.
 #[derive(Clone, Debug)]
 pub enum CardDavAuth {
@@ -101,8 +100,7 @@ impl CardDavAccount {
 }
 
 /// The content-free resource id of a member href: its last path segment
-/// (the vCard resource name), never card contents — the CardDAV analogue of
-/// an IMAP UID.
+/// (the vCard resource name), the CardDAV analogue of an IMAP UID.
 pub fn resource_id(href: &str) -> String {
     href.trim_end_matches('/')
         .rsplit('/')
@@ -116,7 +114,7 @@ pub fn resource_id(href: &str) -> String {
 pub enum SyncPollError {
     /// The server rejected the sync token; a fresh baseline is needed.
     InvalidToken,
-    /// A transport / protocol failure — surfaced as a watch error.
+    /// A transport / protocol failure, surfaced as a watch error.
     Other(anyhow::Error),
 }
 
@@ -142,8 +140,8 @@ impl CardDavProbe {
     }
 }
 
-/// Opens a TLS stream to a CardDAV host, SSRF-guarded exactly like the IMAP
-/// path: resolve + check first, then connect to that exact address (SNI and
+/// Opens a TLS stream to a CardDAV host, SSRF-guarded like the IMAP path:
+/// resolve + check first, then connect to that exact address (SNI and
 /// certificate verification still use the hostname).
 async fn open(connector: &TlsConnector, host: &str, port: u16) -> Result<TlsStream<TcpStream>> {
     let addr = guard::resolve_allowed(host, port)
@@ -161,10 +159,10 @@ async fn open(connector: &TlsConnector, host: &str, port: u16) -> Result<TlsStre
         .context("TLS handshake failed")
 }
 
-/// Drives an I/O-free WebDAV coroutine to completion over an async stream,
-/// returning its terminal value. The CardDAV analogue of
-/// [`crate::imap::pump::run`] (there is no fragmentizer: io-http reassembles
-/// the response itself).
+/// Drives an I/O-free WebDAV coroutine to completion over an async
+/// stream, returning its terminal value. The CardDAV analogue of
+/// [`crate::imap::pump::run`] (no fragmentizer: io-http reassembles the
+/// response itself).
 async fn drive<S, C, R>(stream: &mut S, mut coroutine: C) -> Result<R>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -184,8 +182,9 @@ where
                 }
                 let n = stream.read(&mut buf).await.context("read failed")?;
                 if n == 0 {
-                    // A close-delimited body ends here: feed the empty slice so
-                    // the coroutine finalizes; a further read request is an error.
+                    // NOTE: a close-delimited body ends here; feed the
+                    // empty slice so the coroutine finalizes, and a
+                    // further read request is an error.
                     eof = true;
                 }
                 arg = Some(&buf[..n]);
@@ -196,7 +195,7 @@ where
 }
 
 /// Probes a collection read-only: opens TLS, `PROPFIND`s (Depth 0) its
-/// change token, and reports each stage. Never raises — stage failures are
+/// change token, and reports each stage. Never raises; stage failures are
 /// captured in the returned [`CardDavProbe`], like the IMAP probe.
 pub async fn probe(connector: &TlsConnector, account: &CardDavAccount) -> CardDavProbe {
     let mut probe = CardDavProbe::default();
@@ -242,7 +241,8 @@ pub async fn probe(connector: &TlsConnector, account: &CardDavAccount) -> CardDa
             probe.error = Some("authentication failed".into());
         }
         Ok(Err(err)) => {
-            // Reached and answered, but not a usable collection (e.g. 404).
+            // NOTE: reached and answered, but not a usable collection
+            // (e.g. 404).
             probe.authenticated = true;
             probe.error = Some(format!("{err}"));
         }
@@ -255,7 +255,7 @@ pub async fn probe(connector: &TlsConnector, account: &CardDavAccount) -> CardDa
 /// Runs one `sync-collection` REPORT (RFC 6578) against the collection,
 /// asking only for etags. `since` is the checkpoint token (`None` for an
 /// initial enumeration). Returns the parsed delta, or a [`SyncPollError`]
-/// distinguishing a rejected token (re-baseline) from a transport failure.
+/// distinguishing a rejected token from a transport failure.
 pub async fn sync_changes(
     connector: &TlsConnector,
     account: &CardDavAccount,
@@ -277,9 +277,9 @@ pub async fn sync_changes(
     }
 }
 
-/// One addressbook collection discovered under an account's home-set — the
-/// content-free target picker for a CardDAV service (the analogue of an IMAP
-/// folder).
+/// One addressbook collection discovered under an account's home-set, the
+/// content-free target picker for a CardDAV service (the analogue of an
+/// IMAP folder).
 #[derive(Debug, Serialize)]
 pub struct AddressbookInfo {
     /// Human-readable display name (falls back to the collection id).
@@ -295,13 +295,13 @@ fn url_host_port(url: &Url) -> Result<(String, u16)> {
     Ok((host, port))
 }
 
-/// RFC 6764 §5 bootstrapping. A **bare origin is not necessarily the DAV context
-/// root**: PACC and RFC 6764 both hand back e.g. `https://carddav.fastmail.com/`,
-/// yet Fastmail 404s every request outside `/dav/*`. So when the URL path is bare
-/// (`/` or empty), start the principal walk at `.well-known/carddav`; the server
-/// redirects to the real root and [`run_following`] follows it. A URL that
-/// already carries a path is used as-is (plenty of servers serve the walk from
-/// the origin directly). Mirrors cardamum's connect-time context-root probe.
+/// RFC 6764 §5 bootstrapping. A bare origin is not necessarily the DAV
+/// context root: PACC and RFC 6764 both hand back e.g.
+/// `https://carddav.fastmail.com/`, yet Fastmail 404s every request
+/// outside `/dav/*`. So a bare path (`/` or empty) starts the principal
+/// walk at `.well-known/carddav`; the server redirects to the real root
+/// and [`run_following`] follows it. A URL that already carries a path is
+/// used as-is.
 fn context_root(url: &Url) -> Url {
     match url.path() {
         "" | "/" => {
@@ -313,13 +313,12 @@ fn context_root(url: &Url) -> Url {
     }
 }
 
-/// Drives a **redirect-following** WebDAV coroutine (current-user-principal /
-/// home-set): these yield [`WebdavRedirectYield::WantsRedirect`] and do *not*
-/// continue themselves — the driver must reopen a connection to the new URL and
-/// **rebuild** the coroutine there (RFC 5397 / 6764 servers routinely redirect a
-/// bare origin to the real DAV root). `make` reconstructs the coroutine for a
-/// URL. The inner `Result` is the coroutine's own (so a 401 stays inspectable);
-/// the outer is transport.
+/// Drives a redirect-following WebDAV coroutine (current-user-principal /
+/// home-set): these yield [`WebdavRedirectYield::WantsRedirect`] and do
+/// not continue themselves, so the driver reopens a connection to the new
+/// URL and rebuilds the coroutine there via `make`. The inner `Result` is
+/// the coroutine's own (so a 401 stays inspectable); the outer is
+/// transport.
 async fn run_following<C, T>(
     connector: &TlsConnector,
     start: &Url,
@@ -356,7 +355,9 @@ where
                     ..
                 }) => {
                     url = next;
-                    break; // reopen + rebuild the coroutine for the new URL
+                    // NOTE: reopen + rebuild the coroutine for the new
+                    // URL.
+                    break;
                 }
                 WebdavCoroutineState::Complete(result) => return Ok(result),
             }
@@ -365,10 +366,10 @@ where
     bail!("too many CardDAV redirects")
 }
 
-/// Verifies a CardDAV credential for the **account** (not a collection): does
-/// `current-user-principal` succeed? Used by `POST /auth` for a contacts PIM
-/// account. Never raises — stage failures land in the returned [`CardDavProbe`]
-/// (`sync` is not meaningful here and stays false).
+/// Verifies a CardDAV credential for the account (not a collection): does
+/// `current-user-principal` succeed? Used by `POST /auth` for a contacts
+/// PIM account. Never raises; stage failures land in the returned
+/// [`CardDavProbe`] (`sync` is not meaningful here and stays false).
 pub async fn verify_auth(connector: &TlsConnector, account: &CardDavAccount) -> CardDavProbe {
     let mut probe = CardDavProbe::default();
     let start = match Url::parse(&account.url) {
@@ -406,10 +407,9 @@ pub async fn verify_auth(connector: &TlsConnector, account: &CardDavAccount) -> 
 }
 
 /// Lists the addressbook collections an authenticated account can watch:
-/// current-user-principal → addressbook-home-set → the collections under it
-/// (RFC 5397 + RFC 6352), following redirects along the way. Content-free — only
-/// hrefs + display names, never card data. The folder-picker for a CardDAV
-/// service.
+/// current-user-principal → addressbook-home-set → the collections under
+/// it (RFC 5397 + RFC 6352), following redirects. Content-free: only
+/// hrefs + display names. The folder-picker for a CardDAV service.
 pub async fn list_addressbooks(
     connector: &TlsConnector,
     account: &CardDavAccount,
@@ -442,8 +442,8 @@ pub async fn list_addressbooks(
         .await?
         .map_err(|err| anyhow::anyhow!("list addressbooks failed: {err}"))?;
 
-    // Reconstruct each collection URL from the home-set + its id (the list
-    // yields the id, not the full href).
+    // NOTE: reconstruct each collection URL from the home-set + its id
+    // (the list yields the id, not the full href).
     let mut out = Vec::new();
     for book in books {
         let url = home

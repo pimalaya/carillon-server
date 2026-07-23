@@ -1,8 +1,8 @@
 //! Webhook delivery.
 //!
-//! Consumes canonical [`ChangeEvent`]s off a channel — decoupled from
-//! the watchers so a slow endpoint never stalls IDLE — and POSTs each
-//! as a signed, content-free JSON body. One shared, pooled
+//! Consumes canonical [`ChangeEvent`]s off a channel (decoupled from the
+//! watchers so a slow endpoint never stalls IDLE) and POSTs each as a
+//! signed, content-free JSON body. One shared, pooled
 //! [`reqwest::Client`] fans out to every endpoint; failures retry with
 //! bounded backoff; every outcome is logged to the store.
 
@@ -61,7 +61,8 @@ pub async fn run(
 async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: LiveBus) {
     let account = event.account.clone();
 
-    // The store is the source of truth for the endpoint and secret.
+    // NOTE: the store is the source of truth for the endpoint and
+    // secret.
     let watch = {
         let store = store.clone();
         let lookup_id = account.clone();
@@ -83,9 +84,10 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: Li
     };
 
     let body = serde_json::to_vec(&event).expect("ChangeEvent always serializes");
-    // Sign the timestamped preimage `t.body` with every currently-valid
-    // secret (current, plus the previous one during a rotation overlap),
-    // Stripe-style, so a mid-rotation receiver validates against either.
+    // NOTE: sign the timestamped preimage `t.body` with every
+    // currently-valid secret (current, plus the previous during a
+    // rotation overlap), so a mid-rotation receiver validates against
+    // either.
     let signature = sign(&watch.signing_secrets(now_secs()), event.ts, &body);
 
     let mut attempts = 0;
@@ -116,7 +118,7 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: Li
                     break;
                 }
                 last_error = Some(format!("HTTP {status}"));
-                // 4xx is the caller's fault: do not retry.
+                // NOTE: 4xx is the caller's fault; do not retry.
                 if !status.is_server_error() {
                     break;
                 }
@@ -149,9 +151,9 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: Li
         );
     }
 
-    // Publish the outcome to any live (SSE) subscribers, tagged with the
-    // watch's billing account so the stream can scope it. Ignore the
-    // error: no subscribers is the normal case.
+    // NOTE: publish the outcome to any live (SSE) subscribers, tagged
+    // with the watch's billing account so the stream can scope it.
+    // Ignore the error; no subscribers is the normal case.
     let _ = live.send(Routed::new(
         watch.account_id.clone(),
         LiveEvent::delivery(
@@ -182,11 +184,11 @@ async fn deliver(store: Arc<Store>, client: Client, event: ChangeEvent, live: Li
     .ok();
 }
 
-/// Sends a one-shot, signed **notice** webhook (low balance, exhausted,
+/// Sends a one-shot, signed notice webhook (low balance, exhausted,
 /// auto-refilled) to a watch's notify URL. Best-effort and content-free,
-/// like a change delivery, but not retried — a notice is advisory and the
-/// same state recurs on the next tick. Reuses the change-delivery
-/// signature scheme so receivers verify it the same way.
+/// like a change delivery, but not retried, since a notice is advisory
+/// and the same state recurs on the next tick. Reuses the
+/// change-delivery signature scheme.
 pub async fn deliver_notice(client: &Client, watch: &Watch, kind: &str) {
     let ts = now_secs();
     let body = serde_json::to_vec(&json!({
@@ -217,8 +219,8 @@ pub async fn deliver_notice(client: &Client, watch: &Watch, kind: &str) {
     }
 }
 
-/// The outcome of a one-shot webhook test: whether the endpoint acked, the
-/// HTTP status (if any), and the failure reason (if any).
+/// The outcome of a one-shot webhook test: whether the endpoint acked,
+/// the HTTP status (if any), and the failure reason (if any).
 pub struct TestOutcome {
     /// The endpoint answered with a 2xx.
     pub ok: bool,
@@ -228,11 +230,11 @@ pub struct TestOutcome {
     pub error: Option<String>,
 }
 
-/// POSTs one synthetic, signed **test** event to `notify_url` — the
+/// POSTs one synthetic, signed test event to `notify_url`, the
 /// onboarding "Test webhook" button. Signed exactly like a real delivery
-/// (with `secret`, so a receiver already wired to verify accepts it) but
-/// carrying `{"type":"test", …}` and never retried. The caller is expected
-/// to have validated the URL with [`validate_notify_url`] first.
+/// (with `secret`) but carrying `{"type":"test", …}` and never retried.
+/// The caller is expected to have validated the URL with
+/// [`validate_notify_url`] first.
 pub async fn deliver_test(client: &Client, notify_url: &str, secret: &str) -> TestOutcome {
     let ts = now_secs();
     let body = serde_json::to_vec(&json!({
@@ -271,11 +273,9 @@ pub async fn deliver_test(client: &Client, notify_url: &str, secret: &str) -> Te
 }
 
 /// Validates a notify URL against the HTTPS-only policy. Plain `http://`
-/// is refused because a leaked-in-transit signal (and, worse, an
-/// attacker able to see the URL) defeats the point — with one exception:
-/// a loopback host, where `http://` is safe and needed for local sinks,
-/// self-host and tests. Any non-loopback `http://` (or a non-HTTP
-/// scheme) is rejected.
+/// is refused because a leaked-in-transit signal defeats the point,
+/// except on a loopback host where it is safe and needed for local
+/// sinks, self-host and tests.
 pub fn validate_notify_url(url: &str) -> Result<()> {
     let parsed = Url::parse(url).map_err(|err| anyhow::anyhow!("not a valid URL: {err}"))?;
     match parsed.scheme() {
@@ -306,8 +306,7 @@ fn is_loopback(url: &Url) -> bool {
 /// `"{ts}.{body}"`, HMAC-SHA256 with each valid secret:
 /// `t=<ts>,v1=<hex>[,v1=<hex>]`. The timestamp is inside the signed
 /// content (replay protection); multiple `v1` values cover a rotation
-/// overlap. A receiver reconstructs `"{t}.{raw body}"`, HMACs it with
-/// its configured secret, and accepts if any `v1` matches.
+/// overlap.
 fn sign(secrets: &[&str], ts: i64, body: &[u8]) -> String {
     let mut preimage = Vec::with_capacity(body.len() + 16);
     preimage.extend_from_slice(ts.to_string().as_bytes());

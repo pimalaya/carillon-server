@@ -2,8 +2,20 @@
 name = "carillon-backend"
 description = "Carillon backend"
 version = "0.1.0"
+authors = ["soywod <clement.douin@posteo.net>"]
+rust-version = "1.88"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+categories = ["email", "command-line-utilities"]
+keywords = ["imap", "webhook", "watch", "notification", "idle"]
+homepage = "https://pimalaya.org"
+repository = "https://github.com/pimalaya/carillon-backend"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
 
 [dependencies]
 age = "0.12"

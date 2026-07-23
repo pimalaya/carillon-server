@@ -1,22 +1,21 @@
 //! # Carillon watch server (prototype)
 //!
 //! Holds IMAP IDLE for many accounts on one box and, the instant a
-//! mailbox changes, POSTs a small, HMAC-signed, **content-free** signal
-//! to each account's notify URL. Carillon signals; it never syncs.
+//! mailbox changes, POSTs a content-free, HMAC-signed signal to each
+//! account's notify URL. Carillon signals; it never syncs.
 //!
-//! Wiring: the [`supervisor`] runs one connect/watch/reconnect task per
-//! active watch (over the async [`imap::pump`]) and folds every change
-//! into a canonical [`event::ChangeEvent`]; those flow down a channel to
-//! the [`delivery`] worker, which signs and POSTs them and logs the
-//! outcome to the sqlite [`store`]. The [`api`] manages watches at
-//! runtime. Passwords are encrypted at rest via [`crypto`].
+//! The [`supervisor`] runs one connect/watch/reconnect task per active
+//! watch (over [`imap::pump`]) and folds every change into a canonical
+//! [`event::ChangeEvent`]; those flow down a channel to the [`delivery`]
+//! worker, which signs, POSTs and logs the outcome to the sqlite
+//! [`store`]. The [`api`] manages watches at runtime; [`crypto`]
+//! encrypts passwords at rest.
 //!
 //! Two subcommands:
 //!
-//! - `carillon serve [config]` (the default) runs the daemon.
-//! - `carillon import <accounts.toml> [config]` populates the store from
-//!   an [`config::ImportFile`] and exits — the headless entrypoint, since
-//!   accounts no longer live in the config.
+//! - `carillon-backend serve [config]` (the default) runs the daemon.
+//! - `carillon-backend import <accounts.toml> [config]` populates the store from
+//!   an [`config::ImportFile`] and exits.
 
 mod api;
 mod billing;
@@ -67,8 +66,8 @@ const COMMAND_CHANNEL: usize = 64;
 const TEST_MAX_ATTEMPTS: u32 = 5;
 /// `/test` limit: the window over which attempts are counted.
 const TEST_WINDOW: Duration = Duration::from_secs(300);
-/// `/discover` limit: lookups per IP per window (each makes outbound
-/// DNS/HTTP requests, so it is throttled even though it is unauthenticated).
+/// `/discover` limit: lookups per IP per window (throttled because each
+/// makes outbound DNS/HTTP requests, though unauthenticated).
 const DISCOVER_MAX_ATTEMPTS: u32 = 20;
 /// `/discover` limit window.
 const DISCOVER_WINDOW: Duration = Duration::from_secs(300);
@@ -78,12 +77,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,carillon_server=debug")),
+                .unwrap_or_else(|_| EnvFilter::new("info,carillon_backend=debug")),
         )
         .init();
 
-    // One process-wide crypto provider, shared by the IMAP connector
-    // and reqwest's rustls.
+    // NOTE: one process-wide crypto provider, shared by the IMAP
+    // connector and reqwest's rustls.
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
@@ -93,7 +92,7 @@ async fn main() -> Result<()> {
         Some("import") => {
             let accounts = args
                 .get(2)
-                .context("usage: carillon import <accounts.toml> [config]")?;
+                .context("usage: carillon-backend import <accounts.toml> [config]")?;
             let config = load_config(args.get(3).map(String::as_str))?;
             import(&config, accounts.as_ref())
         }
@@ -101,8 +100,8 @@ async fn main() -> Result<()> {
             let config = load_config(args.get(2).map(String::as_str))?;
             serve(config).await
         }
-        // No subcommand, or a bare config path (kept for convenience):
-        // `carillon` / `carillon carillon.toml` both serve.
+        // NOTE: no subcommand or a bare config path both serve, for
+        // convenience (`carillon-backend` / `carillon-backend carillon.toml`).
         Some(flag) if flag.starts_with('-') => bail!("unknown flag: {flag}"),
         other => {
             let config = load_config(other)?;
@@ -123,42 +122,39 @@ fn load_config(explicit: Option<&str>) -> Result<Config> {
 
 /// Runs the daemon: watchers, delivery worker and control API.
 async fn serve(config: Config) -> Result<()> {
-    // Egress policy first: every outbound connect (IMAP + webhooks) consults it.
+    // NOTE: set egress policy first; every outbound connect (IMAP +
+    // webhooks) consults it.
     guard::set_allow_private_targets(config.server.allow_private_targets);
 
-    // Watching is credit-metered only on the SaaS (Stripe configured); the
-    // keyless stub provider means self-host / dev, which is not billed.
+    // NOTE: watching is credit-metered only on the SaaS (Stripe
+    // configured); the keyless stub means self-host / dev, not billed.
     let metered = config.billing.stripe.is_some();
 
     let store = Arc::new(Store::open(&config.server.db_path()).context("Cannot open store")?);
     let crypto =
         Arc::new(Crypto::load_or_create(&config.server.age_key_path()).context("Cannot load key")?);
 
-    // Shared TLS config: one verifier and one session cache for every
-    // held IMAP connection, and for the read-only `/test` probe.
+    // NOTE: shared TLS config, one verifier and one session cache for
+    // every held IMAP connection and the read-only `/test` probe.
     let tls = Arc::new(ClientConfig::with_platform_verifier().context("Cannot build TLS config")?);
     let connector = TlsConnector::from(tls);
 
-    // Shared, pooled HTTP client for outbound webhooks.
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .context("Cannot build HTTP client")?;
 
-    // Transactional email: Resend when configured, else the keyless stub.
     let mailer = Arc::new(email::Mailer::new(http.clone(), &config.email));
 
     let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
-    // Shutdown signal: flipped on ctrl_c so held SSE streams end and do not
-    // block graceful shutdown.
+    // NOTE: flipped on ctrl_c so held SSE streams end and do not block
+    // graceful shutdown.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    // Live bus for the SSE stream. The extra receiver is dropped; the
-    // sender survives with zero subscribers, and each SSE client makes
-    // its own.
+    // NOTE: the extra receiver is dropped; the sender survives with zero
+    // subscribers, and each SSE client makes its own.
     let (live_tx, _live_rx) = broadcast::channel(live::CAPACITY);
 
-    // Delivery worker.
     tokio::spawn(delivery::run(
         event_rx,
         store.clone(),
@@ -178,7 +174,7 @@ async fn serve(config: Config) -> Result<()> {
         metered,
     ));
 
-    // Supervisor. Keep a clone of the connector for the `/test` probe.
+    // NOTE: keep a clone of the connector for the `/test` probe.
     let supervisor = Supervisor::new(
         store.clone(),
         crypto.clone(),
@@ -192,8 +188,8 @@ async fn serve(config: Config) -> Result<()> {
     let reconcile_interval = Duration::from_secs(config.server.reconcile_interval_secs.max(5));
     tokio::spawn(supervisor.run(command_rx, reconcile_interval));
 
-    // OAuth redirect/popup URLs: the public API base (for the redirect URI)
-    // and the dashboard origin the callback popup posts its result back to.
+    // NOTE: the public API base (redirect URI) and the dashboard origin
+    // the OAuth callback popup posts its result back to.
     let public_url = config
         .api
         .public_url
@@ -208,7 +204,8 @@ async fn serve(config: Config) -> Result<()> {
         .map(|url| url.origin().ascii_serialization())
         .unwrap_or_else(|_| String::from("*"));
 
-    // Own OAuth apps, if configured, override the built-in Thunderbird clients.
+    // NOTE: own OAuth apps, if configured, override the built-in
+    // Thunderbird clients.
     let to_client = |client: &config::OauthClientConfig| {
         (client.client_id.clone(), client.client_secret.clone())
     };
@@ -217,7 +214,6 @@ async fn serve(config: Config) -> Result<()> {
         microsoft: config.oauth.microsoft.as_ref().map(to_client),
     };
 
-    // Payment provider: Stripe when configured, else the keyless stub.
     let billing: Arc<billing::Billing> = match &config.billing.stripe {
         Some(stripe) => {
             info!("billing: stripe");
@@ -233,7 +229,6 @@ async fn serve(config: Config) -> Result<()> {
         }
     };
 
-    // Control API.
     let state = AppState {
         store: store.clone(),
         crypto: crypto.clone(),
@@ -271,8 +266,8 @@ async fn serve(config: Config) -> Result<()> {
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
             info!("shutdown signal received");
-            // End held SSE streams first so they don't stall graceful
-            // shutdown, then stop the watchers.
+            // NOTE: end held SSE streams first so they don't stall
+            // graceful shutdown, then stop the watchers.
             let _ = shutdown_tx.send(true);
             let _ = shutdown_commands.send(SupervisorCmd::Shutdown).await;
         })
@@ -282,9 +277,10 @@ async fn serve(config: Config) -> Result<()> {
     Ok(())
 }
 
-/// Imports accounts from a TOML file into the store, then exits. Watches
-/// are upserted (an existing id is updated in place); the running daemon,
-/// if any, adopts them on its next reconcile.
+/// Imports accounts from a TOML file into the store, then exits.
+///
+/// Watches are upserted (an existing id is updated in place); a running
+/// daemon adopts them on its next reconcile.
 fn import(config: &Config, path: &Path) -> Result<()> {
     let store = Store::open(&config.server.db_path()).context("Cannot open store")?;
     let crypto =
@@ -313,16 +309,17 @@ fn import(config: &Config, path: &Path) -> Result<()> {
             hmac_secret: account.hmac_secret.clone(),
             hmac_secret_prev: None,
             hmac_secret_prev_expires: None,
-            // One watch, one billing account until grouped (M7).
+            // NOTE: one watch, one billing account until grouped (M7).
             account_id: id.clone(),
             provider: metering::provider_domain(&account.imap_host),
             auth_kind: String::from("password"),
-            // Self-host import is unmetered, so activation is moot (watches run
-            // regardless); leave the service un-activated.
+            // NOTE: self-host import is unmetered, so activation is moot
+            // (watches run regardless); leave the service un-activated.
             watching_until: None,
             auto_renew: false,
             active: account.active,
-            // Import is IMAP-only today; CardDAV services are added via the API.
+            // NOTE: import is IMAP-only; CardDAV services are added via
+            // the API.
             source_kind: String::from("imap"),
             carddav_url: None,
             carddav_sync_token: None,

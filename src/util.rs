@@ -2,8 +2,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Current unix time in whole seconds. Saturates to `0` before the
-/// epoch (never happens on a sane clock), keeping callers total.
+/// Current unix time in whole seconds, saturating to `0` before the
+/// epoch.
 pub fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

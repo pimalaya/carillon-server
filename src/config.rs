@@ -1,12 +1,12 @@
 //! # Configuration
 //!
-//! TOML configuration of the watch server: **infrastructure only** —
-//! server-wide settings (the sqlite database, the age key, tuning
-//! knobs) and the control API listen address. Watches (accounts) do
-//! **not** live here: the store is their sole source of truth, and they
-//! enter it through the control API or the one-shot `carillon import`
-//! command (see [`ImportFile`]). This collapses the old "config-path vs
-//! API-path for accounts" duplication onto one path.
+//! TOML configuration of the watch server: infrastructure only, being
+//! server-wide settings (the sqlite database, the age key, tuning knobs)
+//! and the control API listen address.
+//!
+//! Watches (accounts) do not live here: the store is their sole source
+//! of truth, and they enter it through the control API or the one-shot
+//! `carillon-backend import` command (see [`ImportFile`]).
 
 use std::{
     collections::BTreeMap,
@@ -27,57 +27,57 @@ pub struct Config {
     /// Control API settings.
     #[serde(default)]
     pub api: ApiConfig,
-    /// OAuth client overrides (own registered apps instead of the built-in
-    /// Thunderbird public clients).
+    /// OAuth client overrides (own registered apps instead of the
+    /// built-in Thunderbird public clients).
     #[serde(default)]
     pub oauth: OauthConfig,
-    /// Payment provider (Stripe). Unset = the keyless stub provider.
+    /// Payment provider (Stripe). Unset uses the keyless stub.
     #[serde(default)]
     pub billing: BillingConfig,
-    /// Transactional email provider (magic links + notices). Unset = the
-    /// keyless stub mailer (logs instead of sending).
+    /// Transactional email provider (magic links + notices). Unset uses
+    /// the keyless stub mailer (logs instead of sending).
     #[serde(default)]
     pub email: EmailConfig,
 }
 
-/// Transactional email configuration. Unset (`[email]` absent) = the keyless
-/// stub mailer used for local/dev (it logs the magic-link URL). Deliverability
-/// guidance (authenticated sending subdomain, SPF/DKIM/DMARC, no link tracking
-/// on the auth stream) lives in `docs/EMAIL.md`.
+/// Transactional email configuration. Unset (`[email]` absent) uses the
+/// keyless stub mailer for local/dev (it logs the magic-link URL).
+///
+/// Deliverability guidance lives in `docs/EMAIL.md`.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct EmailConfig {
-    /// `[email.resend]` — the Resend adapter. Absent = the stub.
+    /// `[email.resend]`, the Resend adapter. Absent uses the stub.
     #[serde(default)]
     pub resend: Option<ResendConfig>,
 }
 
-/// Resend configuration. `api_key` is a **secret** — inject it via systemd
-/// `LoadCredential` / a secrets manager in production.
+/// Resend configuration. `api_key` is a secret; inject it via systemd
+/// `LoadCredential` or a secrets manager in production.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ResendConfig {
-    /// Resend API key (`re_…`). A **secret**: set it inline, or point
+    /// Resend API key (`re_…`). A secret: set it inline, or point
     /// [`ResendConfig::api_key_file`] at a file holding it.
     #[serde(default)]
     pub api_key: String,
-    /// Read `api_key` from this file (trimmed) instead of inline — for systemd
-    /// `LoadCredential`, sops-nix, or any secret manager. Set exactly one.
+    /// Read `api_key` from this file (trimmed) instead of inline. Set
+    /// exactly one.
     #[serde(default)]
     pub api_key_file: Option<PathBuf>,
-    /// The `From:` header — a monitored address on your authenticated sending
-    /// subdomain, e.g. `Carillon <no-reply@mail.carillon.pimalaya.org>`.
+    /// The `From:` header: a monitored address on your authenticated
+    /// sending subdomain.
     pub from: String,
 }
 
-/// OAuth client overrides for the providers that need a pre-registered app
-/// (Google, Microsoft — they offer no dynamic registration). Unset = the
-/// built-in Thunderbird public clients. Provide your own to use a hosted
-/// redirect URI (Thunderbird's clients only accept loopback redirects).
+/// OAuth client overrides for providers needing a pre-registered app
+/// (Google, Microsoft, which offer no dynamic registration). Unset uses
+/// the built-in Thunderbird public clients. Provide your own to use a
+/// hosted redirect URI (Thunderbird's clients only accept loopback).
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct OauthConfig {
-    /// `[oauth.google]` — your Google OAuth client.
+    /// `[oauth.google]`, your Google OAuth client.
     #[serde(default)]
     pub google: Option<OauthClientConfig>,
-    /// `[oauth.microsoft]` — your Microsoft (Entra) OAuth client.
+    /// `[oauth.microsoft]`, your Microsoft (Entra) OAuth client.
     #[serde(default)]
     pub microsoft: Option<OauthClientConfig>,
 }
@@ -96,44 +96,43 @@ pub struct OauthClientConfig {
     pub client_secret_file: Option<PathBuf>,
 }
 
-/// Payment provider configuration. Unset (`[billing]` absent) = the keyless
-/// stub provider used for local/dev.
+/// Payment provider configuration. Unset (`[billing]` absent) uses the
+/// keyless stub for local/dev.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct BillingConfig {
-    /// `[billing.stripe]` — the Stripe adapter. Absent = the stub.
+    /// `[billing.stripe]`, the Stripe adapter. Absent uses the stub.
     #[serde(default)]
     pub stripe: Option<StripeConfig>,
 }
 
-/// Stripe configuration. `secret_key` and `webhook_secret` are **secrets** —
-/// in production inject them via systemd `LoadCredential` / a secrets manager
-/// rather than a world-readable file (see `docs/DEPLOY_HARDENING.md`). The
-/// price *lives in Stripe*: `prices` maps the `pack` key to a **one-time**
-/// Stripe Price id — the price of one credit pack (`PACK_SIZE` credits) —
-/// created in the dashboard. Only the **secret** key is needed — hosted
-/// Checkout needs no publishable key server-side.
+/// Stripe configuration. `secret_key` and `webhook_secret` are secrets;
+/// inject them via systemd `LoadCredential` or a secrets manager in
+/// production (see `docs/DEPLOY_HARDENING.md`). `prices` maps a plan id
+/// to its Stripe Price id. Only the secret key is needed; hosted
+/// Checkout needs no server-side publishable key.
 #[derive(Clone, Debug, Deserialize)]
 pub struct StripeConfig {
-    /// Secret API key (`sk_test_…` in the sandbox, `sk_live_…` in production).
-    /// A **secret**: set it inline, or via [`StripeConfig::secret_key_file`].
+    /// Secret API key (`sk_test_…` / `sk_live_…`). A secret: set it
+    /// inline, or via [`StripeConfig::secret_key_file`].
     #[serde(default)]
     pub secret_key: String,
     /// Read `secret_key` from this file (trimmed) instead of inline.
     #[serde(default)]
     pub secret_key_file: Option<PathBuf>,
-    /// Webhook signing secret (`whsec_…`) for verifying the event signature.
-    /// A **secret**: set it inline, or via [`StripeConfig::webhook_secret_file`].
+    /// Webhook signing secret (`whsec_…`) verifying the event signature.
+    /// A secret: set it inline, or via
+    /// [`StripeConfig::webhook_secret_file`].
     #[serde(default)]
     pub webhook_secret: String,
     /// Read `webhook_secret` from this file (trimmed) instead of inline.
     #[serde(default)]
     pub webhook_secret_file: Option<PathBuf>,
-    /// Where Stripe returns the buyer after a successful payment. Optional —
-    /// defaults to the dashboard URL with a `?checkout=success` marker.
+    /// Where Stripe returns the buyer after a successful payment.
+    /// Defaults to the dashboard URL with a `?checkout=success` marker.
     #[serde(default)]
     pub success_url: Option<String>,
-    /// Where Stripe returns the buyer after a cancelled payment. Optional —
-    /// defaults to the dashboard URL with a `?checkout=cancel` marker.
+    /// Where Stripe returns the buyer after a cancelled payment.
+    /// Defaults to the dashboard URL with a `?checkout=cancel` marker.
     #[serde(default)]
     pub cancel_url: Option<String>,
     /// Plan id (`month`, `year`, …) → recurring Stripe Price id (`price_…`).
@@ -151,11 +150,10 @@ impl Config {
         Ok(config)
     }
 
-    /// Resolves every `*_file` secret pointer into its inline field by reading
-    /// the file (trimmed). Keeps secrets out of the config file itself —
-    /// delivered instead by systemd `LoadCredential`, sops-nix or any secret
-    /// manager (see `docs/NIXOS.md`, `docs/DEPLOY_HARDENING.md`). For each
-    /// secret, set the inline value OR its `*_file`, never both.
+    /// Resolves every `*_file` secret pointer into its inline field by
+    /// reading the file (trimmed), keeping secrets out of the config
+    /// file. For each secret, set the inline value or its `*_file`, never
+    /// both.
     fn resolve_secrets(&mut self) -> Result<()> {
         self.api.admin_token = resolve_optional_secret(
             "api.admin_token",
@@ -203,8 +201,8 @@ impl Config {
     }
 }
 
-/// Resolves an **optional** secret: reads `file` (trimmed) when set, errors if
-/// both an inline value and a file are given, `None` when neither is.
+/// Resolves an optional secret: reads `file` (trimmed) when set, errors
+/// if both an inline value and a file are given, `None` when neither is.
 fn resolve_optional_secret(
     name: &str,
     inline: Option<String>,
@@ -218,7 +216,7 @@ fn resolve_optional_secret(
     }
 }
 
-/// Resolves a **required** secret. The inline value arrives as a (possibly
+/// Resolves a required secret. The inline value arrives as a (possibly
 /// empty) string; an empty inline with no file is an error.
 fn resolve_required_secret(name: &str, inline: String, file: Option<PathBuf>) -> Result<String> {
     match (inline.is_empty(), file) {
@@ -250,28 +248,27 @@ pub struct ServerConfig {
     /// encrypt watch passwords at rest.
     #[serde(default = "default_age_key")]
     pub age_key_file: PathBuf,
-    /// Ceiling on simultaneous TLS handshakes, to tame reconnect
-    /// storms and per-IP provider limits.
+    /// Ceiling on simultaneous TLS handshakes, taming reconnect storms
+    /// and per-IP provider limits.
     #[serde(default = "default_max_handshakes")]
     pub max_concurrent_handshakes: usize,
-    /// How often the supervisor re-reads the store as a safety net,
-    /// in addition to explicit API-triggered reconciles.
+    /// How often the supervisor re-reads the store as a safety net, on
+    /// top of explicit API-triggered reconciles.
     #[serde(default = "default_reconcile_secs")]
     pub reconcile_interval_secs: u64,
-    /// Permit outbound connections (IMAP + webhooks) to loopback / private /
-    /// link-local addresses. Default `false` (the SSRF-safe posture). Set
-    /// `true` for local dev or a self-host that watches a LAN mail server or
-    /// posts to a loopback sink.
+    /// Permit outbound connections (IMAP + webhooks) to private targets.
+    /// Default `false` (the SSRF-safe posture). Set `true` for local dev
+    /// or a self-host watching a LAN mail server or a loopback sink.
     #[serde(default)]
     pub allow_private_targets: bool,
-    /// Fair-use cap: the most distinct mailboxes a single (SaaS) account may
-    /// watch before it needs a volume plan. A generous backstop against
-    /// reselling, not a product tier — the flat plan is "unlimited" below it.
+    /// Fair-use cap: the most distinct mailboxes a single SaaS account
+    /// may watch before it needs a volume plan. A backstop against
+    /// reselling, not a product tier.
     #[serde(default = "default_max_watches")]
     pub max_watches_per_account: usize,
-    /// Default poll interval (seconds) for CardDAV addressbook services, which
-    /// have no push and are polled for sync-token changes. A per-service
-    /// override may lower it; IMAP services ignore it (they hold IDLE).
+    /// Default poll interval (seconds) for CardDAV addressbook services,
+    /// which have no push and are polled for sync-token changes. A
+    /// per-service override may lower it; IMAP services ignore it.
     #[serde(default = "default_carddav_poll_secs")]
     pub carddav_poll_interval_secs: u64,
 }
@@ -308,38 +305,34 @@ pub struct ApiConfig {
     /// Listen address of the HTTP control API.
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Optional directory of static UI assets (a built `carillon-frontend`
-    /// `dist/`) to serve at the API origin. Unset = API only (the SaaS
-    /// front serves the UI from a CDN instead).
+    /// Optional directory of static UI assets to serve at the API
+    /// origin. Unset serves the API only (the SaaS front uses a CDN).
     #[serde(default)]
     pub ui_dir: Option<PathBuf>,
     /// Optional CORS allow-origin for a cross-origin (CDN) front. `*`
-    /// allows any origin; a URL allows exactly that one. Unset = no CORS
-    /// (same-origin self-host).
+    /// allows any origin; a URL allows exactly that one. Unset disables
+    /// CORS (same-origin self-host).
     #[serde(default)]
     pub cors_allow_origin: Option<String>,
-    /// Optional master bearer token granting **unscoped** access to every
-    /// account's watches, deliveries and events. This is the ops /
-    /// headless-self-host escape hatch: with it, a `carillon import`-only
-    /// box (which has no capability link) can still be inspected, and an
-    /// operator can see the whole fleet. Unset (the default) = there is no
-    /// unscoped access at all; every data route is reachable only through a
-    /// capability link scoped to one account (§ DECISIONS 5). Keep it long
-    /// and secret; it is the whole fleet's key.
+    /// Optional master bearer token granting unscoped access to every
+    /// account's watches, deliveries and events. The ops /
+    /// headless-self-host escape hatch. Unset (the default) leaves every
+    /// data route reachable only through a capability link scoped to one
+    /// account (§ DECISIONS 5). Keep it long and secret.
     #[serde(default)]
     pub admin_token: Option<String>,
-    /// Read `admin_token` from this file (trimmed) instead of inline — for
-    /// systemd `LoadCredential`, sops-nix, etc. Set exactly one of the two.
+    /// Read `admin_token` from this file (trimmed) instead of inline. Set
+    /// exactly one of the two.
     #[serde(default)]
     pub admin_token_file: Option<PathBuf>,
-    /// Public base URL of this API, used to build the OAuth redirect URI
-    /// (`{public_url}/oauth/callback`). Defaults to `http://{listen}` — fine
-    /// for local self-host; set it to the externally reachable URL when
-    /// exposed (the provider redirects the browser here).
+    /// Public base URL of this API, building the OAuth redirect URI
+    /// (`{public_url}/oauth/callback`). Defaults to `http://{listen}`;
+    /// set it to the externally reachable URL when exposed.
     #[serde(default)]
     pub public_url: Option<String>,
-    /// Base URL of the dashboard the OAuth popup posts its result back to; its
-    /// origin is the `postMessage` target. Defaults to `public_url`.
+    /// Base URL of the dashboard the OAuth popup posts its result back
+    /// to; its origin is the `postMessage` target. Defaults to
+    /// `public_url`.
     #[serde(default)]
     pub dashboard_url: Option<String>,
 }
@@ -358,11 +351,13 @@ impl Default for ApiConfig {
     }
 }
 
-/// A file of accounts to import into the store, consumed by the
-/// `carillon import` command. This is the headless self-host entrypoint
-/// for populating the DB out-of-band; the running daemon picks the new
-/// watches up on its next reconcile. Distinct from [`Config`] on
-/// purpose: the daemon config is infra, this is data.
+/// A file of accounts to import into the store, consumed by `carillon
+/// import`.
+///
+/// The headless self-host entrypoint for populating the DB out-of-band;
+/// the running daemon adopts the new watches on its next reconcile.
+/// Distinct from [`Config`] on purpose: the daemon config is infra, this
+/// is data.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct ImportFile {
     /// Accounts to import, keyed by watch id.
@@ -414,7 +409,7 @@ pub struct PasswordConfig {
 
 impl PasswordConfig {
     /// Resolves the password, trimming trailing newlines of command
-    /// outputs.
+    /// output.
     pub fn resolve(&self) -> Result<String> {
         if let Some(raw) = &self.raw {
             return Ok(raw.clone());

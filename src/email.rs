@@ -1,17 +1,15 @@
-//! Transactional email — the magic-link and billing-notice sender behind a
-//! small enum, mirroring [`crate::billing::Billing`].
+//! Transactional email: the magic-link and billing-notice sender behind
+//! a small enum, mirroring [`crate::billing::Billing`].
 //!
-//! Deliverability is existential here: a magic-link that spam-folders means a
-//! user cannot sign in at all (§ BILLING_MODEL / docs/EMAIL.md). So Carillon
-//! never sends from its own box — it relays through a provider, over an
-//! authenticated sending subdomain (SPF + DKIM + DMARC), with link tracking
-//! **off** on the auth stream (a rewritten magic link looks like a redirect and
-//! trips filters).
+//! Deliverability is existential: a spam-foldered magic link means a
+//! user cannot sign in at all. Carillon never sends from its own box; it
+//! relays through a provider over an authenticated sending subdomain
+//! (SPF + DKIM + DMARC), with link tracking off on the auth stream (a
+//! rewritten magic link looks like a redirect and trips filters).
 //!
-//! [`Mailer::Stub`] needs no keys and stands in for local/dev: it logs what it
-//! would send (the magic-link URL included, so a dev flow is testable without a
-//! provider). [`Mailer::Resend`] posts to the Resend HTTP API over the shared
-//! `reqwest` client. The enum makes adding SES/Postmark/SMTP a new variant.
+//! [`Mailer::Stub`] needs no keys and stands in for local/dev, logging
+//! what it would send (magic-link URL included). [`Mailer::Resend`]
+//! posts to the Resend HTTP API over the shared `reqwest` client.
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -22,18 +20,20 @@ use crate::config::EmailConfig;
 /// The Resend send endpoint.
 const RESEND_URL: &str = "https://api.resend.com/emails";
 
-/// The transactional email sender. `Stub` logs (dev/self-host); `Resend` sends.
+/// The transactional email sender. `Stub` logs (dev/self-host);
+/// `Resend` sends.
 pub enum Mailer {
-    /// Keyless stand-in: logs the message (magic-link URL included) instead of
-    /// sending. Lets a dev flow complete with no provider configured.
+    /// Keyless stand-in: logs the message (magic-link URL included)
+    /// instead of sending.
     Stub,
     /// The Resend adapter (HTTP API over the shared client).
     Resend(ResendMailer),
 }
 
 impl Mailer {
-    /// Builds the mailer from config, sharing the server's pooled client.
-    /// `[email.resend]` present → the Resend adapter; absent → the stub.
+    /// Builds the mailer from config, sharing the server's pooled
+    /// client. `[email.resend]` present picks Resend; absent picks the
+    /// stub.
     pub fn new(http: reqwest::Client, config: &EmailConfig) -> Self {
         match &config.resend {
             Some(resend) => {
@@ -51,8 +51,8 @@ impl Mailer {
         }
     }
 
-    /// Sends a sign-in email carrying the magic link. Link tracking is off so
-    /// the token URL is delivered verbatim.
+    /// Sends a sign-in email carrying the magic link. Link tracking is
+    /// off so the token URL is delivered verbatim.
     pub async fn send_magic_link(&self, to: &str, link: &str) -> Result<()> {
         let text = format!(
             "Sign in to Carillon by opening this link (valid briefly, single use):\n\n{link}\n\n\
@@ -68,8 +68,8 @@ impl Mailer {
             .await
     }
 
-    /// Sends a plain billing notice (low pool, watch ending / stopped) — the
-    /// account-level channel the live bus cannot reach.
+    /// Sends a plain billing notice (low pool, watch ending / stopped),
+    /// the account-level channel the live bus cannot reach.
     pub async fn send_notice(&self, to: &str, subject: &str, body: &str) -> Result<()> {
         self.send(to, subject, body, None).await
     }
@@ -90,8 +90,8 @@ impl Mailer {
 pub struct ResendMailer {
     http: reqwest::Client,
     api_key: String,
-    /// The `From:` header — a monitored address on your authenticated sending
-    /// subdomain (e.g. `Carillon <no-reply@mail.carillon.pimalaya.org>`).
+    /// The `From:` header: a monitored address on your authenticated
+    /// sending subdomain.
     from: String,
 }
 

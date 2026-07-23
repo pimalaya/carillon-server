@@ -1,11 +1,10 @@
 //! The live event bus for the SSE stream.
 //!
 //! A process-wide broadcast channel over which the delivery worker and
-//! the supervisor publish what a dashboard wants to watch in real time:
-//! each delivery outcome and each change in a watch's connection status.
-//! The `/events` SSE endpoint subscribes and forwards them. This is
-//! purely observational — it carries no message content, only the same
-//! content-free signal the rest of Carillon deals in.
+//! the supervisor publish what a dashboard watches in real time: each
+//! delivery outcome and each change in a watch's connection status. The
+//! `/events` SSE endpoint subscribes and forwards them. Purely
+//! observational; carries no message content, only content-free signal.
 
 use serde::Serialize;
 use tokio::sync::broadcast;
@@ -21,15 +20,15 @@ pub type LiveBus = broadcast::Sender<Routed>;
 /// status changes are small and infrequent per box, so this is ample.
 pub const CAPACITY: usize = 1024;
 
-/// A live event tagged with the billing **account** it belongs to, so the
-/// `/events` SSE stream can scope each subscriber to its own account
-/// (§ DECISIONS 5). The routing tag is server-side only — the wire
-/// payload a client receives is just the inner [`LiveEvent`], unchanged.
+/// A live event tagged with the billing account it belongs to, so the
+/// `/events` SSE stream can scope each subscriber to its own account (§
+/// DECISIONS 5). The routing tag is server-side only; the wire payload a
+/// client receives is just the inner [`LiveEvent`].
 #[derive(Clone, Debug)]
 pub struct Routed {
     /// The billing account this event concerns; the SSE handler forwards
-    /// an event to a subscriber only when it matches (or the subscriber is
-    /// the unscoped admin).
+    /// it to a subscriber only when it matches (or the subscriber is the
+    /// unscoped admin).
     pub account_id: String,
     /// The event to serialize and deliver.
     pub event: LiveEvent,
@@ -75,10 +74,10 @@ pub enum LiveEvent {
     },
 }
 
-/// A billing notice (§ BILLING_MODEL: the guardrail against silent coverage
-/// gaps). Delivered on the SSE bus and, so a no-dashboard user is not silently
-/// cut off, also as a signed webhook (per-watch notices) — email delivery of
-/// account-level notices lands in a later stage.
+/// A billing notice (§ BILLING_MODEL: the guardrail against silent
+/// coverage gaps). Delivered on the SSE bus and, so a no-dashboard user
+/// is not silently cut off, also as a signed webhook (per-watch
+/// notices).
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoticeKind {

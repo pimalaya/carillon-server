@@ -1,10 +1,9 @@
 //! # Store
 //!
-//! The source of truth for watches and the delivery log, a local
-//! sqlite database behind a mutex. Passwords are stored encrypted (see
-//! [`crate::crypto`]); everything else is plain. Blocking rusqlite
-//! calls are cheap and infrequent here (boot-time loads, one small row
-//! per delivery); the hot delivery path wraps them in
+//! The source of truth for watches and the delivery log, a local sqlite
+//! database behind a mutex. Passwords are stored encrypted (see
+//! [`crate::crypto`]); everything else is plain. Blocking rusqlite calls
+//! are cheap and infrequent here; the hot delivery path wraps them in
 //! `spawn_blocking`.
 
 use std::{path::Path, sync::Mutex, time::Duration};
@@ -237,25 +236,25 @@ pub struct Watch {
     /// signed with.
     pub hmac_secret_prev_expires: Option<i64>,
     /// The billing account this watch draws watch-time from. Defaults to
-    /// the watch id (one watch, one account) until grouped under a shared
-    /// account (M7).
+    /// the watch id (one watch, one account) until grouped (M7).
     pub account_id: String,
-    /// The provider domain this service is grouped + trial-gated under (the
-    /// registrable domain of the server host, e.g. `fastmail.com`). Stamped at
-    /// create; empty on rows predating the column.
+    /// The provider domain this service is grouped + trial-gated under
+    /// (the registrable domain of the server host). Empty on rows
+    /// predating the column.
     pub provider: String,
     /// `password` (uses `enc_password`) or `oauth` (authenticates via the
     /// `oauth_credential` for this watch's `(account_id, mailbox_key)`).
     pub auth_kind: String,
-    /// Paid-through time (§ BILLING_MODEL): the service runs, when metered, only
-    /// while this is in the future. `None` = never activated.
+    /// Paid-through time (§ BILLING_MODEL): the service runs, when
+    /// metered, only while this is in the future. `None` never activated.
     pub watching_until: Option<i64>,
     /// Whether the next credit is drawn from the pool at expiry.
     pub auto_renew: bool,
-    /// Whether the watch is enabled (the user's pause toggle, independent of
-    /// billing).
+    /// Whether the watch is enabled (the user's pause toggle, independent
+    /// of billing).
     pub active: bool,
-    /// Source protocol: `imap` (held IDLE) or `carddav` (polled addressbook).
+    /// Source protocol: `imap` (held IDLE) or `carddav` (polled
+    /// addressbook).
     pub source_kind: String,
     /// CardDAV collection URL the poller connects to (`None` for IMAP).
     pub carddav_url: Option<String>,
@@ -291,10 +290,9 @@ impl Watch {
         })
     }
 
-    /// The secrets a delivery should be signed with right now: always
-    /// the current one, plus the previous one while its overlap window
-    /// is open. Returning both lets a receiver mid-rotation validate
-    /// against either.
+    /// The secrets a delivery should be signed with right now: the
+    /// current one, plus the previous one while its overlap window is
+    /// open, so a receiver mid-rotation validates against either.
     pub fn signing_secrets(&self, now: i64) -> Vec<&str> {
         let mut secrets = vec![self.hmac_secret.as_str()];
         if let (Some(prev), Some(expires)) = (&self.hmac_secret_prev, self.hmac_secret_prev_expires)
@@ -360,13 +358,14 @@ pub struct DeliveryOutcome<'a> {
     pub attempts: u32,
 }
 
-/// A Carillon account: the magic-link email identity and the prepaid credit
-/// pool every PIM account draws its watch-months from.
+/// A Carillon account: the magic-link email identity and the prepaid
+/// credit pool every PIM account draws its watch-months from.
 #[derive(Clone, Debug)]
 pub struct AccountRow {
     /// Account id.
     pub id: String,
-    /// Magic-link email identity. `None` for a self-host / import account.
+    /// Magic-link email identity. `None` for a self-host / import
+    /// account.
     pub email: Option<String>,
     /// Fungible credit-pool balance (one credit = one PIM-account-month).
     pub credits: i64,
@@ -382,9 +381,10 @@ impl AccountRow {
     }
 }
 
-/// A PIM account (§ SERVICE_MODEL): a proven `(identity, protocol, server)`
-/// connection. Ownership/credential unit; services (watches) under it are the
-/// billed unit. The credential is identity-keyed and shared across protocols.
+/// A PIM account (§ SERVICE_MODEL): a proven `(identity, protocol,
+/// server)` connection. The ownership/credential unit; services under it
+/// are the billed unit. The credential is identity-keyed and shared
+/// across protocols.
 #[derive(Clone, Debug)]
 pub struct MembershipRow {
     /// Normalised mailbox key (the identity).
@@ -397,7 +397,8 @@ pub struct MembershipRow {
     pub imap_host: String,
     /// Server port (993 for IMAP; 443 for CardDAV).
     pub imap_port: u16,
-    /// CardDAV context-root URL used to list addressbooks (`None` for IMAP).
+    /// CardDAV context-root URL used to list addressbooks (`None` for
+    /// IMAP).
     pub base_url: Option<String>,
 }
 
@@ -436,9 +437,10 @@ pub struct OauthSession {
     pub scope: Option<String>,
     /// The capability-link account to join, if the flow carried one.
     pub account_id: Option<String>,
-    /// Mailbox context, so the callback can build the credential + watch. For a
-    /// CardDAV login, `imap_host` is the DAV host (keying the mailbox) and
-    /// `mailbox` is unused; `carddav_url` carries the collection context root.
+    /// Mailbox context, so the callback can build the credential + watch.
+    /// For a CardDAV login, `imap_host` is the DAV host (keying the
+    /// mailbox), `mailbox` is unused, and `carddav_url` carries the
+    /// collection context root.
     pub login: String,
     pub imap_host: String,
     pub imap_port: u16,
@@ -469,8 +471,8 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens (or creates) the database at `path` and ensures the
-    /// schema exists.
+    /// Opens (or creates) the database at `path` and ensures the schema
+    /// exists.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -494,12 +496,13 @@ impl Store {
     }
 
     /// Inserts or replaces a watch. Rotation state is left to
-    /// [`Store::rotate_secret`]; an upsert resets it (a redefine of the
-    /// watch drops any in-flight overlap).
+    /// [`Store::rotate_secret`]; an upsert resets it, dropping any
+    /// in-flight overlap.
     pub fn upsert_watch(&self, watch: &Watch) -> Result<()> {
-        // `carddav_sync_token` is deliberately not written here: it is runtime
-        // checkpoint state (like `watching_until`), preserved across an
-        // edit-in-place and set only by `set_carddav_sync_token`.
+        // NOTE: `carddav_sync_token` is deliberately not written here; it
+        // is runtime checkpoint state (like `watching_until`), preserved
+        // across an edit-in-place and set only by
+        // `set_carddav_sync_token`.
         self.lock().execute(
             "INSERT INTO watch
                (id, imap_host, imap_port, login, enc_password, mailbox, notify_url,
@@ -558,8 +561,9 @@ impl Store {
         Ok((n > 0).then_some(expires))
     }
 
-    /// Returns every active watch, in **declaration order** (`rowid` =
-    /// insertion order) — the order the renewal sweep debits the shared pool in.
+    /// Returns every active watch, in declaration order (`rowid` =
+    /// insertion order): the order the renewal sweep debits the shared
+    /// pool in.
     pub fn active_watches(&self) -> Result<Vec<Watch>> {
         let conn = self.lock();
         let mut stmt = conn.prepare("SELECT * FROM watch WHERE active = 1 ORDER BY rowid")?;
@@ -592,9 +596,9 @@ impl Store {
         Ok(watch)
     }
 
-    /// The billing account a watch belongs to, if the watch exists. Cheap
-    /// authorization check for the scoped watch routes (no decrypt, no full
-    /// row): `None` means no such watch.
+    /// The billing account a watch belongs to, if the watch exists. A
+    /// cheap authorization check for the scoped watch routes; `None`
+    /// means no such watch.
     pub fn watch_account(&self, id: &str) -> Result<Option<String>> {
         let conn = self.lock();
         let account = conn
@@ -643,11 +647,11 @@ impl Store {
     }
 
     /// The most recent deliveries across every watch owned by a billing
-    /// account, newest first — the scoped counterpart of
+    /// account, newest first: the scoped counterpart of
     /// [`Store::recent_deliveries`]. Joins on the watch so a capability
-    /// link only ever sees its own account's log. (A delivery whose watch
-    /// was since deleted drops out of the join; that is acceptable — the
-    /// live log is a recent-activity view, not an audit trail.)
+    /// link only ever sees its own account's log. A delivery whose watch
+    /// was since deleted drops out of the join; the live log is a
+    /// recent-activity view, not an audit trail.
     pub fn recent_deliveries_by_owner(
         &self,
         account_id: &str,
@@ -688,12 +692,11 @@ impl Store {
         Ok(rows)
     }
 
-    // --- Carillon accounts & the credit pool ---
-
-    /// Creates the account row if it does not exist yet (with an empty pool).
-    /// The free credit is granted separately by [`Store::grant_free_credit`], on
-    /// the first validated PIM account — not here, so a magic-link signup with no
-    /// mailbox cannot claim it. Returns whether the account was newly created.
+    /// Creates the account row if it does not exist yet (with an empty
+    /// pool). The free credit is granted separately by
+    /// [`Store::grant_free_credit`] on the first validated PIM account,
+    /// so a magic-link signup with no mailbox cannot claim it. Returns
+    /// whether the account was newly created.
     pub fn ensure_account(&self, id: &str, email: Option<&str>) -> Result<bool> {
         let created = self.lock().execute(
             "INSERT OR IGNORE INTO account (id, email) VALUES (?1, ?2)",
@@ -702,11 +705,11 @@ impl Store {
         Ok(created > 0)
     }
 
-    /// Grants the one free credit (§ BILLING_MODEL) to an account exactly once,
-    /// on its first validated PIM account. Idempotent (guarded by
-    /// `free_credited`); returns whether the grant fired this call. Used by the
-    /// self-host / admin-import paths, which have no sybil concern; the SaaS
-    /// `/auth` + OAuth paths use [`Store::claim_free_credit`] instead.
+    /// Grants the one free credit (§ BILLING_MODEL) to an account exactly
+    /// once, on its first validated PIM account. Idempotent (guarded by
+    /// `free_credited`). Used by the self-host / admin-import paths, which
+    /// have no sybil concern; the SaaS paths use
+    /// [`Store::claim_free_trial`] instead.
     pub fn grant_free_credit(&self, account_id: &str, amount: i64) -> Result<bool> {
         let n = self.lock().execute(
             "UPDATE account SET credits = credits + ?2, free_credited = 1
@@ -716,15 +719,12 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Claims the one-time welcome **trial** for a `(Carillon account, provider
-    /// domain)` (§ SERVICE_MODEL v3). The account's FIRST service on a provider
-    /// (its `metering::provider_domain`, e.g. `fastmail.com` for both its IMAP
-    /// and CardDAV hosts) earns a free head start of watch-time on that service;
-    /// the caller sets the new watch's `watching_until` when this returns `true`.
-    /// Recorded per account+provider (the `free_credit_claim` ledger, reused with
-    /// a composite key), so a second service on the same provider — or a
-    /// delete+recreate — does not renew it. The trial is time-on-the-service, not
-    /// a fungible credit, so per-account (not global) gating is safe. Atomic.
+    /// Claims the one-time welcome trial for a `(Carillon account,
+    /// provider domain)` (§ SERVICE_MODEL v3). The account's first
+    /// service on a provider earns a free head start of watch-time; the
+    /// caller sets the new watch's `watching_until` when this returns
+    /// `true`. Recorded per account+provider, so a second service on the
+    /// same provider (or a delete+recreate) does not renew it. Atomic.
     pub fn claim_free_trial(&self, account_id: &str, provider_domain: &str) -> Result<bool> {
         let key = format!("{account_id}|{provider_domain}");
         let mut conn = self.lock();
@@ -784,8 +784,8 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The `(login, imap_host)` of every watch owned by an account — cheap
-    /// input to the fair-use cap, which normalises them into mailbox keys.
+    /// The `(login, imap_host)` of every watch owned by an account, input
+    /// to the fair-use cap which normalises them into mailbox keys.
     pub fn account_watch_identities(&self, account_id: &str) -> Result<Vec<(String, String)>> {
         let conn = self.lock();
         let mut stmt = conn.prepare("SELECT login, imap_host FROM watch WHERE account_id = ?1")?;
@@ -793,8 +793,8 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Adds `n` credits to an account's pool (a fulfilled purchase). Ensures the
-    /// account exists first.
+    /// Adds `n` credits to an account's pool (a fulfilled purchase),
+    /// ensuring the account exists first.
     pub fn add_credits(&self, account_id: &str, n: i64) -> Result<()> {
         let conn = self.lock();
         conn.execute(
@@ -808,8 +808,8 @@ impl Store {
         Ok(())
     }
 
-    /// Spends one credit from an account's pool, atomically (only when the
-    /// balance is positive). Returns whether a credit was drawn.
+    /// Spends one credit from an account's pool, atomically and only when
+    /// the balance is positive. Returns whether a credit was drawn.
     pub fn debit_credit(&self, account_id: &str) -> Result<bool> {
         let n = self.lock().execute(
             "UPDATE account SET credits = credits - 1 WHERE id = ?1 AND credits > 0",
@@ -818,9 +818,9 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Spends `n` credits at once, atomically and all-or-nothing (only when the
-    /// balance covers them). Returns whether the debit happened. `n <= 0` is a
-    /// no-op that fails.
+    /// Spends `n` credits at once, atomically and all-or-nothing, only
+    /// when the balance covers them. Returns whether the debit happened;
+    /// `n <= 0` is a no-op that fails.
     pub fn debit_credits(&self, account_id: &str, n: i64) -> Result<bool> {
         if n <= 0 {
             return Ok(false);
@@ -832,8 +832,6 @@ impl Store {
         Ok(rows > 0)
     }
 
-    // --- Magic-link sign-in ---
-
     /// Stores a pending magic-link token (by hash) for an email address.
     pub fn create_magic_link(&self, token: &str, email: &str) -> Result<()> {
         self.lock().execute(
@@ -844,8 +842,9 @@ impl Store {
         Ok(())
     }
 
-    /// Consumes a magic-link token (single-use), returning the email it proves,
-    /// and prunes tokens older than `max_age_secs`. `None` if unknown/expired.
+    /// Consumes a magic-link token (single-use), returning the email it
+    /// proves, and prunes tokens older than `max_age_secs`. `None` if
+    /// unknown or expired.
     pub fn take_magic_link(&self, token: &str, max_age_secs: i64) -> Result<Option<String>> {
         let conn = self.lock();
         conn.execute(
@@ -866,10 +865,8 @@ impl Store {
         Ok(email)
     }
 
-    // --- Services (watch activation) ---
-
-    /// Sets a service's (watch's) paid-through time (activation / renewal).
-    /// Returns whether the watch matched.
+    /// Sets a service's (watch's) paid-through time (activation /
+    /// renewal). Returns whether the watch matched.
     pub fn set_watch_watching_until(&self, watch_id: &str, until: i64) -> Result<bool> {
         let n = self.lock().execute(
             "UPDATE watch SET watching_until = ?2 WHERE id = ?1",
@@ -879,7 +876,7 @@ impl Store {
     }
 
     /// Checkpoints a CardDAV service's RFC 6578 sync-token after a poll
-    /// (`None` resets it, forcing a fresh baseline on the next poll). Returns
+    /// (`None` resets it, forcing a fresh baseline next poll). Returns
     /// whether the watch matched.
     pub fn set_carddav_sync_token(&self, watch_id: &str, token: Option<&str>) -> Result<bool> {
         let n = self.lock().execute(
@@ -889,8 +886,8 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Turns auto-renew on or off for a service (watch). Returns whether the
-    /// watch matched.
+    /// Turns auto-renew on or off for a service (watch). Returns whether
+    /// the watch matched.
     pub fn set_watch_auto_renew(&self, watch_id: &str, on: bool) -> Result<bool> {
         let n = self.lock().execute(
             "UPDATE watch SET auto_renew = ?2 WHERE id = ?1",
@@ -898,8 +895,6 @@ impl Store {
         )?;
         Ok(n > 0)
     }
-
-    // --- Capability links, membership & checkout (M7) ---
 
     /// Stores a capability link (by hash) for an account.
     pub fn issue_capability(
@@ -945,9 +940,9 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Records that an account controls a `(mailbox_key, protocol)` endpoint (a
-    /// PIM account). Re-auth updates the server info (host/port/base_url) in
-    /// place; `added_at` (declaration order) is preserved.
+    /// Records that an account controls a `(mailbox_key, protocol)`
+    /// endpoint (a PIM account). Re-auth updates the server info in place;
+    /// `added_at` (declaration order) is preserved.
     #[allow(clippy::too_many_arguments)]
     pub fn add_membership(
         &self,
@@ -994,10 +989,9 @@ impl Store {
         Ok(account)
     }
 
-    /// Whether an account has proven control of a `(mailbox_key, protocol)`
-    /// endpoint. The create-watch gate: a scoped caller may only watch a PIM
-    /// account it authenticated (which recorded the membership) — you cannot
-    /// watch what you cannot log into.
+    /// Whether an account has proven control of a `(mailbox_key,
+    /// protocol)` endpoint. The create-watch gate: a scoped caller may
+    /// only watch a PIM account it authenticated.
     pub fn mailbox_belongs(
         &self,
         account_id: &str,
@@ -1027,11 +1021,11 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Forgets a PIM account: removes the `(mailbox_key, protocol)` membership
-    /// and every service (watch) under it, then drops the **shared** credential
-    /// only when no other membership of the same identity remains (another
-    /// protocol may still be using it). Returns the ids of the deleted watches
-    /// (so the supervisor can be reconciled). All in one transaction.
+    /// Forgets a PIM account: removes the `(mailbox_key, protocol)`
+    /// membership and every service under it, then drops the shared
+    /// credential only when no other membership of the same identity
+    /// remains. Returns the ids of the deleted watches. All in one
+    /// transaction.
     pub fn forget_account(
         &self,
         account_id: &str,
@@ -1041,8 +1035,8 @@ impl Store {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
 
-        // Services under this PIM account: same account + protocol, whose
-        // (login, host) normalises to this mailbox_key.
+        // NOTE: services under this PIM account are same account +
+        // protocol whose (login, host) normalises to this mailbox_key.
         let watch_ids: Vec<(String, String, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT id, login, imap_host FROM watch
@@ -1068,8 +1062,8 @@ impl Store {
             params![account_id, mailbox_key, protocol],
         )?;
 
-        // Shared credential: drop it only if no protocol of this identity
-        // remains under the account.
+        // NOTE: drop the shared credential only if no protocol of this
+        // identity remains under the account.
         let remaining: i64 = tx.query_row(
             "SELECT COUNT(*) FROM account_mailbox WHERE account_id = ?1 AND mailbox_key = ?2",
             params![account_id, mailbox_key],
@@ -1101,9 +1095,9 @@ impl Store {
         Ok(())
     }
 
-    /// Fulfils a session exactly once, returning `(account_id, quantity)`.
-    /// `None` if the session is unknown or already fulfilled (idempotency
-    /// against retried payment webhooks).
+    /// Fulfils a session exactly once, returning `(account_id,
+    /// quantity)`. `None` if the session is unknown or already fulfilled
+    /// (idempotency against retried payment webhooks).
     pub fn fulfill_session(&self, session_id: &str) -> Result<Option<(String, i64)>> {
         let conn = self.lock();
         let row: Option<(String, i64)> = conn
@@ -1123,8 +1117,6 @@ impl Store {
         }
         Ok(row)
     }
-
-    // --- OAuth flows & credentials (M10) ---
 
     /// Stores a pending OAuth flow, keyed by its CSRF state.
     pub fn create_oauth_session(&self, session: &OauthSession) -> Result<()> {
@@ -1156,8 +1148,9 @@ impl Store {
         Ok(())
     }
 
-    /// Consumes a pending OAuth flow by its state (single-use), also pruning
-    /// any sessions older than `max_age_secs`. `None` if the state is unknown.
+    /// Consumes a pending OAuth flow by its state (single-use), also
+    /// pruning any sessions older than `max_age_secs`. `None` if the
+    /// state is unknown.
     pub fn take_oauth_session(
         &self,
         state: &str,
@@ -1255,8 +1248,8 @@ impl Store {
         Ok(cred)
     }
 
-    /// Updates the stored refresh token for a mailbox (the provider rotated
-    /// it on a refresh).
+    /// Updates the stored refresh token for a mailbox (the provider
+    /// rotated it on a refresh).
     pub fn update_oauth_refresh_token(
         &self,
         account_id: &str,
@@ -1272,10 +1265,9 @@ impl Store {
         Ok(())
     }
 
-    // --- Password credentials (per PIM account) ---
-
-    /// Stores (or replaces) the password credential for a PIM account. Called at
-    /// 'Add account' (auth); a re-auth updates it for every service under it.
+    /// Stores (or replaces) the password credential for a PIM account.
+    /// Called at 'Add account' (auth); a re-auth updates it for every
+    /// service under it.
     pub fn upsert_password_credential(
         &self,
         account_id: &str,
@@ -1310,7 +1302,7 @@ impl Store {
     }
 }
 
-/// SHA-256 hex of a capability token — what we persist, so a DB leak
+/// SHA-256 hex of a capability token, what is persisted, so a DB leak
 /// never yields a usable link.
 fn token_hash(token: &str) -> String {
     let mut hasher = Sha256::new();
@@ -1322,10 +1314,10 @@ fn token_hash(token: &str) -> String {
 /// database. `CREATE TABLE IF NOT EXISTS` never alters an existing
 /// table, so older stores need their new columns backfilled here.
 fn migrate(conn: &Connection) -> Result<()> {
-    // account_mailbox gained a protocol axis (§ SERVICE_MODEL): its primary key
-    // is now (account_id, mailbox_key, protocol). SQLite cannot ALTER a primary
-    // key, so rebuild the table when the `protocol` column is absent (an old
-    // store), backfilling every existing membership as an IMAP one.
+    // NOTE: account_mailbox gained a protocol axis; its primary key is
+    // now (account_id, mailbox_key, protocol). SQLite cannot ALTER a
+    // primary key, so rebuild the table when the `protocol` column is
+    // absent, backfilling every membership as an IMAP one.
     if !column_exists(conn, "account_mailbox", "protocol")? {
         conn.execute_batch(
             "CREATE TABLE account_mailbox_new (
@@ -1355,22 +1347,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("watch", "provider", "TEXT NOT NULL DEFAULT ''"),
         ("watch", "last_metered", "INTEGER"),
         ("watch", "auth_kind", "TEXT NOT NULL DEFAULT 'password'"),
-        // Credit-pool accounts (§ BILLING_MODEL). Any older subscription / trial
-        // columns from an intermediate build are simply left inert.
+        // NOTE: credit-pool accounts; older subscription / trial columns
+        // from an intermediate build are left inert.
         ("account", "email", "TEXT"),
         ("account", "credits", "INTEGER NOT NULL DEFAULT 0"),
         ("account", "free_credited", "INTEGER NOT NULL DEFAULT 0"),
-        // Per-service activation state lives on the watch (the billed unit).
+        // NOTE: per-service activation state lives on the watch (the
+        // billed unit).
         ("watch", "watching_until", "INTEGER"),
         ("watch", "auto_renew", "INTEGER NOT NULL DEFAULT 0"),
         ("checkout_session", "quantity", "INTEGER NOT NULL DEFAULT 0"),
-        // CardDAV source support: a second service kind alongside IMAP.
+        // NOTE: CardDAV source support, a second service kind alongside
+        // IMAP.
         ("watch", "source_kind", "TEXT NOT NULL DEFAULT 'imap'"),
         ("watch", "carddav_url", "TEXT"),
         ("watch", "carddav_sync_token", "TEXT"),
         ("watch", "carddav_poll_secs", "INTEGER"),
-        // CardDAV OAuth logins carry their protocol + collection through the
-        // pending-flow row.
+        // NOTE: CardDAV OAuth logins carry their protocol + collection
+        // through the pending-flow row.
         (
             "oauth_session",
             "source_kind",
@@ -1385,8 +1379,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             )?;
         }
     }
-    // Backfill the billing account for pre-metering rows: one watch, one
-    // account, sharing the id.
+    // NOTE: backfill the billing account for pre-metering rows: one
+    // watch, one account, sharing the id.
     conn.execute("UPDATE watch SET account_id = id WHERE account_id = ''", [])?;
     Ok(())
 }

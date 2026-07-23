@@ -1,10 +1,9 @@
 //! Password encryption at rest.
 //!
-//! Carillon holds credentials in order to *watch*; those must never
-//! sit in the database as plaintext. We encrypt each password to a
-//! per-box age (x25519) identity kept in a `0600` key file. Production
-//! would move that key into a KMS; the interface here does not change
-//! when it does.
+//! Carillon holds credentials in order to watch; they must never sit in
+//! the database as plaintext. Each password is encrypted to a per-box
+//! age (x25519) identity kept in a `0600` key file. Production would
+//! move that key into a KMS without changing this interface.
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, str::FromStr};
 
@@ -13,7 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use secrecy::ExposeSecret;
 
-/// Symmetric (self-recipient) encryptor backed by a persisted age
+/// Symmetric self-recipient encryptor backed by a persisted age
 /// identity.
 pub struct Crypto {
     identity: Identity,
@@ -22,7 +21,7 @@ pub struct Crypto {
 
 impl Crypto {
     /// Loads the age identity at `path`, generating and persisting a
-    /// fresh one (mode `0600`) if the file does not exist yet.
+    /// fresh one (mode `0600`) if it does not exist.
     pub fn load_or_create(path: &Path) -> Result<Self> {
         let identity = if path.exists() {
             let text = fs::read_to_string(path)
@@ -50,8 +49,7 @@ impl Crypto {
         })
     }
 
-    /// Encrypts a password, returning a base64 blob suitable for the
-    /// database.
+    /// Encrypts a password into a base64 blob for the database.
     pub fn encrypt(&self, plaintext: &str) -> Result<String> {
         let bytes = age::encrypt(&self.recipient, plaintext.as_bytes())
             .context("Cannot encrypt password")?;

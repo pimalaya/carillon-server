@@ -1,20 +1,18 @@
 //! Onboarding discovery.
 //!
-//! Turns a "put anything" identifier — an email address, or a bare
-//! domain/server — into the **onboarding choices** a user picks from, using
-//! [`io_pim_discovery`] (the same engine Himalaya's wizard uses: provider
-//! rules, PACC, Mozilla autoconfig/ISPDB, RFC 6186 SRV). Only **IMAP** is
-//! requested for now; SMTP/JMAP/DAV come later.
+//! Turns a "put anything" identifier (an email address or a bare
+//! domain/server) into the onboarding choices a user picks from, using
+//! [`io_pim_discovery`] (provider rules, PACC, Mozilla autoconfig/ISPDB,
+//! RFC 6186 SRV).
 //!
-//! A *choice* is one **server endpoint + one way to authenticate** — the
-//! discovery mechanism that surfaced it is irrelevant to the user, so results
-//! are grouped by `(host, port, security)` with their auth methods unioned,
-//! then split into one choice per auth category (password / OAuth / token).
-//! So Fastmail yields exactly one Password choice and one OAuth choice, each
-//! scoping which credential form the wizard then shows. Everything is a hint
-//! the user confirms; an unresolvable input yields an empty list (manual
-//! entry). The blocking std client runs its own network I/O over a thread
-//! pool, so callers wrap [`discover_imap`] in `spawn_blocking`.
+//! A choice is one server endpoint plus one way to authenticate; the
+//! discovery mechanism that surfaced it is irrelevant to the user, so
+//! results are grouped by `(host, port, security)` with auth methods
+//! unioned, then split into one choice per auth category (password /
+//! OAuth / token). Everything is a hint the user confirms; an
+//! unresolvable input yields an empty list. The blocking std client runs
+//! its own network I/O, so callers wrap [`discover_imap`] in
+//! `spawn_blocking`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,10 +29,10 @@ use url::Url;
 /// Fallback DNS resolver when the system one cannot be read.
 const DEFAULT_RESOLVER: &str = "tcp://1.1.1.1:53";
 
-/// One onboarding choice: an IMAP endpoint plus a single way to authenticate
-/// to it. The wizard renders one card per choice and, on selection, shows the
-/// matching credential form (password, API token, or OAuth). Every field is a
-/// hint the user confirms or overrides.
+/// One onboarding choice: an IMAP endpoint plus a single way to
+/// authenticate to it. The wizard renders one card per choice, showing
+/// the matching credential form on selection. Every field is a hint the
+/// user confirms or overrides.
 #[derive(Debug, Serialize)]
 pub struct ImapChoice {
     /// IMAP server host.
@@ -47,9 +45,8 @@ pub struct ImapChoice {
     pub auth: AuthMethodView,
 }
 
-/// A discovered authentication method, tagged for the client. OAuth variants
-/// carry the endpoints where known; they are surfaced now but only wired into
-/// an actual OAuth login later.
+/// A discovered authentication method, tagged for the client. OAuth
+/// variants carry the endpoints where known.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuthMethodView {
@@ -74,9 +71,9 @@ pub enum AuthMethodView {
     OauthIssuer { issuer: String },
 }
 
-/// The three auth *forms* a choice maps to. Discovery may advertise several
-/// concrete methods per category (e.g. two OAuth grants); the user picks a
-/// category, and we keep the best concrete method for it.
+/// The three auth forms a choice maps to. Discovery may advertise
+/// several concrete methods per category; the user picks a category, and
+/// the best concrete method for it is kept.
 #[derive(Clone, Copy, PartialEq)]
 enum AuthCategory {
     Password,
@@ -84,23 +81,23 @@ enum AuthCategory {
     Token,
 }
 
-/// One CardDAV onboarding choice: a discovered addressbook **server** (RFC 6764
-/// context root) plus how to authenticate. Unlike IMAP there is no host/port —
-/// CardDAV is HTTP, so the endpoint is a URL the wizard confirms, then lists its
-/// addressbooks under.
+/// One CardDAV onboarding choice: a discovered addressbook server (RFC
+/// 6764 context root) plus how to authenticate. Unlike IMAP there is no
+/// host/port; CardDAV is HTTP, so the endpoint is a URL the wizard
+/// confirms.
 #[derive(Debug, Serialize)]
 pub struct CardDavChoice {
     /// CardDAV context-root URL (RFC 6764), e.g. `https://carddav.host/`.
     pub url: String,
-    /// How to authenticate (password is the DAV default; a provider that
-    /// advertises OAuth on the endpoint surfaces it here).
+    /// How to authenticate (password is the DAV default; a provider
+    /// advertising OAuth on the endpoint surfaces it here).
     pub auth: AuthMethodView,
 }
 
-/// Discovers CardDAV onboarding choices for `input` — an email address or a
-/// bare domain/server — via RFC 6764 (`_carddavs._tcp` SRV + `.well-known`).
-/// Never fails loudly (empty list ⇒ manual entry). Blocking; call inside
-/// `spawn_blocking`.
+/// Discovers CardDAV onboarding choices for `input` (an email address or
+/// bare domain/server) via RFC 6764 (`_carddavs._tcp` SRV +
+/// `.well-known`). Never fails loudly (empty list means manual entry).
+/// Blocking; call inside `spawn_blocking`.
 pub fn discover_carddav(input: &str) -> Vec<CardDavChoice> {
     let input = input.trim();
     let email = if input.contains('@') {
@@ -118,12 +115,10 @@ pub fn discover_carddav(input: &str) -> Vec<CardDavChoice> {
         }
     };
 
-    // One or two choices per distinct context-root URL, mirroring the IMAP path:
-    // Password is always offered (Basic auth / app passwords work on essentially
-    // every CardDAV server, and it is the default), plus an OAuth choice when the
-    // endpoint advertises one. Emitting BOTH (not OAuth-preferred) is what lets a
-    // Fastmail user pick their app password. (NB: OAuth-over-CardDAV is surfaced
-    // here but not yet wired end-to-end — the wizard offers the password path.)
+    // NOTE: one or two choices per distinct context-root URL. Password
+    // is always offered (the DAV default, near-universal); an OAuth
+    // choice is added when advertised. Emitting both (not
+    // OAuth-preferred) lets a Fastmail user pick their app password.
     let mut seen = BTreeSet::new();
     let mut choices = Vec::new();
     for config in configs {
@@ -150,13 +145,12 @@ pub fn discover_carddav(input: &str) -> Vec<CardDavChoice> {
     choices
 }
 
-/// Discovers IMAP onboarding choices for `input` — an email address, or a bare
-/// domain/server. Never fails loudly: an unresolvable input yields an empty
-/// list and the wizard falls back to manual entry. Blocking; call inside
-/// `spawn_blocking`.
+/// Discovers IMAP onboarding choices for `input` (an email address or
+/// bare domain/server). Never fails loudly: an unresolvable input yields
+/// an empty list. Blocking; call inside `spawn_blocking`.
 pub fn discover_imap(input: &str) -> Vec<ImapChoice> {
-    // `compose_all` wants a `local@domain`; for a bare domain/server we
-    // synthesize a local part so discovery still runs against the domain.
+    // NOTE: `compose_all` wants a `local@domain`; for a bare
+    // domain/server synthesize a local part so discovery still runs.
     let input = input.trim();
     let email = if input.contains('@') {
         input.to_string()
@@ -173,9 +167,9 @@ pub fn discover_imap(input: &str) -> Vec<ImapChoice> {
         }
     };
 
-    // Group by endpoint, unioning the auth methods every mechanism advertised
-    // for it — the mechanism itself (PACC vs autoconfig vs SRV) is irrelevant
-    // to the user. BTreeMap keeps the output deterministic (by host, port).
+    // NOTE: group by endpoint, unioning the auth methods every mechanism
+    // advertised (the mechanism itself is irrelevant to the user).
+    // BTreeMap keeps the output deterministic.
     let mut endpoints: BTreeMap<(String, u16, &'static str), Vec<DiscoveryAuthMethod>> =
         BTreeMap::new();
     for config in configs {
@@ -196,9 +190,9 @@ pub fn discover_imap(input: &str) -> Vec<ImapChoice> {
             .extend(config.auth);
     }
 
-    // One choice per (endpoint, auth category), ordered password → OAuth →
-    // token. A server discovered with *no* auth at all (some autoconfig
-    // entries) still offers Password, the near-universal default.
+    // NOTE: one choice per (endpoint, auth category), ordered password →
+    // OAuth → token. A server discovered with no auth at all still
+    // offers Password, the near-universal default.
     let mut choices = Vec::new();
     for ((host, port, security), methods) in endpoints {
         let has = |category| methods.iter().any(|method| categorize(method) == category);
@@ -242,9 +236,10 @@ fn categorize(method: &DiscoveryAuthMethod) -> AuthCategory {
     }
 }
 
-/// Picks the single best OAuth method for an endpoint: an authorization-code
-/// grant with a mail-oriented scope, else any authorization-code grant, else
-/// a device grant, else a bare issuer. `None` if the endpoint has no OAuth.
+/// Picks the single best OAuth method for an endpoint: an
+/// authorization-code grant with a mail-oriented scope, else any
+/// authorization-code grant, else a device grant, else a bare issuer.
+/// `None` if the endpoint has no OAuth.
 fn best_oauth(methods: &[DiscoveryAuthMethod]) -> Option<&DiscoveryAuthMethod> {
     let is_auth_code = |method: &&DiscoveryAuthMethod| {
         matches!(
@@ -281,8 +276,8 @@ fn best_oauth(methods: &[DiscoveryAuthMethod]) -> Option<&DiscoveryAuthMethod> {
         })
 }
 
-/// The DNS resolver to discover with: the system one, else a public fallback.
-/// Shared with the OAuth module (RFC 8414 metadata fetches).
+/// The DNS resolver to discover with: the system one, else a public
+/// fallback. Shared with the OAuth module.
 pub(crate) fn resolver() -> Url {
     system_resolver().unwrap_or_else(|| {
         DEFAULT_RESOLVER
