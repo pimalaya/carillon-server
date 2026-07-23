@@ -58,7 +58,7 @@ const CAPABILITY_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 /// This server's OpenAPI contract, embedded so it is always served in
 /// sync with the binary.
-const OPENAPI_YAML: &str = include_str!("../docs/openapi.yaml");
+const OPENAPI_YAML: &str = include_str!("../openapi.yaml");
 
 /// Shared handler state.
 #[derive(Clone)]

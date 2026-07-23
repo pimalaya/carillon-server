@@ -34,7 +34,7 @@
         carillon-backend = inputs.self.packages.${final.stdenv.hostPlatform.system}.default;
       };
 
-      # Local dev/test targets (see docs/NIXOS.md "Testing locally"). Both run
+      # Local dev/test targets (see cairn/spec/nixos.md "Testing locally"). Both run
       # the module in DEV mode — no secrets, no disko, no proxy:
       #   container: sudo nixos-container create carillon --flake .#container
       #   vm:        nixos-rebuild build-vm --flake .#vm

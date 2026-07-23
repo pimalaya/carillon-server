@@ -10,7 +10,7 @@
 #
 # It deliberately does NOT manage the reverse proxy or the host firewall: the
 # app binds loopback and something else (e.g. Caddy) terminates TLS in front.
-# See docs/PRODUCTION.md for the surrounding host setup.
+# See cairn/spec/production.md for the surrounding host setup.
 {
   config,
   lib,
@@ -117,7 +117,7 @@ in
       description = ''
         Apply sysctls for holding many idle sockets (file descriptors, ephemeral
         port range, TCP keepalive below typical NAT cutoffs). conntrack sizing
-        and the firewall stay a host concern — see docs/PRODUCTION.md.
+        and the firewall stay a host concern — see cairn/spec/production.md.
       '';
     };
 

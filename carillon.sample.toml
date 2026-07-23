@@ -72,11 +72,11 @@ listen = "127.0.0.1:3000"
 # returns a placeholder URL and the webhook credits the pool on trust) — fine for
 # local dev, and the marker for a NON-metered self-host (watches just run; no
 # credits). Configure [billing.stripe] to take real money and turn metering ON.
-# Billing is a PREPAID CREDIT POOL (§ docs/BILLING_MODEL.md): per SERVICE, one
+# Billing is a PREPAID CREDIT POOL (§ cairn/spec/billing.md): per SERVICE, one
 # credit = one service-month (€2). The only refill unit is a PACK of 5 credits
 # (€10) — checkout buys N packs. Hosted Checkout needs ONLY the secret key
 # server-side — no publishable key, no subscription. In production inject the
-# secrets via systemd LoadCredential, not this file (see docs/DEPLOY_HARDENING.md).
+# secrets via systemd LoadCredential, not this file (see cairn/spec/hardening.md).
 # Create ONE one-time Price in Stripe (the PACK price, e.g. €10); the price lives THERE.
 # [billing.stripe]
 # secret_key = "sk_test_…"          # sandbox key; sk_live_… in production
@@ -95,7 +95,7 @@ listen = "127.0.0.1:3000"
 # dev flow works with no provider). Configure [email.resend] to actually send.
 # Deliverability is existential (a spam-foldered magic link = no sign-in): send
 # from an authenticated sending SUBDOMAIN with SPF + DKIM + DMARC, tracking OFF
-# on the auth stream (see docs/EMAIL.md). Inject api_key via LoadCredential in
+# on the auth stream (see cairn/spec/email.md). Inject api_key via LoadCredential in
 # production.
 # [email.resend]
 # api_key = "re_…"

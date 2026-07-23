@@ -43,7 +43,7 @@ pub struct Config {
 /// Transactional email configuration. Unset (`[email]` absent) uses the
 /// keyless stub mailer for local/dev (it logs the magic-link URL).
 ///
-/// Deliverability guidance lives in `docs/EMAIL.md`.
+/// Deliverability guidance lives in `cairn/spec/email.md`.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct EmailConfig {
     /// `[email.resend]`, the Resend adapter. Absent uses the stub.
@@ -107,7 +107,7 @@ pub struct BillingConfig {
 
 /// Stripe configuration. `secret_key` and `webhook_secret` are secrets;
 /// inject them via systemd `LoadCredential` or a secrets manager in
-/// production (see `docs/DEPLOY_HARDENING.md`). `prices` maps a plan id
+/// production (see `cairn/spec/hardening.md`). `prices` maps a plan id
 /// to its Stripe Price id. Only the secret key is needed; hosted
 /// Checkout needs no server-side publishable key.
 #[derive(Clone, Debug, Deserialize)]

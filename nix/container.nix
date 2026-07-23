@@ -9,7 +9,7 @@
 #   sudo nixos-container update carillon --flake .#container   # after edits
 #   sudo nixos-container destroy carillon                      # host untouched
 #
-# See docs/NIXOS.md "Testing locally".
+# See cairn/spec/nixos.md "Testing locally".
 {
   boot.isContainer = true;
 

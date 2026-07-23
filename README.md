@@ -66,7 +66,7 @@ The configuration is infrastructure only: the sqlite store, the age key and a fe
 
 ## Usage
 
-Run `carillon-backend --help` for the two subcommands: `serve` runs the daemon, `import` bulk-loads watches into the store. The control API is described by the OpenAPI contract at [docs/openapi.yaml](./docs/openapi.yaml); the serving fronts, webhook payload and production runbook live in the [docs](./docs) folder.
+Run `carillon-backend --help` for the two subcommands: `serve` runs the daemon, `import` bulk-loads watches into the store. The control API is described by the OpenAPI contract at [openapi.yaml](./openapi.yaml); the design spec, serving fronts, webhook payload and production runbook live in the [cairn](./cairn) folder, which follows the [Cairn](https://github.com/pimalaya/cairn) convention (`spec/` current design, `changes/` proposals, `log/` history).
 
 ## License
 
