@@ -73,7 +73,7 @@ listen = "127.0.0.1:3000"
 # local dev, and the marker for a NON-metered self-host (watches just run; no
 # credits). Configure [billing.stripe] to take real money and turn metering ON.
 # Billing is a PREPAID CREDIT POOL (§ docs/BILLING_MODEL.md): per SERVICE, one
-# credit = one service-month (€2.5). The only refill unit is a PACK of 4 credits
+# credit = one service-month (€2). The only refill unit is a PACK of 5 credits
 # (€10) — checkout buys N packs. Hosted Checkout needs ONLY the secret key
 # server-side — no publishable key, no subscription. In production inject the
 # secrets via systemd LoadCredential, not this file (see docs/DEPLOY_HARDENING.md).
@@ -88,7 +88,7 @@ listen = "127.0.0.1:3000"
 # success_url = "https://app.carillon.example.org/?checkout=success"
 # cancel_url  = "https://app.carillon.example.org/?checkout=cancel"
 # [billing.stripe.prices]           # the `pack` key → ONE-TIME Stripe Price id
-# pack = "price_…"                  # the 4-credit pack price, e.g. €10
+# pack = "price_…"                  # the 5-credit pack price, e.g. €10
 
 # Transactional email — magic-link sign-in + billing notices. Unset (default) =
 # the keyless STUB mailer (it LOGS the magic-link URL instead of sending, so a

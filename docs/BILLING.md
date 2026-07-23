@@ -2,8 +2,8 @@
 
 > **Model superseded — see [`BILLING_MODEL.md`](BILLING_MODEL.md).** Carillon no
 > longer sells a recurring subscription with a 7-day trial. The current model is
-> a **prepaid credit pool**, billed **per service** (1 credit = 2.5 € = one
-> service-month), refilled **only in 4-credit packs** (€10), with magic-link
+> a **prepaid credit pool**, billed **per service** (1 credit = 2 € = one
+> service-month), refilled **only in 5-credit packs** (€10), with magic-link
 > accounts and one free credit. The Stripe *operational* steps below stay useful
 > once re-pointed at **one-shot `payment`-mode Checkout** with a one-time **pack**
 > Price (the `pack` key). The subscription description in this section is retained

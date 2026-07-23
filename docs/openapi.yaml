@@ -522,7 +522,7 @@ paths:
       summary: Buy credit packs in one payment
       security: [{ capabilityLink: [] }]
       description: |
-        The only refill unit is a pack of 4 credits (§ BILLING_MODEL); `packs`
+        The only refill unit is a pack of 5 credits (§ BILLING_MODEL); `packs`
         is the number of packs.
       requestBody:
         required: false

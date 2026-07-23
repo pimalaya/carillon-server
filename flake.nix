@@ -1,5 +1,5 @@
 {
-  description = "Carillon watch server prototype: holds IMAP IDLE and emits content-free webhooks, written in Rust";
+  description = "Carillon backend";
 
   inputs = {
     nixpkgs = {

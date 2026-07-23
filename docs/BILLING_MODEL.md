@@ -48,15 +48,15 @@ poll-vs-IDLE distinction is a cost-side detail, not a pricing one.
 
 ## 2. What you pay for — the service (per connection), not the account
 
-**2.5 € / service / month.** A service = one watched source = ~one held IMAP IDLE
+**2 € / service / month.** A service = one watched source = ~one held IMAP IDLE
 connection = our unit cost.
 
 Per-*service* pricing is **cost-aligned**, which is the decisive property: usage
 and cost move together, so there is **no abuse surface** (50 services = 50
 connections = 50 credits — self-metering; no fair-use policing, no "unlimited
 but capped"). It also lowers the entry price for the majority single-INBOX user
-(2.5 € vs a 3 €/account flat), converts the multi-provider target user better
-(3 services = 7.5 €, paid only for the mailboxes actually watched), and grows
+(2 € vs a 3 €/account flat), converts the multi-provider target user better
+(3 services = 6 €, paid only for the mailboxes actually watched), and grows
 revenue as a user adds mailboxes (expansion). Lower ARPU on single-service users is offset by
 conversion, ~99 % margin (break-even at a few dozen services), and the fact that
 the price is trivial to raise later. Per-*account* flat pricing was rejected: it
@@ -69,9 +69,9 @@ high **sanity cap** as an infra DoS guard, not a tier.
 
 ## 3. Credits & the pool
 
-- **1 credit = 2.5 € = one service-month.**
-- **Refill only in packs of 4** (`PACK_SIZE = 4`, one €10 pack). A single-service
-  user buys a €10 pack ≈ every 4 months (effective 2.5 €/mo); the pack amortizes
+- **1 credit = 2 € = one service-month.**
+- **Refill only in packs of 5** (`PACK_SIZE = 5`, one €10 pack). A single-service
+  user buys a €10 pack ≈ every 5 months (effective 2 €/mo); the pack amortizes
   Stripe's per-transaction fee and gives a prepaid runway that lowers churn.
 - Credits live in a **fungible pool** on the Carillon account. Never
   pre-assigned to a service — services *pull* from the shared pool.
@@ -142,7 +142,7 @@ a second code path:
 - **Abuse barrier:** to farm another free credit you need a **new real inbox**
   (magic-link is delivered there) **and** a **new, not-yet-claimed authenticatable
   PIM account**. Magic-link + PIM-auth-validation + the per-mailbox claim *are*
-  the sybil control — no fraud engine needed for a 2.5 € value.
+  the sybil control — no fraud engine needed for a 2 € value.
 - Expiry of a free-credit month is a **hard stop**, same as any paid month.
 
 This is distinct from **free testing** (§ onboarding in `DECISIONS.md`): the
@@ -153,11 +153,11 @@ account-free forever. The free *credit* buys one *standing* month.
 
 ## 6. Buying credits
 
-- **One purchase type:** a one-shot pool top-up bought in **packs of 4 credits**
-  (`PACK_SIZE = 4`, €10 a pack), linear — `N packs = N × 4 credits = N × 10 €`.
+- **One purchase type:** a one-shot pool top-up bought in **packs of 5 credits**
+  (`PACK_SIZE = 5`, €10 a pack), linear — `N packs = N × 5 credits = N × 10 €`.
   No sub-pack granularity, no volume discount.
 - The **€10 pack floor** keeps Stripe's per-transaction fee to a few percent (a
-  single €2.5 credit would lose ~11 % to fees — the pack is precisely why we
+  single €2 credit would lose ~14 % to fees — the pack is precisely why we
   don't sell those).
 - **No auto-refill in v1.** The pool depth *is* the buffer: buy 20, watch 2
   accounts, and that's ~10 months of runway. Continuity comes from **opt-in
@@ -220,7 +220,7 @@ notification company; flaky billing notices are self-refuting. Required triggers
 
 - Sanity cap (`max_watches_per_account`) — an infra DoS guard now, not a tier.
 - Notification lead times (3-day pre-expiry, low-pool threshold).
-- Pack size (`PACK_SIZE = 4`) and the per-credit price (2.5 €) — both easy to raise.
+- Pack size (`PACK_SIZE = 5`) and the per-credit price (2 €) — both easy to raise.
 - Auto-recharge (off-session) — future, only if manual + warnings prove
   insufficient.
 - API keys — future, for REST/integration.
@@ -235,7 +235,7 @@ The model above is **implemented** in the server (clippy-clean, tests green):
   preserves activation across edits; `active_watches` is `rowid`-ordered.
 - **Billing** — Stripe `mode=payment` one-shot Checkout; the line item is the
   **pack** Price, `quantity` = number of packs; the webhook credits the pool by
-  the session's credit count. `PACK_SIZE = 4`.
+  the session's credit count. `PACK_SIZE = 5`.
 - **Metering** — the sweep iterates active **services** in declaration order and
   renews (auto-renew) or stops each, warns pre-expiry, and warns low-pool. Gated
   by a `metered` flag (`true` only when Stripe is configured) — self-host stays

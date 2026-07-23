@@ -62,7 +62,7 @@ Kernel tunables that make 10³–10⁴ held sockets possible are in Phase 1.
 - [ ] **DNS**: `carillon.pimalaya.org` (API + UI, one origin) → the VPS public IP.
       A `mail.carillon.pimalaya.org` sending subdomain for magic-link email
       (SPF + DKIM + DMARC, tracking OFF — see [`EMAIL.md`](EMAIL.md)).
-- [ ] **Stripe**: live account, one **one-time Price** for the 4-credit pack (€10),
+- [ ] **Stripe**: live account, one **one-time Price** for the 5-credit pack (€10),
       a webhook endpoint (`/billing/webhook`) → note the `whsec_…` signing secret.
 - [ ] **Resend** (or chosen mailer): API key + verified sending subdomain.
 - [ ] **Object storage** for Litestream: an S3-compatible bucket (Backblaze B2 /
@@ -236,7 +236,7 @@ client_id = "<entra public client id>"
 secret_key = "sk_live_…"
 webhook_secret = "whsec_…"
 [billing.stripe.prices]
-pack = "price_…"                   # the one-time 4-credit pack Price (€10)
+pack = "price_…"                   # the one-time 5-credit pack Price (€10)
 
 [email.resend]
 api_key = "re_…"
